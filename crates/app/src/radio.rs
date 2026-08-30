@@ -76,6 +76,8 @@ pub enum Cmd {
     Demod(Demod),
     Volume(f32),
     Fft(usize),
+    /// Spectrum frames per second delivered to the UI.
+    Refresh(f32),
     Stop,
 }
 
@@ -264,6 +266,8 @@ fn run(
     let mut listen: Option<f64> = None;
     let mut mode = Demod::Wfm;
     let mut volume = 0.5f32;
+    let mut refresh = 30.0f32;
+    let mut next_frame = std::time::Instant::now();
     let mut cur_rate = dev.rate().as_f64();
     let mut cur_center = dev.center().as_f64();
     let mut retune = false;
@@ -299,6 +303,7 @@ fn run(
                 Cmd::Fft(n) => {
                     spec = Spectrum::new(n);
                 }
+                Cmd::Refresh(hz) => refresh = hz.clamp(1.0, 120.0),
             }
         }
 
@@ -307,23 +312,35 @@ fn run(
             retune = false;
         }
 
+        let read_span = tracing::info_span!("rf_read").entered();
         let buf = match stream.read() {
             Ok(b) => b,
             Err(_) => return Ok(()),
         };
+        drop(read_span);
         status.dropped.store(stream.dropped(), Ordering::Relaxed);
 
-        if spec.process(&buf.samples) {
-            let f = Frame { db: spec.power_db().to_vec(), center: cur_center, rate: cur_rate };
-            // Drop rather than block: the radio must never stall waiting for
-            // the UI, and a stale spectrum is worthless anyway.
-            match frames.try_send(f) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => return Ok(()),
+        // Only run the FFT and wake the UI when a frame is actually due.
+        // Waking on every USB buffer asks for ~260 repaints a second, which
+        // pins a core redrawing frames no display can show.
+        let now = std::time::Instant::now();
+        if now >= next_frame {
+            next_frame = now + std::time::Duration::from_secs_f32(1.0 / refresh);
+            let _s = tracing::info_span!("spectrum").entered();
+            if spec.process(&buf.samples) {
+                let f =
+                    Frame { db: spec.power_db().to_vec(), center: cur_center, rate: cur_rate };
+                // Drop rather than block: the radio must never stall waiting
+                // for the UI, and a stale spectrum is worthless anyway.
+                match frames.try_send(f) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
+                }
+                repaint();
             }
-            repaint();
         }
 
+        let _a = tracing::info_span!("audio").entered();
         if let (Some(a), Some(s)) = (audio.as_mut(), sink.as_mut()) {
             let rate = a.audio_rate;
             let pcm = a.process(&buf.samples, volume);

@@ -31,6 +31,7 @@ pub struct App {
     wf_pending: Vec<f32>,
     wf_last: Option<std::time::Instant>,
     rows_per_sec: f32,
+    refresh: f32,
     fft_size: usize,
     scrub: Wheel,
     channels: Vec<Channel>,
@@ -38,6 +39,8 @@ pub struct App {
     volume: f32,
     next_id: u32,
     fft: usize,
+    /// Run for this many seconds, report CPU used, then quit.
+    pub soak: Option<f32>,
     /// Save a PNG to this path once the radio has settled, then quit.
     pub shot: Option<String>,
     shot_at: Option<std::time::Instant>,
@@ -51,6 +54,8 @@ pub struct Channel {
 }
 
 const FFTS: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+/// Spectrum refresh rates in frames per second.
+const REFRESH: [(&str, f32); 4] = [("10", 10.0), ("20", 20.0), ("30", 30.0), ("60", 60.0)];
 /// Waterfall scroll rates in rows per second.
 const SPEEDS: [(&str, f32); 5] = [
     ("5", 5.0),
@@ -86,6 +91,7 @@ impl Default for App {
             wf_pending: Vec::new(),
             wf_last: None,
             rows_per_sec: 20.0,
+            refresh: 30.0,
             fft_size: 2048,
             scrub: Wheel::default(),
             channels: Vec::new(),
@@ -93,6 +99,7 @@ impl Default for App {
             volume: 0.5,
             next_id: 1,
             fft: 2048,
+            soak: None,
             shot: None,
             shot_at: None,
             shot_sent: false,
@@ -263,10 +270,22 @@ fn fmt_hz(hz: f64) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
-        self.drain();
+        let _f = tracing::info_span!("frame").entered();
+        {
+            let _s = tracing::info_span!("drain").entered();
+            self.drain();
+        }
         self.screenshot(ui.ctx());
-        self.head(ui);
-        self.strip(ui);
+        self.soak_check(ui.ctx());
+        {
+            let _s = tracing::info_span!("head").entered();
+            self.head(ui);
+        }
+        {
+            let _s = tracing::info_span!("strip").entered();
+            self.strip(ui);
+        }
+        let _s = tracing::info_span!("scope").entered();
         CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CHASSIS))
             .show(ui, |ui| self.scope(ui));
@@ -274,6 +293,41 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Self-measured CPU, because a GUI process is awkward to sample from a
+    /// shell and the number that matters is over a steady-state window.
+    fn soak_check(&mut self, ctx: &egui::Context) {
+        let Some(secs) = self.soak else { return };
+        if self.shot_sent {
+            return;
+        }
+        // Deliberately does not request repaints: the point is to measure how
+        // often the app redraws on its own.
+        let t0 = *self.shot_at.get_or_insert_with(std::time::Instant::now);
+        let el = t0.elapsed().as_secs_f32();
+        if el < secs {
+            return;
+        }
+        let cpu = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| {
+                // Fields are offset by the comm field, which can contain
+                // spaces and parentheses, so start after the last ')'.
+                let tail = &s[s.rfind(')')? + 1..];
+                let f: Vec<&str> = tail.split_whitespace().collect();
+                let u: f64 = f.get(11)?.parse().ok()?;
+                let k: f64 = f.get(12)?.parse().ok()?;
+                Some((u + k) / 100.0)
+            })
+            .unwrap_or(0.0);
+        println!(
+            "ran {el:.1}s, used {cpu:.2}s CPU = {:.0}% of one core",
+            cpu / el as f64 * 100.0
+        );
+        crate::prof::report(std::time::Duration::from_secs_f32(el));
+        self.shot_sent = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.shot.clone() else { return };
         ctx.request_repaint();
@@ -405,6 +459,16 @@ impl App {
                         let on = (self.rows_per_sec - v).abs() < 0.01;
                         if ui.selectable_label(on, name).clicked() {
                             self.rows_per_sec = v;
+                        }
+                    }
+
+                    ui.add_space(14.0);
+                    ui.label(legend("fps"));
+                    for (name, v) in REFRESH {
+                        let on = (self.refresh - v).abs() < 0.01;
+                        if ui.selectable_label(on, name).clicked() && !on {
+                            self.refresh = v;
+                            self.send(Cmd::Refresh(v));
                         }
                     }
 
@@ -576,27 +640,16 @@ impl App {
         p.rect_filled(plot, 0.0, theme::WELL);
 
         self.grid(&p, &plot);
-        self.trace(&p, &plot);
+        {
+            let _s = tracing::info_span!("trace").entered();
+            self.trace(&p, &plot);
+        }
         self.ribbon(&p, &ribbon);
 
         p.rect_filled(fall, 0.0, theme::CHASSIS);
-        let frac = self.wf.filled_fraction();
-        if let Some(tex) = self.wf.texture(ui.ctx()) {
-            if frac > 0.0 {
-                // Draw only the rows that exist, at the same height per row as
-                // when the buffer is full, so filling up looks like history
-                // accumulating rather than the image stretching.
-                let shown = Rect::from_min_max(
-                    fall.min,
-                    Pos2::new(fall.right(), fall.top() + fall.height() * frac),
-                );
-                p.image(
-                    tex.id(),
-                    shown,
-                    Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, frac)),
-                    Color32::WHITE,
-                );
-            }
+        {
+            let _wf = tracing::info_span!("wf_texture").entered();
+            self.wf.draw(ui.ctx(), &p, fall);
         }
 
         self.markers(&p, &full);

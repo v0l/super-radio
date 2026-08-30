@@ -4,7 +4,7 @@
 //! frame. Scrolling by rewriting one row and moving a cursor keeps the cost
 //! independent of history depth.
 
-use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, Pos2, TextureHandle, TextureOptions};
 
 pub struct Waterfall {
     width: usize,
@@ -14,7 +14,11 @@ pub struct Waterfall {
     cursor: usize,
     filled: usize,
     tex: Option<TextureHandle>,
-    dirty: bool,
+    /// Whole texture needs re-uploading (resize, clear, or a pan).
+    dirty_all: bool,
+    /// Only this row changed since the last upload.
+    dirty_row: Option<usize>,
+    row_buf: Vec<Color32>,
 }
 
 impl Waterfall {
@@ -26,7 +30,9 @@ impl Waterfall {
             cursor: 0,
             filled: 0,
             tex: None,
-            dirty: false,
+            dirty_all: true,
+            dirty_row: None,
+            row_buf: Vec::new(),
         }
     }
 
@@ -34,7 +40,8 @@ impl Waterfall {
         self.pixels.fill(Color32::BLACK);
         self.cursor = 0;
         self.filled = 0;
-        self.dirty = true;
+        self.dirty_all = true;
+        self.dirty_row = None;
     }
 
     /// Add one spectrum row, mapping dB through the given display range.
@@ -45,27 +52,20 @@ impl Waterfall {
         if db.len() != self.width {
             self.width = db.len();
             self.pixels = vec![Color32::BLACK; self.width * self.height];
+            self.row_buf = vec![Color32::BLACK; self.width];
             self.cursor = 0;
             self.filled = 0;
+            self.dirty_all = true;
+            self.tex = None;
         }
         let span = (ceil - floor).max(1.0);
         let row = self.cursor * self.width;
         for (i, &v) in db.iter().enumerate() {
             self.pixels[row + i] = colormap(((v - floor) / span).clamp(0.0, 1.0));
         }
+        self.dirty_row = Some(self.cursor);
         self.cursor = (self.cursor + 1) % self.height;
         self.filled = (self.filled + 1).min(self.height);
-        self.dirty = true;
-    }
-
-    /// Fraction of the history buffer that holds real rows. Starting up, the
-    /// rest is not black data, it is data that does not exist yet.
-    pub fn filled_fraction(&self) -> f32 {
-        if self.height == 0 {
-            0.0
-        } else {
-            self.filled as f32 / self.height as f32
-        }
     }
 
     /// Slide the history sideways when the radio is retuned.
@@ -81,7 +81,7 @@ impl Waterfall {
         let w = self.width;
         if d.unsigned_abs() as usize >= w {
             self.pixels.fill(Color32::BLACK);
-            self.dirty = true;
+            self.dirty_all = true;
             return;
         }
         let n = d.unsigned_abs() as usize;
@@ -96,32 +96,79 @@ impl Waterfall {
                 row[..n].fill(Color32::BLACK);
             }
         }
-        self.dirty = true;
+        // Every row moved, so a partial upload cannot express this.
+        self.dirty_all = true;
     }
 
-    /// Texture with the newest row at the top.
-    pub fn texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
-        if self.width == 0 {
-            return None;
+    /// Push pending pixels to the GPU and draw, newest row at the top.
+    ///
+    /// Rows are stored in ring order and never rotated, so a new row costs one
+    /// row of upload instead of rebuilding the whole image. At 2048 bins and
+    /// 512 rows a full rebuild is 4 MB, which at 20 rows a second is 84 MB/s
+    /// of texture traffic for one changed row.
+    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, rect: egui::Rect) {
+        if self.width == 0 || self.height == 0 {
+            return;
         }
-        if self.dirty || self.tex.is_none() {
+        if self.tex.is_none() {
+            let img = ColorImage::filled([self.width, self.height], Color32::BLACK);
+            self.tex = Some(ctx.load_texture("waterfall", img, TextureOptions::LINEAR));
+            self.dirty_all = true;
+        }
+        let tex = self.tex.as_mut().expect("texture just created");
+
+        if self.dirty_all {
             let mut img = ColorImage::filled([self.width, self.height], Color32::BLACK);
-            for y in 0..self.height {
-                // Walk backwards from the newest row so time runs downward.
-                let src = (self.cursor + self.height - 1 - y) % self.height;
-                let s = src * self.width;
-                let d = y * self.width;
-                img.pixels[d..d + self.width].copy_from_slice(&self.pixels[s..s + self.width]);
-            }
-            match &mut self.tex {
-                Some(t) => t.set(img, TextureOptions::LINEAR),
-                None => {
-                    self.tex = Some(ctx.load_texture("waterfall", img, TextureOptions::LINEAR))
-                }
-            }
-            self.dirty = false;
+            img.pixels.copy_from_slice(&self.pixels);
+            tex.set(img, TextureOptions::LINEAR);
+            self.dirty_all = false;
+            self.dirty_row = None;
+        } else if let Some(r) = self.dirty_row.take() {
+            self.row_buf.copy_from_slice(&self.pixels[r * self.width..(r + 1) * self.width]);
+            let mut img = ColorImage::filled([self.width, 1], Color32::BLACK);
+            img.pixels.copy_from_slice(&self.row_buf);
+            tex.set_partial([0, r], img, TextureOptions::LINEAR);
         }
-        self.tex.as_ref()
+
+        if self.filled == 0 {
+            return;
+        }
+        let id = tex.id();
+        let h = self.height as f32;
+        let c = self.cursor;
+        let row_px = rect.height() / h;
+
+        // Segment from the start of the ring, newest first, so the V range is
+        // inverted: screen top maps to the most recently written row.
+        let a_rows = c.min(self.filled);
+        let mut y = rect.top();
+        if a_rows > 0 {
+            let bottom = y + a_rows as f32 * row_px;
+            p.image(
+                id,
+                egui::Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), bottom)),
+                egui::Rect::from_min_max(
+                    Pos2::new(0.0, c as f32 / h),
+                    Pos2::new(1.0, (c - a_rows) as f32 / h),
+                ),
+                Color32::WHITE,
+            );
+            y = bottom;
+        }
+        // Older rows wrapped around the end of the ring.
+        let b_rows = self.filled.saturating_sub(a_rows);
+        if b_rows > 0 {
+            let bottom = y + b_rows as f32 * row_px;
+            p.image(
+                id,
+                egui::Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), bottom)),
+                egui::Rect::from_min_max(
+                    Pos2::new(0.0, 1.0),
+                    Pos2::new(1.0, (self.height - b_rows) as f32 / h),
+                ),
+                Color32::WHITE,
+            );
+        }
     }
 }
 
@@ -198,15 +245,36 @@ mod tests {
     }
 
     #[test]
-    fn the_filled_fraction_grows_then_saturates() {
+    fn the_ring_cursor_wraps_and_tracks_what_is_valid() {
         let mut w = Waterfall::new(4);
-        assert_eq!(w.filled_fraction(), 0.0);
+        assert_eq!((w.cursor, w.filled), (0, 0));
         w.push(&[-50.0; 8], -100.0, 0.0);
-        assert_eq!(w.filled_fraction(), 0.25);
+        assert_eq!((w.cursor, w.filled), (1, 1));
         for _ in 0..20 {
             w.push(&[-50.0; 8], -100.0, 0.0);
         }
-        assert_eq!(w.filled_fraction(), 1.0);
+        assert_eq!(w.filled, 4, "filled must saturate at the ring size");
+        assert!(w.cursor < 4, "cursor escaped the ring: {}", w.cursor);
+    }
+
+    #[test]
+    fn a_new_row_asks_for_a_partial_upload_not_a_full_one() {
+        let mut w = Waterfall::new(8);
+        w.push(&[-50.0; 16], -100.0, 0.0);
+        w.dirty_all = false;
+        w.dirty_row = None;
+        w.push(&[-50.0; 16], -100.0, 0.0);
+        assert_eq!(w.dirty_row, Some(1), "one changed row should be a partial upload");
+        assert!(!w.dirty_all, "a single row must not force a full re-upload");
+    }
+
+    #[test]
+    fn panning_forces_a_full_upload_because_every_row_moved() {
+        let mut w = Waterfall::new(8);
+        w.push(&[-50.0; 16], -100.0, 0.0);
+        w.dirty_all = false;
+        w.shift(3);
+        assert!(w.dirty_all);
     }
 
     #[test]

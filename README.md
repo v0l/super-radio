@@ -154,6 +154,16 @@ slides the waterfall history sideways rather than discarding it. Each channel
 is drawn at the width its demodulator actually accepts, so an NFM and a WFM
 channel on the same frequency look as different as they are.
 
+To find where time is going, `--soak` runs the interface for N seconds, then
+reports process CPU and a table of span timings:
+
+```
+cargo run --release -p app -- --soak 15
+```
+
+Note that span times are wall clock, so `rf_read` sitting near 100% means the
+radio thread is idle waiting on USB, which is exactly what it should be doing.
+
 To capture a PNG of the running interface:
 
 ```

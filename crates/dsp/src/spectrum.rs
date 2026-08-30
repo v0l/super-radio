@@ -21,6 +21,8 @@ pub struct Spectrum {
     avg: Vec<f32>,
     out: Vec<f32>,
     primed: bool,
+    /// Samples carried between calls, so a frame can span input blocks.
+    pending: Vec<C32>,
     pub smoothing: f32,
 }
 
@@ -40,6 +42,7 @@ impl Spectrum {
             avg: vec![0.0; size],
             out: vec![0.0; size],
             primed: false,
+            pending: Vec::new(),
             smoothing: 0.35,
         }
     }
@@ -49,22 +52,30 @@ impl Spectrum {
     }
 
     /// Consume samples, averaging every full frame with 50% overlap.
-    /// Returns false if there was not enough data for even one frame.
+    ///
+    /// Leftovers are carried to the next call, so the FFT may be larger than
+    /// the blocks the radio delivers. Without that, asking for 16384 bins
+    /// while the driver hands over 8192 samples produces no frames at all and
+    /// the display simply stops.
     pub fn process(&mut self, iq: &[C32]) -> bool {
         let hop = self.size / 2;
+        self.pending.extend_from_slice(iq);
         let mut any = false;
         let mut pos = 0;
-        while pos + self.size <= iq.len() {
-            self.frame(&iq[pos..pos + self.size]);
+        while pos + self.size <= self.pending.len() {
+            self.frame_at(pos);
             pos += hop;
             any = true;
         }
+        self.pending.drain(..pos);
         any
     }
 
-    fn frame(&mut self, src: &[C32]) {
-        for (d, (s, w)) in self.buf.iter_mut().zip(src.iter().zip(&self.win)) {
-            *d = *s * *w;
+    /// Windows `size` samples starting at `pos` in `pending`. Taking an index
+    /// rather than a slice keeps the borrow checker happy without unsafe.
+    fn frame_at(&mut self, pos: usize) {
+        for i in 0..self.size {
+            self.buf[i] = self.pending[pos + i] * self.win[i];
         }
         self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
 
@@ -90,6 +101,7 @@ impl Spectrum {
     pub fn reset(&mut self) {
         self.avg.fill(0.0);
         self.primed = false;
+        self.pending.clear();
     }
 }
 
@@ -116,6 +128,32 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_can_span_several_input_blocks() {
+        // The driver's block size and the FFT size are unrelated, so a large
+        // FFT must accumulate rather than silently produce nothing.
+        let mut s = Spectrum::new(4096);
+        s.smoothing = 1.0;
+        let sig = tone(8192, 400.0, 4096, 1.0);
+        let mut produced = false;
+        for chunk in sig.chunks(512) {
+            produced |= s.process(chunk);
+        }
+        assert!(produced, "no frame from blocks smaller than the FFT");
+        let db = s.power_db();
+        let idx = db.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        assert_eq!(idx, 2048 + 400);
+    }
+
+    #[test]
+    fn leftovers_do_not_accumulate_without_bound() {
+        let mut s = Spectrum::new(1024);
+        for _ in 0..500 {
+            s.process(&tone(300, 10.0, 1024, 1.0));
+        }
+        assert!(s.pending.len() < 1024 + 300, "carried {} samples", s.pending.len());
+    }
+
+    #[test]
     fn dc_lands_in_the_middle() {
         let mut s = Spectrum::new(256);
         s.smoothing = 1.0;
@@ -138,13 +176,16 @@ mod tests {
 
     #[test]
     fn averaging_in_power_does_not_bias_low() {
-        // Alternating loud and silent frames should read about half power
-        // (-3 dB), not the -inf that averaging in dB would drift toward.
+        // Half the time full scale, half silent, in runs long enough that few
+        // frames straddle a transition. Averaging power gives about -3 dB;
+        // averaging decibels would be dragged toward the silent frames.
+        // The averaging window must be much longer than one loud/silent run,
+        // or the reading is just wherever the oscillation happened to stop.
         let mut s = Spectrum::new(256);
-        s.smoothing = 0.5;
-        for i in 0..64 {
+        s.smoothing = 0.005;
+        for i in 0..400 {
             let amp = if i % 2 == 0 { 1.0 } else { 0.0 };
-            s.process(&tone(256, 32.0, 256, amp));
+            s.process(&tone(2048, 32.0, 256, amp));
         }
         let peak = s.power_db().iter().cloned().fold(f32::MIN, f32::max);
         assert!((peak + 3.0).abs() < 2.0, "expected about -3 dBFS, got {peak:.2}");
