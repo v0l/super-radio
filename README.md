@@ -25,6 +25,7 @@ our own assumptions.
 | `nodes` | DSP and decoders as graph nodes, the registry, and the wideband channel bank |
 | `sources` | file replay with rtl_433-style filename metadata |
 | `audio` | cpal playback with a drift-tracking resampler |
+| `app` | egui front end: spectrum, waterfall, tuner, channels |
 | `rtlsdr-sys` | bindgen FFI to librtlsdr |
 | `rtlsdr` | safe driver with an async streaming thread |
 | `hackrf` | pure-Rust USB driver (not started) |
@@ -126,4 +127,24 @@ cargo run --release -p rtlsdr --example wfm
 # and the sound card.
 cargo run --release -p rtlsdr --example listen -- 95.8
 cargo run --release -p rtlsdr --example listen -- 446.0 nfm
+```
+
+## The app
+
+```
+cargo run --release -p app
+```
+
+Spectrum and waterfall over a live RTL-SDR. Click the pane to place a channel
+and start listening, click an existing marker to switch to it, drag to pan the
+centre frequency. Mode defaults from the band plan (WFM in the broadcast band,
+AM in the airband, otherwise NFM) and can be overridden per channel.
+
+The display auto-scales against the 10th and 99.9th percentiles rather than the
+extremes, so one strong carrier does not flatten everything else.
+
+To check the signal path without a display:
+
+```
+cargo run --release -p app -- --probe 95.8
 ```
