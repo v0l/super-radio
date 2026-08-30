@@ -16,6 +16,16 @@ use std::f64::consts::TAU;
 
 pub const CARRIER_HZ: f64 = 57_000.0;
 pub const BAUD: f64 = 1187.5;
+/// Nominal pilot, used only until the tracked one is available.
+const PILOT_NOMINAL: f64 = 19_000.0;
+
+/// Taps for the shaping filter, from the transition band a Kaiser needs to get
+/// from the 2.4 kHz edge to the first thing worth rejecting.
+fn shaping_taps(sym_rate: f64) -> usize {
+    let transition = DATA_BW * 0.6 / sym_rate;
+    let n = ((60.0 - 7.95) / (2.285 * std::f64::consts::TAU * transition)).ceil() as usize;
+    (n | 1).clamp(31, 255)
+}
 /// Bandwidth of the data either side of the carrier.
 const DATA_BW: f64 = 2_400.0;
 
@@ -48,7 +58,12 @@ const SWITCH_MARGIN: f64 = 1.05;
 /// One symbol-timing hypothesis.
 #[derive(Clone)]
 struct Arm {
-    phase: f64,
+    /// Offset within the symbol, a fixed fraction.
+    offset: f64,
+    /// Index of the symbol currently being integrated, so a boundary is a
+    /// change of index rather than a locally accumulated phase. This keeps the
+    /// output identical however the caller blocks its input.
+    idx: i64,
     first: (f64, f64),
     second: (f64, f64),
     n1: u32,
@@ -65,9 +80,10 @@ struct Arm {
 }
 
 impl Arm {
-    fn new(phase: f64) -> Self {
+    fn new(offset: f64) -> Self {
         Self {
-            phase,
+            offset,
+            idx: i64::MIN,
             first: (0.0, 0.0),
             second: (0.0, 0.0),
             n1: 0,
@@ -78,15 +94,34 @@ impl Arm {
         }
     }
 
-    fn reset(&mut self, phase: f64) {
-        *self = Arm::new(phase);
+    fn reset(&mut self, offset: f64) {
+        *self = Arm::new(offset);
     }
 }
 
+/// Symbol rate the baseband is brought down to, as a multiple of the baud.
+/// Twelve samples a symbol leaves the timing bank resolving to about an eighth
+/// of a sample without carrying any more rate than the detector needs.
+const SYMBOL_OVERSAMPLE: f64 = 12.0;
+
 pub struct RdsDemod {
     rate: f64,
+    /// Rate the symbol detector runs at, after decimation.
+    sym_rate: f64,
+    /// Coarse decimation, then the sharp filter at a rate where it is cheap.
+    ///
+    /// A 2.4 kHz lowpass directly at the multiplex rate cannot be built: at
+    /// 341 kHz a 255-tap Kaiser has a 4.9 kHz transition, twice the width of
+    /// the passband it is meant to define, so the data is attenuated and phase
+    /// distorted rather than filtered. Decimating first makes the same filter
+    /// narrow in normalised terms and far cheaper.
+    i_c: FirDecimReal,
+    q_c: FirDecimReal,
     i_lp: FirDecimReal,
     q_lp: FirDecimReal,
+    i_mid: Vec<f32>,
+    q_mid: Vec<f32>,
+    dec: usize,
     i_buf: Vec<f32>,
     q_buf: Vec<f32>,
     i_out: Vec<f32>,
@@ -102,18 +137,39 @@ pub struct RdsDemod {
     locked: bool,
     /// Previous pilot phase, for unwrapping.
     prev_pilot: Option<f64>,
+    /// Symbols elapsed since the stream started, carried across blocks.
+    cum: f64,
+    /// Symbol position for each decimated sample still to be consumed.
+    sym_pos: Vec<f64>,
+    /// Position within the decimation, so the queue stays aligned with the
+    /// filters across block boundaries.
+    dec_ctr: usize,
     level: f64,
 }
 
 impl RdsDemod {
     pub fn new(rate: f64) -> Self {
-        // A few hundred taps at the multiplex rate keeps the 2.4 kHz data
-        // while rejecting the difference subcarrier below and anything above.
-        let taps = lowpass(255, DATA_BW / rate, 60.0);
+        let want = BAUD * SYMBOL_OVERSAMPLE;
+        let dec = ((rate / want).floor() as usize).max(1);
+        let sym_rate = rate / dec as f64;
+        // Two separate jobs, and one filter cannot do both. `design_hz` places
+        // its stopband where the first alias folds down, which is the right
+        // answer for decimating and the wrong one for detection: at these
+        // rates it leaves a 7.4 kHz cutoff around 2.4 kHz of data, so three
+        // times more noise reaches the detector than signal. The decimator
+        // stops aliasing; the shaping filter afterwards defines the bandwidth,
+        // and at the decimated rate it is narrow in normalised terms and cheap.
+        let shape = lowpass(shaping_taps(sym_rate), DATA_BW / sym_rate, 60.0);
         Self {
             rate,
-            i_lp: FirDecimReal::new(taps.clone(), 1),
-            q_lp: FirDecimReal::new(taps, 1),
+            sym_rate,
+            i_c: FirDecimReal::design_hz(rate, dec, DATA_BW, 60.0),
+            q_c: FirDecimReal::design_hz(rate, dec, DATA_BW, 60.0),
+            i_lp: FirDecimReal::new(shape.clone(), 1),
+            q_lp: FirDecimReal::new(shape, 1),
+            i_mid: Vec::new(),
+            q_mid: Vec::new(),
+            dec,
             i_buf: Vec::new(),
             q_buf: Vec::new(),
             i_out: Vec::new(),
@@ -123,6 +179,9 @@ impl RdsDemod {
             syms: 0,
             locked: false,
             prev_pilot: None,
+            cum: 0.0,
+            sym_pos: Vec::new(),
+            dec_ctr: 0,
             level: 0.0,
         }
     }
@@ -151,7 +210,20 @@ impl RdsDemod {
         (self.best, if next > 1e-12 { best / next } else { 1.0 })
     }
 
+    /// Filter sizes, for reporting what the chain actually costs.
+    pub fn cost(&self) -> String {
+        format!(
+            "decimate {} taps /{}, shape {} taps, symbol rate {:.0} Hz",
+            self.i_c.taps(),
+            self.dec,
+            self.i_lp.taps(),
+            self.sym_rate
+        )
+    }
+
     pub fn reset(&mut self) {
+        self.i_c.reset();
+        self.q_c.reset();
         self.i_lp.reset();
         self.q_lp.reset();
         for (k, a) in self.arms.iter_mut().enumerate() {
@@ -161,6 +233,9 @@ impl RdsDemod {
         self.syms = 0;
         self.locked = false;
         self.prev_pilot = None;
+        self.cum = 0.0;
+        self.sym_pos.clear();
+        self.dec_ctr = 0;
         self.level = 0.0;
     }
 
@@ -179,52 +254,112 @@ impl RdsDemod {
         // quadratures are kept: the standard locks the 57 kHz subcarrier to
         // the pilot's third harmonic but not its phase, so which axis carries
         // the data is not known in advance.
+        let d = self.dec;
         for (&x, &p) in mpx.iter().zip(pilot_phase) {
             let c = 3.0 * p;
-            let (s, co) = c.sin_cos();
+            let (si, co) = c.sin_cos();
             self.i_buf.push((x as f64 * co) as f32);
-            self.q_buf.push((x as f64 * s) as f32);
+            self.q_buf.push((x as f64 * si) as f32);
+
+            // The symbol clock is the pilot divided by sixteen, so advance it
+            // from the tracked pilot rather than a nominal baud rate. A
+            // receiver crystal is tens of ppm off and a fixed increment drifts
+            // against the transmitter for as long as it runs; taking it from
+            // the pilot cancels that exactly, which is why the standard tied
+            // the two together.
+            let step = match self.prev_pilot {
+                Some(prev) => {
+                    let mut dp = p - prev;
+                    while dp > std::f64::consts::PI {
+                        dp -= TAU;
+                    }
+                    while dp < -std::f64::consts::PI {
+                        dp += TAU;
+                    }
+                    dp
+                }
+                None => TAU * PILOT_NOMINAL / self.rate,
+            };
+            self.prev_pilot = Some(p);
+            self.cum += step / TAU / 16.0;
+
+            if self.dec_ctr == 0 {
+                self.sym_pos.push(self.cum);
+            }
+            self.dec_ctr = (self.dec_ctr + 1) % d;
         }
+        self.i_mid.clear();
+        self.q_mid.clear();
+        let mut i_mid = std::mem::take(&mut self.i_mid);
+        let mut q_mid = std::mem::take(&mut self.q_mid);
+        self.i_c.process(&self.i_buf, &mut i_mid);
+        self.q_c.process(&self.q_buf, &mut q_mid);
+
         self.i_out.clear();
         self.q_out.clear();
         let mut i_out = std::mem::take(&mut self.i_out);
         let mut q_out = std::mem::take(&mut self.q_out);
-        self.i_lp.process(&self.i_buf, &mut i_out);
-        self.q_lp.process(&self.q_buf, &mut q_out);
+        self.i_lp.process(&i_mid, &mut i_out);
+        self.q_lp.process(&q_mid, &mut q_out);
+        self.i_mid = i_mid;
+        self.q_mid = q_mid;
 
-        // The symbol clock is the pilot divided by sixteen, so advance it from
-        // the tracked pilot phase rather than from the nominal baud rate. A
-        // receiver crystal is tens of ppm off, and a fixed increment drifts
-        // against the transmitter by that much for as long as it runs; taking
-        // the increment from the pilot cancels the error exactly, which is the
-        // whole reason the standard tied the two together.
-        let n = i_out.len().min(q_out.len()).min(pilot_phase.len());
+        let n = i_out.len().min(q_out.len()).min(self.sym_pos.len());
         for k in 0..n {
+            let pos = self.sym_pos[k];
             let best = self.best;
             let mut boundary = false;
             let v = i_out[k] as f64;
             let w = q_out[k] as f64;
 
-            let p = pilot_phase[k];
-            let inc = match self.prev_pilot {
-                Some(prev) => {
-                    let mut d = p - prev;
-                    // Unwrap: the tracked phase is kept within one turn.
-                    while d > std::f64::consts::PI {
-                        d -= TAU;
-                    }
-                    while d < -std::f64::consts::PI {
-                        d += TAU;
-                    }
-                    (d / TAU / 16.0).clamp(0.0, 0.5)
-                }
-                None => BAUD / self.rate,
-            };
-            self.prev_pilot = Some(p);
-
             for (ai, arm) in self.arms.iter_mut().enumerate() {
-                arm.phase += inc;
-                if arm.phase % 1.0 >= 0.5 {
+                let t = pos + arm.offset;
+                let idx = t.floor() as i64;
+                if arm.idx == i64::MIN {
+                    arm.idx = idx;
+                }
+
+                // Close the previous symbol first, then accumulate this sample
+                // into the new one.
+                if idx > arm.idx {
+                    arm.idx = idx;
+                    let inv1 = if arm.n1 > 0 { 1.0 / arm.n1 as f64 } else { 0.0 };
+                    let inv2 = if arm.n2 > 0 { 1.0 / arm.n2 as f64 } else { 0.0 };
+                    // Manchester: the mid-symbol step carries the symbol.
+                    let sx = arm.first.0 * inv1 - arm.second.0 * inv2;
+                    let sy = arm.first.1 * inv1 - arm.second.1 * inv2;
+                    arm.first = (0.0, 0.0);
+                    arm.second = (0.0, 0.0);
+                    arm.n1 = 0;
+                    arm.n2 = 0;
+
+                    if inv1 != 0.0 && inv2 != 0.0 {
+                        arm.energy += ENERGY_ALPHA * ((sx * sx + sy * sy).sqrt() - arm.energy);
+                        // Squaring folds the two BPSK phases together, so this
+                        // converges on the modulation axis rather than
+                        // cancelling to zero.
+                        arm.carrier.0 += CARRIER_ALPHA * ((sx * sx - sy * sy) - arm.carrier.0);
+                        arm.carrier.1 += CARRIER_ALPHA * ((2.0 * sx * sy) - arm.carrier.1);
+
+                        let theta = 0.5 * arm.carrier.1.atan2(arm.carrier.0);
+                        let (st, ct) = theta.sin_cos();
+                        // Rotate onto the estimated axis and take its sign.
+                        let proj = sx * ct + sy * st;
+                        let sym = if proj >= 0.0 { 1u8 } else { 0u8 };
+
+                        if ai == best {
+                            boundary = true;
+                            self.level += 0.01 * (proj.abs() - self.level);
+                            if let Some(p) = arm.prev_sym {
+                                // Differential: the bit is the change.
+                                bits.push(sym ^ p);
+                            }
+                        }
+                        arm.prev_sym = Some(sym);
+                    }
+                }
+
+                if t - arm.idx as f64 >= 0.5 {
                     arm.second.0 += v;
                     arm.second.1 += w;
                     arm.n2 += 1;
@@ -233,43 +368,6 @@ impl RdsDemod {
                     arm.first.1 += w;
                     arm.n1 += 1;
                 }
-
-                if arm.phase < 1.0 {
-                    continue;
-                }
-                arm.phase -= 1.0;
-
-                let inv1 = if arm.n1 > 0 { 1.0 / arm.n1 as f64 } else { 0.0 };
-                let inv2 = if arm.n2 > 0 { 1.0 / arm.n2 as f64 } else { 0.0 };
-                // Manchester: the mid-symbol step carries the symbol.
-                let sx = arm.first.0 * inv1 - arm.second.0 * inv2;
-                let sy = arm.first.1 * inv1 - arm.second.1 * inv2;
-                arm.first = (0.0, 0.0);
-                arm.second = (0.0, 0.0);
-                arm.n1 = 0;
-                arm.n2 = 0;
-
-                arm.energy += ENERGY_ALPHA * ((sx * sx + sy * sy).sqrt() - arm.energy);
-                // Squaring folds the two BPSK phases together, so this
-                // converges on the modulation axis rather than cancelling.
-                arm.carrier.0 += CARRIER_ALPHA * ((sx * sx - sy * sy) - arm.carrier.0);
-                arm.carrier.1 += CARRIER_ALPHA * ((2.0 * sx * sy) - arm.carrier.1);
-
-                let theta = 0.5 * arm.carrier.1.atan2(arm.carrier.0);
-                let (st, ct) = theta.sin_cos();
-                // Rotate onto the estimated axis and take its sign.
-                let proj = sx * ct + sy * st;
-                let sym = if proj >= 0.0 { 1u8 } else { 0u8 };
-
-                if ai == best {
-                    boundary = true;
-                    self.level += 0.01 * (proj.abs() - self.level);
-                    if let Some(p) = arm.prev_sym {
-                        // Differential: the transmitted bit is the change.
-                        bits.push(sym ^ p);
-                    }
-                }
-                arm.prev_sym = Some(sym);
             }
 
             if boundary {
@@ -303,6 +401,8 @@ impl RdsDemod {
             }
         }
 
+        // Anything not consumed this call stays for the next one.
+        self.sym_pos.drain(..n);
         self.i_out = i_out;
         self.q_out = q_out;
     }

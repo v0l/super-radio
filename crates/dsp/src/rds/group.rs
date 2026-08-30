@@ -107,6 +107,8 @@ impl GroupDecoder {
     }
 
     pub fn push(&mut self, g: &Group) {
+        // Blocks A and B are guaranteed by the synchroniser; C and D are not,
+        // so anything reading them checks first.
         let pi = g.words[0];
         self.station.pi = Some(pi);
 
@@ -129,6 +131,9 @@ impl GroupDecoder {
         // Version B repeats the PI in block C, so the characters are always in
         // block D regardless of version.
         let _ = version_b;
+        if !g.valid[3] {
+            return;
+        }
         let chars = g.words[3];
         self.name_buf[seg * 2] = (chars >> 8) as u8;
         self.name_buf[seg * 2 + 1] = (chars & 0xFF) as u8;
@@ -156,8 +161,17 @@ impl GroupDecoder {
         let seg = (b & 0xF) as usize;
         // Version A carries four characters across blocks C and D, version B
         // carries two in block D and reuses block C for the PI.
-        let (chars, count, base) =
-            if version_b { ([g.words[3], 0], 2, seg * 2) } else { ([g.words[2], g.words[3]], 4, seg * 4) };
+        let (chars, count, base) = if version_b {
+            if !g.valid[3] {
+                return;
+            }
+            ([g.words[3], 0], 2, seg * 2)
+        } else {
+            if !(g.valid[2] && g.valid[3]) {
+                return;
+            }
+            ([g.words[2], g.words[3]], 4, seg * 4)
+        };
 
         for i in 0..count {
             let w = chars[i / 2];
@@ -199,7 +213,7 @@ mod tests {
     use super::*;
 
     fn group(a: u16, b: u16, c: u16, d: u16) -> Group {
-        Group { words: [a, b, c, d], c_prime: false }
+        Group { words: [a, b, c, d], valid: [true; 4], c_prime: false }
     }
 
     /// Build the 0A groups that carry a station name.
