@@ -24,6 +24,7 @@ our own assumptions.
 | `decode` | bit buffers, pulse slicers, protocol registry, device decoders |
 | `nodes` | DSP and decoders as graph nodes, the registry, and the wideband channel bank |
 | `sources` | file replay with rtl_433-style filename metadata |
+| `audio` | cpal playback with a drift-tracking resampler |
 | `rtlsdr-sys` | bindgen FFI to librtlsdr |
 | `rtlsdr` | safe driver with an async streaming thread |
 | `hackrf` | pure-Rust USB driver (not started) |
@@ -119,4 +120,10 @@ cargo run --release -p nodes --example chain -- \
 
 # WFM receiver; verifies itself by finding the 19 kHz stereo pilot
 cargo run --release -p rtlsdr --example wfm
+
+# Listen live. 2.304 MS/s / 8 / 6 is exactly 48 kHz, so the chain needs no
+# resampling; the drift loop only absorbs crystal mismatch between the radio
+# and the sound card.
+cargo run --release -p rtlsdr --example listen -- 95.8
+cargo run --release -p rtlsdr --example listen -- 446.0 nfm
 ```

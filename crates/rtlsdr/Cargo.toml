@@ -12,6 +12,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 dsp.workspace = true
+audio.workspace = true
 
 [[example]]
 name = "scan"
@@ -21,3 +22,7 @@ name = "wfm"
 
 [[example]]
 name = "ism"
+
+[[example]]
+name = "listen"
+

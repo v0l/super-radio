@@ -11,6 +11,7 @@ members = [
     "crates/sources",
     "crates/decode",
     "crates/app",
+    "crates/audio",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ common = { path = "crates/common" }
 dsp = { path = "crates/dsp" }
 pipeline = { path = "crates/pipeline" }
 nodes = { path = "crates/nodes" }
+audio = { path = "crates/audio" }
 hackrf = { path = "crates/hackrf" }
 rtlsdr = { path = "crates/rtlsdr" }
 rtlsdr-sys = { path = "crates/rtlsdr-sys" }
