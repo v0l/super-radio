@@ -57,8 +57,14 @@ pub struct AudioSink {
     block: usize,
     /// Drift tracking state for [`AudioSink::write_adaptive`].
     resampler: Option<Resampler>,
+    /// Second resampler for the right channel. Both are driven with the same
+    /// ratio, so the channels cannot drift apart and smear the stereo image.
+    resampler_r: Option<Resampler>,
     trim: f64,
     resampled: Vec<f32>,
+    resampled_r: Vec<f32>,
+    deint_l: Vec<f32>,
+    deint_r: Vec<f32>,
 }
 
 impl AudioSink {
@@ -98,14 +104,7 @@ impl AudioSink {
         // block-to-block jitter of the queue, which is far larger. The gain
         // gives a time constant of minutes, and the clamp is wider than any
         // real crystal error so hitting it means something else is wrong.
-        let backlog = self.stats.backlog.load(Ordering::Relaxed) as f64;
-        let err = (backlog - TARGET_BACKLOG) / TARGET_BACKLOG;
-
-        // PI. The integral term alone has no damping and overshoots, then
-        // takes as long again to unwind. The proportional term supplies the
-        // damping without contributing to windup.
-        self.trim = (self.trim + 2e-7 * err).clamp(-1e-3, 1e-3);
-        let correction = (self.trim + 5e-6 * err).clamp(-2e-3, 2e-3);
+        let correction = self.drift_correction();
 
         let r = self.resampler.as_mut().unwrap();
         r.set_ratio(in_rate / out_rate * (1.0 + correction));
@@ -114,6 +113,78 @@ impl AudioSink {
         r.process(samples, &mut out);
         self.write(&out);
         self.resampled = out;
+    }
+
+    /// Steer the resample ratio from queue depth.
+    ///
+    /// Integral-dominant and deliberately very slow: this corrects crystal
+    /// drift, which is tens of ppm and constant, and must not chase the
+    /// block-to-block jitter of the queue, which is far larger. The clamp is
+    /// wider than any real crystal error, so hitting it means something else
+    /// is wrong. The proportional term supplies damping the integral lacks
+    /// without contributing to windup.
+    fn drift_correction(&mut self) -> f64 {
+        let backlog = self.stats.backlog.load(Ordering::Relaxed) as f64;
+        let err = (backlog - TARGET_BACKLOG) / TARGET_BACKLOG;
+        self.trim = (self.trim + 2e-7 * err).clamp(-1e-3, 1e-3);
+        (self.trim + 5e-6 * err).clamp(-2e-3, 2e-3)
+    }
+
+    /// Queue interleaved stereo, resampling both channels by the same ratio.
+    ///
+    /// The frames are split, resampled separately and interleaved again.
+    /// Resampling the interleaved stream directly would filter across the
+    /// channel boundary and mix left into right.
+    pub fn write_adaptive_stereo(&mut self, frames: &[f32], in_rate: f64) {
+        if self.channels < 2 {
+            // A mono device cannot carry the image; fold down rather than
+            // playing only the left channel.
+            self.deint_l.clear();
+            self.deint_l.extend(frames.chunks_exact(2).map(|f| 0.5 * (f[0] + f[1])));
+            let mono = std::mem::take(&mut self.deint_l);
+            self.write_adaptive(&mono, in_rate);
+            self.deint_l = mono;
+            return;
+        }
+
+        let out_rate = self.rate as f64;
+        if self.resampler.is_none() {
+            self.resampler = Some(Resampler::new(in_rate, out_rate, 8));
+        }
+        if self.resampler_r.is_none() {
+            self.resampler_r = Some(Resampler::new(in_rate, out_rate, 8));
+        }
+
+        let ratio = in_rate / out_rate * (1.0 + self.drift_correction());
+
+        self.deint_l.clear();
+        self.deint_r.clear();
+        for f in frames.chunks_exact(2) {
+            self.deint_l.push(f[0]);
+            self.deint_r.push(f[1]);
+        }
+
+        let mut l = std::mem::take(&mut self.resampled);
+        let mut r = std::mem::take(&mut self.resampled_r);
+        l.clear();
+        r.clear();
+        let rl = self.resampler.as_mut().unwrap();
+        rl.set_ratio(ratio);
+        rl.process(&self.deint_l, &mut l);
+        let rr = self.resampler_r.as_mut().unwrap();
+        rr.set_ratio(ratio);
+        rr.process(&self.deint_r, &mut r);
+
+        let n = l.len().min(r.len());
+        for i in 0..n {
+            self.staging.push(l[i]);
+            self.staging.push(r[i]);
+            if self.staging.len() >= self.block {
+                self.flush();
+            }
+        }
+        self.resampled = l;
+        self.resampled_r = r;
     }
 
     /// Current drift correction in ppm, for diagnostics.
@@ -308,6 +379,10 @@ impl AudioPlayer {
             staging: Vec::with_capacity(4096),
             block,
             resampler: None,
+            resampler_r: None,
+            resampled_r: Vec::new(),
+            deint_l: Vec::new(),
+            deint_r: Vec::new(),
             trim: 0.0,
             resampled: Vec::new(),
         };

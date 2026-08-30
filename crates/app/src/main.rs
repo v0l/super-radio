@@ -28,7 +28,10 @@ fn probe(mhz: f64, listen: bool) {
     }
     let start = std::time::Instant::now();
     let mut n = 0;
-    while start.elapsed().as_secs() < 8 {
+    // RDS needs longer than a spectrum check: a station name is four groups
+    // and radiotext is sixteen, repeated every couple of seconds.
+    let secs = if listen { 25 } else { 8 };
+    while start.elapsed().as_secs() < secs {
         let Ok(f) = r.frames.recv_timeout(std::time::Duration::from_secs(3)) else { break };
         n += 1;
         if n % 20 != 0 {
@@ -50,6 +53,23 @@ fn probe(mhz: f64, listen: bool) {
             hz / 1e6,
             peak - median
         );
+    }
+    if listen {
+        let st = r.status.station();
+        println!(
+            "\nstereo blend {:.2}   PI {}   name {:?}   pty {:?}",
+            r.status.blend(),
+            st.pi.map(|p| format!("{p:04X}")).unwrap_or_else(|| "-".into()),
+            st.name,
+            st.pty
+        );
+        println!(
+            "rds groups {}   block errors {}   synced {}",
+            st.groups, st.block_errors, st.synced
+        );
+        if let Some(rt) = st.radiotext {
+            println!("radiotext: {rt}");
+        }
     }
     let dropped = r.status.dropped.load(std::sync::atomic::Ordering::Relaxed);
     println!(

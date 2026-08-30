@@ -781,7 +781,60 @@ impl App {
             ui.add_space(4.0);
             lamp(ui, "drops", dropped > 0, theme::FAULT, &format!("{dropped}"));
             lamp(ui, "rx", running, theme::TRACE, if running { "on" } else { "off" });
+            // Brightness follows the blend rather than switching, matching what
+            // the audio is actually doing: separation is scaled, not toggled.
+            let blend = r.status.blend();
+            lamp_level(
+                ui,
+                "stereo",
+                blend,
+                theme::READOUT,
+                if blend > 0.99 {
+                    "full".to_string()
+                } else if blend < 0.01 {
+                    "mono".to_string()
+                } else {
+                    format!("{:.0}%", blend * 100.0)
+                },
+            );
         });
+    }
+
+    /// Station identification from RDS, shown only once it has arrived.
+    fn rds(&self, ui: &mut egui::Ui) {
+        let Some(r) = &self.radio else { return };
+        let st = r.status.station();
+        if st.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        egui::Frame::NONE
+            .fill(theme::WELL)
+            .stroke(Stroke::new(1.0, theme::ETCH))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(legend("rds"));
+                    if let Some(pi) = st.pi {
+                        ui.label(legend(&format!("PI {pi:04X}")));
+                    }
+                });
+                if let Some(n) = &st.name {
+                    ui.label(value(n).size(16.0).color(theme::READOUT));
+                }
+                if let Some(p) = st.pty {
+                    ui.label(legend(p));
+                }
+                if let Some(rt) = &st.radiotext {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(rt)
+                            .color(theme::LEGEND)
+                            .size(11.0),
+                    );
+                }
+            });
     }
 
     fn strip(&mut self, ui: &mut egui::Ui) {
@@ -810,6 +863,7 @@ impl App {
                     }
                 });
 
+                self.rds(ui);
                 ui.add_space(8.0);
 
                 if self.channels.is_empty() {
@@ -1145,6 +1199,31 @@ fn lamp(ui: &mut egui::Ui, label: &str, lit: bool, col: Color32, text: &str) {
         }
         ui.label(legend(label));
         ui.label(value(text).size(11.0).color(if lit { col } else { theme::LEGEND }));
+    });
+}
+
+/// A lamp whose brightness tracks a continuous level.
+fn lamp_level(ui: &mut egui::Ui, label: &str, level: f32, col: Color32, text: String) {
+    let t = level.clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
+        let dark = Color32::from_rgb(0x2C, 0x31, 0x38);
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+        let c = Color32::from_rgb(
+            mix(dark.r(), col.r()),
+            mix(dark.g(), col.g()),
+            mix(dark.b(), col.b()),
+        );
+        ui.painter().circle_filled(r.center(), 3.5, c);
+        if t > 0.02 {
+            ui.painter().circle_filled(
+                r.center(),
+                6.0,
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (30.0 * t) as u8),
+            );
+        }
+        ui.label(legend(label));
+        ui.label(value(&text).size(11.0).color(c));
     });
 }
 
