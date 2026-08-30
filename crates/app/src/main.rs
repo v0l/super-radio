@@ -1,3 +1,4 @@
+mod prof;
 mod wheel;
 mod bands;
 mod dial;
@@ -88,6 +89,10 @@ fn bench_audio() {
     }
 }
 
+fn soak_enabled(a: &[String]) -> bool {
+    a.iter().any(|x| x == "--soak")
+}
+
 fn main() -> eframe::Result<()> {
     let a: Vec<String> = std::env::args().collect();
     if a.iter().any(|x| x == "--bench-audio") {
@@ -105,6 +110,15 @@ fn main() -> eframe::Result<()> {
         .iter()
         .position(|x| x == "--shot")
         .map(|i| a.get(i + 1).cloned().unwrap_or_else(|| "/tmp/shot.png".into()));
+    if soak_enabled(&a) {
+        use tracing_subscriber::prelude::*;
+        prof::enable();
+        tracing_subscriber::registry().with(prof::Timing).init();
+    }
+    let soak = a
+        .iter()
+        .position(|x| x == "--soak")
+        .map(|i| a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(12.0f32));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
@@ -118,6 +132,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let mut app = ui::App::new(cc);
             app.shot = shot;
+            app.soak = soak;
             Ok(Box::new(app))
         }),
     )
