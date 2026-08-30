@@ -141,11 +141,6 @@ pub fn value(text: impl Into<String>) -> RichText {
         .color(VALUE)
 }
 
-pub fn readout(text: impl Into<String>, size: f32) -> RichText {
-    RichText::new(text)
-        .font(FontId::new(size, FontFamily::Name(READOUT_FONT.into())))
-        .color(READOUT)
-}
 
 #[cfg(test)]
 mod tests {

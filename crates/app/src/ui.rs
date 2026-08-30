@@ -3,7 +3,7 @@
 use crate::bands;
 use crate::dial::Dial;
 use crate::radio::{Cmd, Demod, Frame, Radio, StationInfo};
-use crate::theme::{self, legend, readout, value};
+use crate::theme::{self, legend, value};
 use crate::waterfall::Waterfall;
 use crate::wheel::Wheel;
 use common::{GainMode, Hz, Sps};
@@ -52,6 +52,11 @@ pub struct App {
     pub shot: Option<String>,
     shot_at: Option<std::time::Instant>,
     shot_sent: bool,
+    /// Channel whose marker is being dragged in the spectrum.
+    drag_ch: Option<usize>,
+    /// Shared per-digit readout for the channel strip. Only one channel can be
+    /// under the pointer, so one is enough.
+    chan_dial: crate::dial::Dial,
 }
 
 /// Which settings panel is open. Each pane owns its own, because spectrum and
@@ -125,6 +130,8 @@ impl Default for App {
             spans: Vec::new(),
             soak: None,
             shot: None,
+            drag_ch: None,
+            chan_dial: crate::dial::Dial::new(),
             shot_at: None,
             shot_sent: false,
         }
@@ -179,6 +186,17 @@ impl App {
             move || c.request_repaint(),
         ));
         self.reset_waterfall();
+    }
+
+    /// Release the radio without quitting.
+    ///
+    /// Dropping it stops the thread and gives up the USB claim; a stale
+    /// process holding that claim is why a second program fails to open the
+    /// device at all.
+    fn stop(&mut self) {
+        self.radio = None;
+        self.listening = None;
+        self.err = None;
     }
 
     fn select_device(&mut self, ctx: &egui::Context, e: crate::devices::Entry) {
@@ -534,6 +552,24 @@ impl App {
                             let c = ui.ctx().clone();
                             self.select_device(&c, d);
                         }
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            // Stopping releases the USB claim, which is the
+                            // only way to hand the radio to another program
+                            // without quitting.
+                            let on = self.radio.is_some();
+                            if ui
+                                .add_enabled(!on, egui::Button::new("START"))
+                                .clicked()
+                            {
+                                let c = ui.ctx().clone();
+                                self.connect(&c);
+                            }
+                            if ui.add_enabled(on, egui::Button::new("STOP")).clicked() {
+                                self.stop();
+                            }
+                        });
                     });
 
                     ui.add_space(18.0);
@@ -541,7 +577,7 @@ impl App {
                     ui.add_space(18.0);
 
                     ui.vertical(|ui| {
-                        ui.label(legend("span"));
+                        ui.label(legend("bandwidth"));
                         let cur = self
                             .spans
                             .iter()
@@ -844,7 +880,7 @@ impl App {
 
     fn strip(&mut self, ui: &mut egui::Ui) {
         Panel::right("channels")
-            .default_size(250.0)
+            .default_size(285.0)
             .frame(
                 egui::Frame::NONE
                     .fill(theme::PANEL)
@@ -915,7 +951,14 @@ impl App {
                                     },
                                 );
                             });
-                            ui.label(readout(format!("{:.4}", ch.freq / 1e6), 17.0));
+                            // Per-digit, like the main tuner: the wheel over a
+                            // digit steps that decade, so tuning is repeatable
+                            // rather than depending on pointer speed.
+                            let d = self.chan_dial.compact(ui, ch.freq, 23.0);
+                            if d.changed {
+                                ch.freq = d.hz;
+                                tune = Some(i);
+                            }
                             ui.label(legend(bands::name_at(ch.freq)));
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -1004,7 +1047,7 @@ impl App {
             self.cursor(&p, &full, &resp);
         }
 
-        if resp.clicked() {
+        if resp.clicked() && self.drag_ch.is_none() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 // Cogs sit inside the pane, so they get first refusal on a
                 // click; otherwise opening settings would also drop a channel.
@@ -1022,10 +1065,54 @@ impl App {
                 }
             }
         }
+        // Grabbing a channel marker moves that channel; grabbing anywhere else
+        // pans the view. Deciding once when the drag starts means the gesture
+        // cannot change meaning halfway through as the pointer moves off the
+        // line it grabbed.
+        if resp.drag_started() {
+            self.drag_ch = resp.interact_pointer_pos().and_then(|pos| {
+                if plot_cog.contains(pos) || fall_cog.contains(pos) {
+                    return None;
+                }
+                let hz = self.hz_at(&full, pos.x);
+                let tol = self.rate / full.width() as f64 * 6.0;
+                self.channels.iter().position(|c| (c.freq - hz).abs() < tol)
+            });
+        }
         if resp.dragged() {
-            let dx = resp.drag_delta().x as f64;
-            if dx.abs() > 0.0 {
-                self.retune(self.center - dx * self.rate / full.width() as f64);
+            match self.drag_ch {
+                Some(i) if i < self.channels.len() => {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        // Follow the pointer rather than accumulating deltas,
+                        // so the marker cannot drift away from the cursor.
+                        self.channels[i].freq = self.hz_at(&full, pos.x);
+                        if self.listening == Some(i) {
+                            self.listen(i);
+                        }
+                    }
+                }
+                _ => {
+                    let dx = resp.drag_delta().x as f64;
+                    if dx.abs() > 0.0 {
+                        self.retune(self.center - dx * self.rate / full.width() as f64);
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_ch = None;
+        }
+
+        // A marker under the pointer is draggable, so say so.
+        if self.drag_ch.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        } else if let Some(h) = hover {
+            if !plot_hot && !fall_hot {
+                let hz = self.hz_at(&full, h.x);
+                let tol = self.rate / full.width() as f64 * 6.0;
+                if self.channels.iter().any(|c| (c.freq - hz).abs() < tol) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
             }
         }
 

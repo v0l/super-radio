@@ -138,6 +138,103 @@ impl Dial {
     }
 }
 
+/// Decades shown by the compact dial: 1 GHz down to 100 Hz. Finer than any
+/// broadcast channel needs at the bottom, and the top digit is there because
+/// the tuner reaches 1766 MHz and stopping at 100 MHz would silently drop the
+/// leading digit of anything above 1 GHz.
+const SMALL_DECADES: [i32; 8] = [9, 8, 7, 6, 5, 4, 3, 2];
+
+/// Digits for the compact dial, most significant first.
+///
+/// The lowest decade shown is 100 Hz, so the frequency is scaled by that first.
+/// Taking digits straight off a value in Hz makes every digit mean a hundred
+/// times what its column says, which renders 92.4 MHz as 9240.0000.
+fn small_digits(hz: f64) -> [u8; SMALL_DECADES.len()] {
+    let step = 10f64.powi(*SMALL_DECADES.last().unwrap());
+    // Round rather than truncate: a channel dragged to 92,400,050 Hz should
+    // read 92.4001, not 92.4000.
+    let mut n = (hz / step).round().max(0.0) as u64;
+    let mut digits = [0u8; SMALL_DECADES.len()];
+    for i in (0..SMALL_DECADES.len()).rev() {
+        digits[i] = (n % 10) as u8;
+        n /= 10;
+    }
+    digits
+}
+
+impl Dial {
+    /// A small per-digit readout for a channel, with the same gesture as the
+    /// main dial: the wheel over a digit steps that decade.
+    ///
+    /// Sharing the widget rather than giving each channel its own is safe
+    /// because only one can be under the pointer, and the wheel accumulator
+    /// only means anything while a gesture is in progress.
+    pub fn compact(&mut self, ui: &mut Ui, hz: f64, size: f32) -> DialOut {
+        let digit_w = size * 0.60;
+        let gap = size * 0.26;
+        let width = SMALL_DECADES.len() as f32 * digit_w + gap;
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, size * 1.25), Sense::hover());
+        let p = ui.painter_at(rect);
+
+        let digits = small_digits(hz);
+
+        let hover = response.hover_pos();
+        let mut hot = None;
+        let mut x = rect.left();
+        let cy = rect.center().y;
+        let mut leading = true;
+
+        for (i, &dec) in SMALL_DECADES.iter().enumerate() {
+            if digits[i] != 0 || dec <= 6 {
+                leading = false;
+            }
+            let cell = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(digit_w, rect.height()));
+            let is_hot = hover.is_some_and(|h| cell.x_range().contains(h.x) && rect.contains(h));
+            if is_hot {
+                hot = Some(dec);
+                p.rect_filled(cell, 1.0, Color32::from_rgba_unmultiplied(245, 166, 59, 26));
+                p.line_segment(
+                    [
+                        Pos2::new(cell.left() + 1.0, cell.bottom() - 1.0),
+                        Pos2::new(cell.right() - 1.0, cell.bottom() - 1.0),
+                    ],
+                    Stroke::new(1.5, theme::READOUT),
+                );
+            }
+            p.text(
+                Pos2::new(cell.center().x, cy),
+                Align2::CENTER_CENTER,
+                digits[i].to_string(),
+                FontId::new(size, FontFamily::Name(theme::READOUT_FONT.into())),
+                if leading { theme::READOUT_DIM } else { theme::READOUT },
+            );
+            x += digit_w;
+            if dec == 6 {
+                p.text(
+                    Pos2::new(x + gap * 0.5, cy),
+                    Align2::CENTER_CENTER,
+                    ".",
+                    FontId::new(size, FontFamily::Name(theme::READOUT_FONT.into())),
+                    theme::READOUT_DIM,
+                );
+                x += gap;
+            }
+        }
+
+        let mut out = hz;
+        let mut changed = false;
+        if let Some(dec) = hot {
+            let n = self.wheel.notches(ui);
+            if n != 0 {
+                out = (hz + 10f64.powi(dec) * n as f64).clamp(0.0, 3e9);
+                changed = true;
+            }
+        }
+        DialOut { changed, hz: out }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +277,52 @@ mod tests {
         let hz: f64 = 5.0;
         let out = (hz - 10f64.powi(6)).clamp(0.0, 3e9);
         assert_eq!(out, 0.0);
+    }
+
+    #[test]
+    fn the_compact_dial_resolves_finer_than_any_channel_needs() {
+        // 100 Hz steps against a 12.5 kHz narrowband channel.
+        assert_eq!(*SMALL_DECADES.last().unwrap(), 2);
+        // And reaches past the top of the tuner's range, so a channel above
+        // 1 GHz does not lose its leading digit.
+        assert!(10f64.powi(SMALL_DECADES[0] + 1) > 1.766e9);
+    }
+
+    /// What the compact dial puts on screen, point included.
+    fn rendered(hz: f64) -> String {
+        let d = small_digits(hz);
+        let mut out = String::new();
+        for (i, &dec) in SMALL_DECADES.iter().enumerate() {
+            out.push((b'0' + d[i]) as char);
+            if dec == 6 {
+                out.push('.');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_compact_dial_shows_the_frequency_it_was_given() {
+        // This read 9240.0000 when the digits were taken off a value in Hz
+        // while the lowest column meant hundreds.
+        assert_eq!(rendered(92_400_000.0), "0092.4000");
+        assert_eq!(rendered(95_800_000.0), "0095.8000");
+        assert_eq!(rendered(433_920_000.0), "0433.9200");
+        assert_eq!(rendered(1_090_000_000.0), "1090.0000");
+    }
+
+    #[test]
+    fn the_compact_dial_rounds_rather_than_truncating() {
+        assert_eq!(rendered(92_400_050.0), "0092.4001");
+        assert_eq!(rendered(92_400_040.0), "0092.4000");
+    }
+
+    #[test]
+    fn a_step_on_the_compact_dial_lands_on_the_digit_it_underlines() {
+        // Stepping the 10 kHz column must change only that column.
+        let hz = 92_400_000.0;
+        assert_eq!(rendered(hz + 10f64.powi(4)), "0092.4100");
+        assert_eq!(rendered(hz + 10f64.powi(6)), "0093.4000");
     }
 
     #[test]
