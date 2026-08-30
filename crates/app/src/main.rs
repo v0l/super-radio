@@ -1,6 +1,7 @@
 mod prof;
 mod wheel;
 mod bands;
+mod devices;
 mod dial;
 mod theme;
 mod radio;
@@ -12,7 +13,12 @@ mod waterfall;
 fn probe(mhz: f64, listen: bool) {
     use common::{Hz, Sps};
     let rate = 2_304_000.0;
-    let r = radio::Radio::start(0, Hz((mhz * 1e6) as u64), Sps(rate as u64), 2048, || {});
+    let Some(entry) = devices::list().into_iter().next() else {
+        println!("no radio found");
+        return;
+    };
+    println!("using {}", entry.label);
+    let r = radio::Radio::start(entry, Hz((mhz * 1e6) as u64), Sps(rate as u64), 2048, || {});
     if listen {
         // Decode a channel off-centre, the case that was dropping samples.
         r.send(radio::Cmd::Demod(radio::Demod::Wfm));

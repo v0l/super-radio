@@ -43,6 +43,9 @@ pub struct App {
     volume: f32,
     next_id: u32,
     fft: usize,
+    devices: Vec<crate::devices::Entry>,
+    device: Option<crate::devices::Entry>,
+    spans: Vec<(String, f64)>,
     /// Run for this many seconds, report CPU used, then quit.
     pub soak: Option<f32>,
     /// Save a PNG to this path once the radio has settled, then quit.
@@ -78,13 +81,14 @@ const SPEEDS: [(&str, f32); 5] = [
     ("80", 80.0),
 ];
 
-const SPANS: [(&str, f64); 5] = [
-    ("250k", 250_000.0),
-    ("1.024M", 1_024_000.0),
-    ("2.048M", 2_048_000.0),
-    ("2.304M", 2_304_000.0),
-    ("2.4M", 2_400_000.0),
-];
+/// Rate limits per driver, used to build the span list before the device is
+/// opened. The driver reports the same numbers through `DeviceInfo`.
+fn device_rates(e: &crate::devices::Entry) -> std::ops::RangeInclusive<Sps> {
+    match e.kind {
+        common::DriverKind::HackRf => Sps(2_000_000)..=Sps(20_000_000),
+        _ => Sps(225_000)..=Sps(2_400_000),
+    }
+}
 
 impl Default for App {
     fn default() -> Self {
@@ -116,6 +120,9 @@ impl Default for App {
             volume: 0.5,
             next_id: 1,
             fft: 2048,
+            devices: Vec::new(),
+            device: None,
+            spans: Vec::new(),
             soak: None,
             shot: None,
             shot_at: None,
@@ -128,20 +135,43 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
         let mut app = Self::default();
+        app.devices = crate::devices::list();
+        app.device = app.devices.first().cloned();
         app.connect(&cc.egui_ctx);
         app
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
+        // Dropping the old Radio stops its thread and releases the USB claim
+        // before the next one tries to take it.
+        self.radio = None;
+        self.err = None;
+        let Some(entry) = self.device.clone() else {
+            self.err = Some("no radio found. plug one in, then press RESCAN.".into());
+            return;
+        };
+        self.spans = crate::devices::spans_for(&device_rates(&entry));
+        if !self.spans.iter().any(|(_, r)| (*r - self.rate).abs() < 1.0) {
+            self.rate = self.spans.last().map(|(_, r)| *r).unwrap_or(self.rate);
+        }
         let c = ctx.clone();
         self.radio = Some(Radio::start(
-            0,
+            entry,
             Hz(self.center as u64),
             Sps(self.rate as u64),
             self.fft,
             move || c.request_repaint(),
         ));
-        self.wf.clear();
+        self.reset_waterfall();
+    }
+
+    fn select_device(&mut self, ctx: &egui::Context, e: crate::devices::Entry) {
+        if self.device.as_ref() == Some(&e) {
+            return;
+        }
+        self.device = Some(e);
+        self.listening = None;
+        self.connect(ctx);
     }
 
     fn send(&self, c: Cmd) {
@@ -453,26 +483,73 @@ impl App {
                     ui.add_space(18.0);
 
                     ui.vertical(|ui| {
+                        ui.label(legend("radio"));
+                        let cur = self
+                            .device
+                            .as_ref()
+                            .map(|d| d.label.clone())
+                            .unwrap_or_else(|| "none".into());
+                        let mut pick = None;
+                        let mut rescan = false;
+                        egui::ComboBox::from_id_salt("device")
+                            .selected_text(cur)
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                for d in &self.devices {
+                                    let on = self.device.as_ref() == Some(d);
+                                    if ui.selectable_label(on, &d.label).clicked() {
+                                        pick = Some(d.clone());
+                                    }
+                                }
+                                ui.separator();
+                                if ui.selectable_label(false, "Rescan").clicked() {
+                                    rescan = true;
+                                }
+                            });
+                        if rescan {
+                            self.devices = crate::devices::list();
+                            if self.device.is_none() {
+                                self.device = self.devices.first().cloned();
+                                let c = ui.ctx().clone();
+                                self.connect(&c);
+                            }
+                        }
+                        if let Some(d) = pick {
+                            let c = ui.ctx().clone();
+                            self.select_device(&c, d);
+                        }
+                    });
+
+                    ui.add_space(18.0);
+                    self.divider(ui);
+                    ui.add_space(18.0);
+
+                    ui.vertical(|ui| {
                         ui.label(legend("span"));
-                        let cur = SPANS
+                        let cur = self
+                            .spans
                             .iter()
                             .find(|(_, r)| (self.rate - r).abs() < 1.0)
-                            .map(|(n, _)| *n)
-                            .unwrap_or("custom");
+                            .map(|(n, _)| n.clone())
+                            .unwrap_or_else(|| "custom".into());
+                        let mut pick = None;
                         egui::ComboBox::from_id_salt("span")
                             .selected_text(cur)
                             .width(96.0)
                             .show_ui(ui, |ui| {
-                                for (name, r) in SPANS {
+                                for (name, r) in &self.spans {
                                     let on = (self.rate - r).abs() < 1.0;
                                     if ui.selectable_label(on, name).clicked() && !on {
-                                        self.rate = r;
-                                        self.send(Cmd::Rate(Sps(r as u64)));
-                                        self.reset_waterfall();
-                                        self.retune_listener();
+                                        pick = Some(*r);
                                     }
                                 }
                             });
+                        if let Some(r) = pick {
+                            self.rate = r;
+                            self.send(Cmd::Rate(Sps(r as u64)));
+                            self.reset_waterfall();
+                            self.retune_listener();
+                        }
                     });
 
                     ui.add_space(18.0);

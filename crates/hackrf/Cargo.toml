@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rs-hackrf = "0.4"
+common.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
