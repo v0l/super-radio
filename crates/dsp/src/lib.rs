@@ -11,7 +11,9 @@ pub mod detect;
 pub mod fir;
 pub mod mixer;
 pub mod pulse;
+pub mod rds;
 pub mod spectrum;
+pub mod stereo;
 pub mod window;
 
 pub use blend::{HighBlend, NoiseMeter, VariableLowpass};
@@ -21,4 +23,5 @@ pub use detect::{Burst, Detector, DetectorConfig, NoiseFloor};
 pub use fir::{Fir, FirDecim, FirDecimReal};
 pub use mixer::Mixer;
 pub use spectrum::Spectrum;
+pub use stereo::StereoDecoder;
 pub use pulse::{OokDetector, Package, Pulse, PulseConfig, PulseStats};
