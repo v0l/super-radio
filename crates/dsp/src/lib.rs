@@ -18,7 +18,7 @@ pub use blend::{HighBlend, NoiseMeter, VariableLowpass};
 pub use channelizer::Channelizer;
 pub use demod::{AmDemod, Deemphasis, FmDemod};
 pub use detect::{Burst, Detector, DetectorConfig, NoiseFloor};
-pub use fir::{Fir, FirDecim};
+pub use fir::{Fir, FirDecim, FirDecimReal};
 pub use mixer::Mixer;
 pub use spectrum::Spectrum;
 pub use pulse::{OokDetector, Package, Pulse, PulseConfig, PulseStats};
