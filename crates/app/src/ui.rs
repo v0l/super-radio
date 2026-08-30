@@ -89,6 +89,12 @@ const SPEEDS: [(&str, f32); 5] = [
     ("80", 80.0),
 ];
 
+/// How near the pointer must be to a channel marker to grab it, in pixels.
+///
+/// Must exceed egui's drag threshold, or the pointer leaves the marker before
+/// the drag is reported and the grab is never seen.
+const GRAB_PX: f64 = 10.0;
+
 /// Rate limits per driver, used to build the span list before the device is
 /// opened. The driver reports the same numbers through `DeviceInfo`.
 fn device_rates(e: &crate::devices::Entry) -> std::ops::RangeInclusive<Sps> {
@@ -306,6 +312,24 @@ impl App {
     fn hz_at(&self, rect: &Rect, x: f32) -> f64 {
         let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
         self.center - self.rate / 2.0 + t * self.rate
+    }
+
+    /// Index of the channel marker within grabbing distance of `x`.
+    ///
+    /// Tolerance is in pixels, not Hz: the marker is a line on screen and the
+    /// pointer is aiming at that line, so how close a grab counts as a hit must
+    /// not change with the span.
+    fn channel_at(&self, rect: &Rect, x: f32) -> Option<usize> {
+        let tol = GRAB_PX * self.rate / rect.width().max(1.0) as f64;
+        let hz = self.hz_at(rect, x);
+        self.channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| (c.freq - hz).abs() < tol)
+            .min_by(|a, b| {
+                (a.1.freq - hz).abs().partial_cmp(&(b.1.freq - hz).abs()).unwrap()
+            })
+            .map(|(i, _)| i)
     }
 
     fn x_of(&self, rect: &Rect, hz: f64) -> f32 {
@@ -1090,9 +1114,7 @@ impl App {
                     // Hit testing uses the true position; only the frequency a
                     // new channel lands on is snapped, so shift-clicking an
                     // existing channel still selects it.
-                    let hz = self.hz_at(&full, pos.x);
-                    let tol = self.rate / full.width() as f64 * 6.0;
-                    match self.channels.iter().position(|c| (c.freq - hz).abs() < tol) {
+                    match self.channel_at(&full, pos.x) {
                         Some(i) => self.listen(i),
                         None => self.add_channel(self.hz_at_snapped(&full, pos.x, ui)),
                     }
@@ -1104,13 +1126,19 @@ impl App {
         // cannot change meaning halfway through as the pointer moves off the
         // line it grabbed.
         if resp.drag_started() {
-            self.drag_ch = resp.interact_pointer_pos().and_then(|pos| {
+            // Test where the button went down, not where the pointer is now.
+            // egui only reports a drag once the pointer has passed its drag
+            // threshold, which is about the same distance as the grab
+            // tolerance, so by this point the pointer has already left the
+            // marker it grabbed and every drag looked like a pan.
+            let origin = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| resp.interact_pointer_pos());
+            self.drag_ch = origin.and_then(|pos| {
                 if plot_cog.contains(pos) || fall_cog.contains(pos) {
                     return None;
                 }
-                let hz = self.hz_at(&full, pos.x);
-                let tol = self.rate / full.width() as f64 * 6.0;
-                self.channels.iter().position(|c| (c.freq - hz).abs() < tol)
+                self.channel_at(&full, pos.x)
             });
         }
         if resp.dragged() {
@@ -1142,9 +1170,7 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         } else if let Some(h) = hover {
             if !plot_hot && !fall_hot {
-                let hz = self.hz_at(&full, h.x);
-                let tol = self.rate / full.width() as f64 * 6.0;
-                if self.channels.iter().any(|c| (c.freq - hz).abs() < tol) {
+                if self.channel_at(&full, h.x).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
             }
@@ -1384,6 +1410,62 @@ mod tests {
             let back = a.hz_at(&r, a.x_of(&r, hz));
             assert!((back - hz).abs() < 1.0, "{hz} came back as {back}");
         }
+    }
+
+    fn with_channels(freqs: &[f64]) -> App {
+        let mut a = app();
+        a.center = 95_000_000.0;
+        a.rate = 2_400_000.0;
+        for f in freqs {
+            a.channels.push(Channel {
+                freq: *f,
+                demod: Demod::Wfm,
+                label: "t".into(),
+            });
+        }
+        a
+    }
+
+    #[test]
+    fn a_marker_can_be_grabbed_from_further_than_the_drag_threshold() {
+        // egui only reports a drag once the pointer has moved about 6 px, and
+        // the hit test runs at that moment. A tolerance at or under the
+        // threshold means the pointer has always already left the marker, and
+        // every attempt to drag a channel pans the view instead.
+        assert!(GRAB_PX > 6.0);
+    }
+
+    #[test]
+    fn grabbing_is_a_fixed_distance_on_screen_at_any_span() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        for rate in [250_000.0, 2_400_000.0, 20_000_000.0] {
+            let mut a = with_channels(&[95_000_000.0]);
+            a.rate = rate;
+            let x = a.x_of(&rect, 95_000_000.0);
+            assert_eq!(a.channel_at(&rect, x), Some(0), "rate {rate}");
+            // Just inside the grab distance, and just outside it.
+            assert_eq!(a.channel_at(&rect, x + (GRAB_PX as f32) * 0.8), Some(0), "rate {rate}");
+            assert_eq!(a.channel_at(&rect, x + (GRAB_PX as f32) * 1.5), None, "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn the_nearest_marker_wins_when_two_are_close() {
+        // Taking the first match would grab whichever was added earlier rather
+        // than the one being pointed at.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        let a = with_channels(&[95_000_000.0, 95_009_000.0]);
+        let x = a.x_of(&rect, 95_009_000.0);
+        assert_eq!(a.channel_at(&rect, x), Some(1));
+        let x = a.x_of(&rect, 95_000_000.0);
+        assert_eq!(a.channel_at(&rect, x), Some(0));
+    }
+
+    #[test]
+    fn empty_space_grabs_nothing() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        let a = with_channels(&[95_000_000.0]);
+        assert_eq!(a.channel_at(&rect, a.x_of(&rect, 94_500_000.0)), None);
     }
 
     #[test]
