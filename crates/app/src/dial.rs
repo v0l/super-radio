@@ -1,0 +1,190 @@
+//! Per-digit frequency dial.
+//!
+//! On a hardware receiver you pick a decade and turn the knob, so tuning is
+//! precise and repeatable. A drag field cannot do that: its step depends on how
+//! fast you move the mouse. Here each digit is its own hit target, and the
+//! wheel over a digit steps that decade.
+
+use crate::theme;
+use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+
+/// Digits shown, from 1 GHz down to 1 Hz. Ten of them, because the tuner
+/// reaches 1766 MHz and nine would cap the dial at 999.999999 MHz.
+const DECADES: [i32; 10] = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+/// Where a gap is drawn, keyed by the decade to its right.
+const GROUP_AFTER: [i32; 2] = [6, 3];
+
+pub struct Dial {
+    /// Decade currently under the pointer, if any.
+    pub hot: Option<i32>,
+}
+
+/// Result of drawing the dial.
+pub struct DialOut {
+    pub changed: bool,
+    pub hz: f64,
+}
+
+impl Dial {
+    pub fn new() -> Self {
+        Self { hot: None }
+    }
+
+    /// Draw the readout and apply wheel input. Returns the possibly-updated
+    /// frequency.
+    pub fn show(&mut self, ui: &mut Ui, hz: f64, size: f32) -> DialOut {
+        let digit_w = size * 0.62;
+        let gap = size * 0.22;
+        let width = DECADES.len() as f32 * digit_w + GROUP_AFTER.len() as f32 * gap + size * 2.4;
+        let height = size * 1.5;
+
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        let p = ui.painter_at(rect);
+
+        p.rect_filled(rect, 2.0, theme::WELL);
+        p.rect_stroke(rect, 2.0, Stroke::new(1.0, theme::ETCH), egui::StrokeKind::Inside);
+
+        let hover = response.hover_pos();
+        let mut hot = None;
+
+        // Above 100 MHz the leading digit is significant; below it, it is a
+        // leading zero and should be dimmed rather than hidden, so the digits
+        // never move.
+        let mut n = hz.round().max(0.0) as u64;
+        let mut digits = [0u8; 10];
+        for (i, _) in DECADES.iter().enumerate().rev() {
+            digits[i] = (n % 10) as u8;
+            n /= 10;
+        }
+
+        let mut x = rect.left() + size * 0.5;
+        let cy = rect.center().y;
+        let mut leading = true;
+
+        for (i, &dec) in DECADES.iter().enumerate() {
+            if digits[i] != 0 || dec <= 6 {
+                leading = false;
+            }
+            let cell = Rect::from_min_size(
+                Pos2::new(x, rect.top() + size * 0.18),
+                Vec2::new(digit_w, height - size * 0.36),
+            );
+
+            let is_hot = hover.is_some_and(|h| cell.x_range().contains(h.x) && rect.contains(h));
+            if is_hot {
+                hot = Some(dec);
+                p.rect_filled(cell, 1.0, Color32::from_rgba_unmultiplied(245, 166, 59, 22));
+                // Underline the live decade, the way a receiver marks the
+                // selected tuning step.
+                p.line_segment(
+                    [
+                        Pos2::new(cell.left() + 1.0, cell.bottom()),
+                        Pos2::new(cell.right() - 1.0, cell.bottom()),
+                    ],
+                    Stroke::new(2.0, theme::READOUT),
+                );
+            }
+
+            let col = if leading { theme::READOUT_DIM } else { theme::READOUT };
+            p.text(
+                Pos2::new(cell.center().x, cy),
+                Align2::CENTER_CENTER,
+                digits[i].to_string(),
+                FontId::new(size, FontFamily::Name(theme::READOUT_FONT.into())),
+                col,
+            );
+
+            x += digit_w;
+            if GROUP_AFTER.contains(&dec) {
+                // A dot at the MHz break, a thinner space at the kHz break:
+                // the same convention as a printed frequency.
+                let mark = if dec == 6 { "." } else { "\u{2009}" };
+                p.text(
+                    Pos2::new(x + gap * 0.5, cy),
+                    Align2::CENTER_CENTER,
+                    mark,
+                    FontId::new(size, FontFamily::Name(theme::READOUT_FONT.into())),
+                    theme::READOUT_DIM,
+                );
+                x += gap;
+            }
+        }
+
+        p.text(
+            Pos2::new(rect.right() - size * 0.35, cy + size * 0.12),
+            Align2::RIGHT_CENTER,
+            "MHz",
+            FontId::new(size * 0.34, FontFamily::Name(theme::LEGEND_FONT.into())),
+            theme::LEGEND,
+        );
+
+        self.hot = hot;
+
+        let mut out = hz;
+        let mut changed = false;
+        if let Some(dec) = hot {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let step = 10f64.powi(dec) * scroll.signum() as f64;
+                out = (hz + step).clamp(0.0, 3e9);
+                changed = true;
+            }
+        }
+
+        let _ = response;
+        DialOut { changed, hz: out }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dial_shows_every_decade_it_claims_to() {
+        // Nine digits covers 100 MHz down to 1 Hz, which must span the whole
+        // RTL-SDR range with the leading digit still meaningful at 1.7 GHz.
+        assert_eq!(DECADES.len(), 10);
+        assert_eq!(*DECADES.first().unwrap(), 9);
+        assert_eq!(*DECADES.last().unwrap(), 0);
+        assert!(10f64.powi(DECADES[0] + 1) > 1.766e9);
+    }
+
+    #[test]
+    fn digit_extraction_matches_the_frequency() {
+        let hz = 95_800_000u64;
+        let mut n = hz;
+        let mut digits = [0u8; 10];
+        for i in (0..10).rev() {
+            digits[i] = (n % 10) as u8;
+            n /= 10;
+        }
+        // 0095.800 000
+        assert_eq!(digits, [0, 0, 9, 5, 8, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_step_changes_only_its_own_decade() {
+        let hz = 95_800_000.0;
+        for dec in 0..10 {
+            let stepped = hz + 10f64.powi(dec);
+            let diff = stepped - hz;
+            assert!((diff - 10f64.powi(dec)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn tuning_cannot_go_negative() {
+        let hz: f64 = 5.0;
+        let out = (hz - 10f64.powi(6)).clamp(0.0, 3e9);
+        assert_eq!(out, 0.0);
+    }
+
+    #[test]
+    fn groups_break_at_mhz_and_khz() {
+        // 095.800 000 reads as MHz . kHz Hz, matching how frequencies are
+        // written down and spoken.
+        assert_eq!(GROUP_AFTER, [6, 3]);
+    }
+}

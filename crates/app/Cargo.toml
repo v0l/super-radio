@@ -20,3 +20,4 @@ sources.workspace = true
 crossbeam-channel.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }

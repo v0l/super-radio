@@ -143,6 +143,17 @@ AM in the airband, otherwise NFM) and can be overridden per channel.
 The display auto-scales against the 10th and 99.9th percentiles rather than the
 extremes, so one strong carrier does not flatten everything else.
 
+The frequency readout is a per-digit dial: hover a digit and scroll to step
+that decade, the way you pick a tuning step on a hardware receiver. The two
+accent colours carry meaning rather than decoration -- amber is what you set,
+cyan is what the radio hears -- and the waterfall ramps between them.
+
+To capture a PNG of the running interface:
+
+```
+cargo run --release -p app -- --shot /tmp/shot.png
+```
+
 To check the signal path without a display:
 
 ```

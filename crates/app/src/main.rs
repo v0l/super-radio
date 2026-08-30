@@ -1,3 +1,6 @@
+mod bands;
+mod dial;
+mod theme;
 mod radio;
 mod ui;
 mod waterfall;
@@ -46,12 +49,24 @@ fn main() -> eframe::Result<()> {
         probe(a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8));
         return Ok(());
     }
+    let shot = a
+        .iter()
+        .position(|x| x == "--shot")
+        .map(|i| a.get(i + 1).cloned().unwrap_or_else(|| "/tmp/shot.png".into()));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
             .with_min_inner_size([800.0, 500.0])
             .with_title("super-radio"),
         ..Default::default()
     };
-    eframe::run_native("super-radio", opts, Box::new(|cc| Ok(Box::new(ui::App::new(cc)))))
+    eframe::run_native(
+        "super-radio",
+        opts,
+        Box::new(move |cc| {
+            let mut app = ui::App::new(cc);
+            app.shot = shot;
+            Ok(Box::new(app))
+        }),
+    )
 }

@@ -238,6 +238,7 @@ dependencies = [
  "dsp",
  "eframe",
  "egui",
+ "image",
  "parking_lot",
  "rtlsdr",
  "sources",
