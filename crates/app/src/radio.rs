@@ -27,7 +27,7 @@ impl Demod {
     }
 
     /// Occupied channel bandwidth, two-sided.
-    fn bandwidth(self) -> f64 {
+    pub fn bandwidth(self) -> f64 {
         match self {
             // Carson: 2 * (75 kHz deviation + 15 kHz audio).
             Demod::Wfm => 180_000.0,
@@ -75,6 +75,7 @@ pub enum Cmd {
     Listen(Option<f64>),
     Demod(Demod),
     Volume(f32),
+    Fft(usize),
     Stop,
 }
 
@@ -295,6 +296,9 @@ fn run(
                     retune = true;
                 }
                 Cmd::Volume(v) => volume = v,
+                Cmd::Fft(n) => {
+                    spec = Spectrum::new(n);
+                }
             }
         }
 

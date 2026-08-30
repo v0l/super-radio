@@ -5,6 +5,7 @@ use crate::dial::Dial;
 use crate::radio::{Cmd, Demod, Frame, Radio};
 use crate::theme::{self, legend, readout, value};
 use crate::waterfall::Waterfall;
+use crate::wheel::Wheel;
 use common::{GainMode, Hz, Sps};
 use egui::containers::{CentralPanel, Panel};
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -24,6 +25,14 @@ pub struct App {
     auto_scale: bool,
 
     dial: Dial,
+    /// Centre the waterfall history currently corresponds to, so a retune can
+    /// slide it instead of throwing it away.
+    wf_center: f64,
+    wf_pending: Vec<f32>,
+    wf_last: Option<std::time::Instant>,
+    rows_per_sec: f32,
+    fft_size: usize,
+    scrub: Wheel,
     channels: Vec<Channel>,
     listening: Option<usize>,
     volume: f32,
@@ -40,6 +49,16 @@ pub struct Channel {
     demod: Demod,
     label: String,
 }
+
+const FFTS: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+/// Waterfall scroll rates in rows per second.
+const SPEEDS: [(&str, f32); 5] = [
+    ("5", 5.0),
+    ("10", 10.0),
+    ("20", 20.0),
+    ("40", 40.0),
+    ("80", 80.0),
+];
 
 const SPANS: [(&str, f64); 5] = [
     ("250k", 250_000.0),
@@ -63,6 +82,12 @@ impl Default for App {
             ceil: -20.0,
             auto_scale: true,
             dial: Dial::new(),
+            wf_center: 95_800_000.0,
+            wf_pending: Vec::new(),
+            wf_last: None,
+            rows_per_sec: 20.0,
+            fft_size: 2048,
+            scrub: Wheel::default(),
             channels: Vec::new(),
             listening: None,
             volume: 0.5,
@@ -116,11 +141,45 @@ impl App {
             if self.auto_scale {
                 self.rescale(&f.db);
             }
-            // The waterfall tops out a little below the trace's ceiling. The
-            // plot wants headroom so peaks are not clipped flat; the colour
-            // ramp wants the opposite, or its hottest colours are never used.
-            self.wf.push(&f.db, self.floor, self.ceil - 5.0);
+            self.slide_waterfall(f.db.len());
+
+            // Hold the peak between rows rather than sampling one frame in N,
+            // or a short burst lands between rows and is never drawn.
+            if self.wf_pending.len() != f.db.len() {
+                self.wf_pending = f.db.clone();
+            } else {
+                for (a, b) in self.wf_pending.iter_mut().zip(&f.db) {
+                    *a = a.max(*b);
+                }
+            }
+            let due = self
+                .wf_last
+                .map(|t| t.elapsed().as_secs_f32() >= 1.0 / self.rows_per_sec)
+                .unwrap_or(true);
+            if due {
+                // The waterfall tops out below the trace's ceiling: the plot
+                // wants headroom so peaks are not clipped flat, the colour
+                // ramp wants the opposite or its hottest colours go unused.
+                let pending = std::mem::take(&mut self.wf_pending);
+                self.wf.push(&pending, self.floor, self.ceil - 5.0);
+                self.wf_pending = pending;
+                self.wf_pending.fill(f32::MIN);
+                self.wf_last = Some(std::time::Instant::now());
+            }
             self.db = f.db;
+        }
+    }
+
+    /// Slide the waterfall to match a new centre frequency.
+    fn slide_waterfall(&mut self, bins: usize) {
+        if bins == 0 {
+            return;
+        }
+        let hz_per_bin = self.rate / bins as f64;
+        let d = ((self.center - self.wf_center) / hz_per_bin).round();
+        if d != 0.0 {
+            self.wf.shift(d as i32);
+            self.wf_center += d * hz_per_bin;
         }
     }
 
@@ -151,8 +210,14 @@ impl App {
     fn retune(&mut self, hz: f64) {
         self.center = hz.clamp(24e6, 1766e6);
         self.send(Cmd::Center(Hz(self.center as u64)));
-        self.wf.clear();
         self.retune_listener();
+    }
+
+    /// The span or bin count changed, so old rows no longer line up.
+    fn reset_waterfall(&mut self) {
+        self.wf.clear();
+        self.wf_center = self.center;
+        self.wf_pending.clear();
     }
 
     fn add_channel(&mut self, freq: f64) {
@@ -278,7 +343,7 @@ impl App {
                                 if ui.selectable_label(on, name).clicked() && !on {
                                     self.rate = r;
                                     self.send(Cmd::Rate(Sps(r as u64)));
-                                    self.wf.clear();
+                                    self.reset_waterfall();
                                     self.retune_listener();
                                 }
                             }
@@ -320,6 +385,38 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.lamps(ui);
                     });
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(legend("fft bins"));
+                    for n in FFTS {
+                        let on = self.fft_size == n;
+                        if ui.selectable_label(on, n.to_string()).clicked() && !on {
+                            self.fft_size = n;
+                            self.send(Cmd::Fft(n));
+                            self.reset_waterfall();
+                        }
+                    }
+
+                    ui.add_space(14.0);
+                    ui.label(legend("rows/sec"));
+                    for (name, v) in SPEEDS {
+                        let on = (self.rows_per_sec - v).abs() < 0.01;
+                        if ui.selectable_label(on, name).clicked() {
+                            self.rows_per_sec = v;
+                        }
+                    }
+
+                    ui.add_space(14.0);
+                    ui.label(legend("scale"));
+                    if ui.selectable_label(self.auto_scale, "AUTO").clicked() {
+                        self.auto_scale = !self.auto_scale;
+                    }
+                    if !self.auto_scale {
+                        ui.add(egui::Slider::new(&mut self.floor, -140.0..=0.0).text("floor"));
+                        ui.add(egui::Slider::new(&mut self.ceil, -140.0..=20.0).text("ceil"));
+                    }
                 });
 
                 if let Some(e) = &self.err {
@@ -460,19 +557,6 @@ impl App {
                     self.listen(i);
                 }
 
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.collapsing("Display", |ui| {
-                        ui.checkbox(&mut self.auto_scale, "Auto scale");
-                        ui.add_enabled(
-                            !self.auto_scale,
-                            egui::Slider::new(&mut self.floor, -140.0..=0.0).text("floor"),
-                        );
-                        ui.add_enabled(
-                            !self.auto_scale,
-                            egui::Slider::new(&mut self.ceil, -140.0..=20.0).text("ceiling"),
-                        );
-                    });
-                });
             });
     }
 
@@ -488,20 +572,31 @@ impl App {
         let fall = Rect::from_min_max(Pos2::new(full.left(), ribbon.bottom()), full.max);
 
         let resp = ui.allocate_rect(full, Sense::click_and_drag());
-        let p = ui.painter_at(full);
+        let p = ui.painter_at(full).to_owned();
         p.rect_filled(plot, 0.0, theme::WELL);
 
         self.grid(&p, &plot);
         self.trace(&p, &plot);
         self.ribbon(&p, &ribbon);
 
+        p.rect_filled(fall, 0.0, theme::CHASSIS);
+        let frac = self.wf.filled_fraction();
         if let Some(tex) = self.wf.texture(ui.ctx()) {
-            p.image(
-                tex.id(),
-                fall,
-                Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            if frac > 0.0 {
+                // Draw only the rows that exist, at the same height per row as
+                // when the buffer is full, so filling up looks like history
+                // accumulating rather than the image stretching.
+                let shown = Rect::from_min_max(
+                    fall.min,
+                    Pos2::new(fall.right(), fall.top() + fall.height() * frac),
+                );
+                p.image(
+                    tex.id(),
+                    shown,
+                    Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, frac)),
+                    Color32::WHITE,
+                );
+            }
         }
 
         self.markers(&p, &full);
@@ -521,6 +616,16 @@ impl App {
             let dx = resp.drag_delta().x as f64;
             if dx.abs() > 0.0 {
                 self.retune(self.center - dx * self.rate / full.width() as f64);
+            }
+        }
+
+        // Wheel over the pane scrubs the centre frequency. A notch moves a
+        // twentieth of the span, so the gesture means the same thing at every
+        // zoom level.
+        if resp.hovered() {
+            let n = self.scrub.notches(ui);
+            if n != 0 {
+                self.retune(self.center - n as f64 * self.rate / 20.0);
             }
         }
     }
@@ -621,6 +726,31 @@ impl App {
             let x = self.x_of(full, ch.freq);
             let active = self.listening == Some(i);
             let col = if active { theme::READOUT } else { Color32::from_rgb(0x6E, 0x7A, 0x88) };
+
+            // Show what the demodulator actually takes in, not just where it
+            // is centred: an NFM channel and a WFM channel at the same spot
+            // are wildly different slices of spectrum.
+            let half = ch.demod.bandwidth() / 2.0;
+            let (bx0, bx1) = (self.x_of(full, ch.freq - half), self.x_of(full, ch.freq + half));
+            if bx1 - bx0 >= 1.0 {
+                let band = Rect::from_min_max(
+                    Pos2::new(bx0.max(full.left()), full.top()),
+                    Pos2::new(bx1.min(full.right()), full.bottom()),
+                );
+                p.rect_filled(
+                    band,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), if active { 34 } else { 18 }),
+                );
+                for ex in [bx0, bx1] {
+                    if full.x_range().contains(ex) {
+                        p.line_segment(
+                            [Pos2::new(ex, full.top()), Pos2::new(ex, full.bottom())],
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 120)),
+                        );
+                    }
+                }
+            }
             p.line_segment(
                 [Pos2::new(x, full.top()), Pos2::new(x, full.bottom())],
                 Stroke::new(if active { 1.5 } else { 1.0 }, col),
