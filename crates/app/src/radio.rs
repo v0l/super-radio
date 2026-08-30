@@ -4,7 +4,7 @@
 use audio::AudioPlayer;
 use common::{Device, GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use dsp::{Deemphasis, FirDecim, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum};
+use dsp::{Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -26,12 +26,35 @@ impl Demod {
         }
     }
 
-    /// Channel bandwidth, which sets how far we decimate.
+    /// Occupied channel bandwidth, two-sided.
     fn bandwidth(self) -> f64 {
         match self {
-            Demod::Wfm => 200_000.0,
+            // Carson: 2 * (75 kHz deviation + 15 kHz audio).
+            Demod::Wfm => 180_000.0,
             Demod::Nfm => 12_500.0,
             Demod::Am => 10_000.0,
+        }
+    }
+
+    /// Sample rate to run the demodulator at.
+    ///
+    /// Comfortably above the channel bandwidth, never equal to it. Decimating
+    /// until the output rate matches the bandwidth leaves no transition band,
+    /// and the anti-alias filter then needs thousands of taps: 7947 for NFM
+    /// against 281 here, with a history buffer too big for L2.
+    fn if_rate(self) -> f64 {
+        match self {
+            Demod::Wfm => 288_000.0,
+            Demod::Nfm | Demod::Am => 48_000.0,
+        }
+    }
+
+    /// Audio bandwidth after demodulation.
+    fn audio_bw(self) -> f64 {
+        match self {
+            Demod::Wfm => 15_000.0,
+            Demod::Nfm => 4_000.0,
+            Demod::Am => 5_000.0,
         }
     }
 
@@ -132,12 +155,12 @@ impl Drop for Radio {
 }
 
 /// Audio chain for one channel, rebuilt whenever the tuning or mode changes.
-struct Audio {
+pub struct Audio {
     mixer: Mixer,
     if_dec: FirDecim,
     demod: FmDemod,
     am: bool,
-    au_dec: FirDecim,
+    au_dec: FirDecimReal,
     deemph: Deemphasis,
     noise: NoiseMeter,
     blend: HighBlend,
@@ -145,25 +168,22 @@ struct Audio {
     shifted: Vec<C32>,
     iq: Vec<C32>,
     disc: Vec<f32>,
-    au: Vec<C32>,
     pcm: Vec<f32>,
 }
 
 impl Audio {
-    fn new(offset: f64, rate: f64, mode: Demod, target: f64) -> Self {
-        // Pick integer decimations that land closest to the target audio rate,
-        // so the chain needs no rational resampling of its own.
-        let if_dec = ((rate / mode.bandwidth()).floor() as usize).max(1);
+    pub fn new(offset: f64, rate: f64, mode: Demod, target: f64) -> Self {
+        let if_dec = ((rate / mode.if_rate()).round() as usize).max(1);
         let if_rate = rate / if_dec as f64;
         let au_dec = ((if_rate / target).round() as usize).max(1);
         let audio_rate = if_rate / au_dec as f64;
 
         Self {
             mixer: Mixer::new(-offset, rate),
-            if_dec: FirDecim::design(if_dec, 0.8, 70.0),
+            if_dec: FirDecim::design_hz(rate, if_dec, mode.bandwidth() / 2.0, 70.0),
             demod: FmDemod::new(if_rate, mode.deviation().max(1.0)),
             am: mode == Demod::Am,
-            au_dec: FirDecim::design(au_dec, 0.8, 70.0),
+            au_dec: FirDecimReal::design_hz(if_rate, au_dec, mode.audio_bw(), 70.0),
             deemph: Deemphasis::eu(audio_rate),
             noise: NoiseMeter::new(if_rate),
             blend: HighBlend::new(audio_rate),
@@ -171,31 +191,38 @@ impl Audio {
             shifted: Vec::new(),
             iq: Vec::new(),
             disc: Vec::new(),
-            au: Vec::new(),
             pcm: Vec::new(),
         }
     }
 
-    fn process(&mut self, input: &[C32], gain: f32) -> &[f32] {
+    pub fn cost(&self) -> String {
+        format!("if {} taps /{}, audio {} taps /{}",
+            self.if_dec.taps(), self.if_dec.factor(),
+            self.au_dec.taps(), self.au_dec.factor())
+    }
+
+    pub fn process(&mut self, input: &[C32], gain: f32) -> &[f32] {
+        // Every one of these appends, so they must all be cleared. Missing
+        // one makes the buffer grow without bound and each block re-filters
+        // the whole accumulated history.
+        self.shifted.clear();
         self.mixer.process(input, &mut self.shifted);
         self.iq.clear();
         self.if_dec.process(&self.shifted, &mut self.iq);
 
+        self.disc.clear();
         if self.am {
-            self.disc.clear();
             self.disc.extend(self.iq.iter().map(|c| c.norm()));
         } else {
             self.demod.process(&self.iq, &mut self.disc);
         }
         let n = self.noise.process(&self.disc);
 
-        // The audio decimator is complex, so carry the real signal through it.
-        self.au.clear();
-        let real: Vec<C32> = self.disc.iter().map(|&v| C32::new(v, 0.0)).collect();
-        self.au_dec.process(&real, &mut self.au);
-
         self.pcm.clear();
-        self.pcm.extend(self.au.iter().map(|c| c.re * gain));
+        self.au_dec.process(&self.disc, &mut self.pcm);
+        for v in self.pcm.iter_mut() {
+            *v *= gain;
+        }
         if !self.am {
             self.deemph.process(&mut self.pcm);
         }
@@ -298,6 +325,92 @@ fn run(
             let pcm = a.process(&buf.samples, volume);
             s.write_adaptive(pcm, rate);
             status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(n: usize) -> Vec<C32> {
+        (0..n)
+            .map(|i| {
+                let p = std::f64::consts::TAU * 0.1 * i as f64;
+                C32::new(p.cos() as f32 * 0.5, p.sin() as f32 * 0.5)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scratch_buffers_do_not_grow_across_blocks() {
+        // Every stage appends to its output. If one is not cleared it grows
+        // without bound and each block re-filters the whole history, which
+        // looks like the radio slowly seizing up rather than an obvious fault.
+        let mut a = Audio::new(120_000.0, 2_304_000.0, Demod::Wfm, 48_000.0);
+        let b = block(8192);
+        for _ in 0..20 {
+            a.process(&b, 0.5);
+        }
+        assert_eq!(a.shifted.len(), b.len(), "mixer output grew");
+        assert!(a.iq.len() <= b.len(), "if output grew");
+        assert!(a.disc.len() <= b.len(), "discriminator output grew");
+        assert!(a.pcm.len() <= b.len(), "audio output grew");
+    }
+
+    #[test]
+    fn output_length_is_steady_block_to_block() {
+        let mut a = Audio::new(0.0, 2_304_000.0, Demod::Nfm, 48_000.0);
+        let b = block(4800);
+        let first = a.process(&b, 0.5).len();
+        for _ in 0..10 {
+            let n = a.process(&b, 0.5).len();
+            assert!(
+                (n as i64 - first as i64).abs() <= 1,
+                "block produced {n} samples after {first}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mode_runs_faster_than_real_time() {
+        // The audio chain shares the radio thread with USB draining, so
+        // anything near 1x drops samples.
+        let rate = 2_304_000.0;
+        let b = block(131_072);
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+            let mut a = Audio::new(120_000.0, rate, mode, 48_000.0);
+            a.process(&b, 0.5);
+            let t = std::time::Instant::now();
+            for _ in 0..4 {
+                a.process(&b, 0.5);
+            }
+            let x = (4.0 * b.len() as f64 / rate) / t.elapsed().as_secs_f64();
+            assert!(x > 4.0, "{} only ran at {x:.1}x real time", mode.label());
+        }
+    }
+
+    #[test]
+    fn filters_stay_short_enough_to_sit_in_cache() {
+        // Driving the IF rate down to the channel bandwidth leaves no
+        // transition band and asks for thousands of taps.
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+            let a = Audio::new(0.0, 2_304_000.0, mode, 48_000.0);
+            assert!(
+                a.if_dec.taps() < 600,
+                "{} if filter is {} taps",
+                mode.label(),
+                a.if_dec.taps()
+            );
+        }
+    }
+
+    #[test]
+    fn the_audio_rate_is_close_to_what_was_asked_for() {
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+            let a = Audio::new(0.0, 2_304_000.0, mode, 48_000.0);
+            let r = a.audio_rate;
+            assert!((r - 48_000.0).abs() < 12_000.0, "{} gave {r} Hz", mode.label());
         }
     }
 }

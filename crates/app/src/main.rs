@@ -7,10 +7,17 @@ mod waterfall;
 
 /// `--probe <mhz>` runs the radio thread without a window and reports what the
 /// waterfall would be drawing, so the signal path can be checked over ssh.
-fn probe(mhz: f64) {
+fn probe(mhz: f64, listen: bool) {
     use common::{Hz, Sps};
     let rate = 2_304_000.0;
     let r = radio::Radio::start(0, Hz((mhz * 1e6) as u64), Sps(rate as u64), 2048, || {});
+    if listen {
+        // Decode a channel off-centre, the case that was dropping samples.
+        r.send(radio::Cmd::Demod(radio::Demod::Wfm));
+        r.send(radio::Cmd::Listen(Some(0.0)));
+        r.send(radio::Cmd::Volume(0.0));
+        println!("decoding a WFM channel while measuring");
+    }
     let start = std::time::Instant::now();
     let mut n = 0;
     while start.elapsed().as_secs() < 8 {
@@ -36,17 +43,61 @@ fn probe(mhz: f64) {
             peak - median
         );
     }
-    println!("\n{n} frames in {:.1}s", start.elapsed().as_secs_f64());
+    let dropped = r.status.dropped.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "\n{n} frames in {:.1}s   dropped {dropped}",
+        start.elapsed().as_secs_f64()
+    );
     let err = r.status.error.lock().clone();
     if let Some(e) = err {
         println!("error: {e}");
     }
 }
 
+/// Time the per-channel audio chain against real time, which is the only
+/// number that decides whether the radio thread can keep draining USB.
+fn bench_audio() {
+    use common::C32;
+    let rate = 2_304_000.0;
+    let block = 262_144usize;
+    let sig: Vec<C32> = (0..block)
+        .map(|i| {
+            let p = std::f64::consts::TAU * 0.1 * i as f64;
+            C32::new(p.cos() as f32 * 0.5, p.sin() as f32 * 0.5)
+        })
+        .collect();
+    println!("{:5} {:>44} {:>10} {:>10}", "mode", "filters", "x real", "us/block");
+    for mode in [radio::Demod::Wfm, radio::Demod::Nfm, radio::Demod::Am] {
+        let mut a = radio::Audio::new(120_000.0, rate, mode, 48_000.0);
+        a.process(&sig, 0.5);
+        let reps = 24;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            a.process(&sig, 0.5);
+        }
+        let el = t.elapsed().as_secs_f64();
+        let audio_secs = reps as f64 * block as f64 / rate;
+        println!(
+            "{:5} {:>44} {:>9.1}x {:>9.0}",
+            mode.label(),
+            a.cost(),
+            audio_secs / el,
+            el / reps as f64 * 1e6
+        );
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().any(|x| x == "--bench-audio") {
+        bench_audio();
+        return Ok(());
+    }
     if let Some(i) = a.iter().position(|x| x == "--probe") {
-        probe(a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8));
+        probe(
+            a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8),
+            a.iter().any(|x| x == "--listen"),
+        );
         return Ok(());
     }
     let shot = a
