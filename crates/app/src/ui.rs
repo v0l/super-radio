@@ -34,6 +34,10 @@ pub struct App {
     refresh: f32,
     fft_size: usize,
     scrub: Wheel,
+    open: Option<Settings>,
+    smoothing: f32,
+    wf_top_offset: f32,
+    wf_rows: usize,
     channels: Vec<Channel>,
     listening: Option<usize>,
     volume: f32,
@@ -45,6 +49,15 @@ pub struct App {
     pub shot: Option<String>,
     shot_at: Option<std::time::Instant>,
     shot_sent: bool,
+}
+
+/// Which settings panel is open. Each pane owns its own, because spectrum and
+/// waterfall settings are unrelated and lumping them together makes both
+/// harder to find.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Settings {
+    Spectrum,
+    Waterfall,
 }
 
 pub struct Channel {
@@ -94,6 +107,10 @@ impl Default for App {
             refresh: 30.0,
             fft_size: 2048,
             scrub: Wheel::default(),
+            open: None,
+            smoothing: 0.35,
+            wf_top_offset: 5.0,
+            wf_rows: 512,
             channels: Vec::new(),
             listening: None,
             volume: 0.5,
@@ -168,7 +185,7 @@ impl App {
                 // wants headroom so peaks are not clipped flat, the colour
                 // ramp wants the opposite or its hottest colours go unused.
                 let pending = std::mem::take(&mut self.wf_pending);
-                self.wf.push(&pending, self.floor, self.ceil - 5.0);
+                    self.wf.push(&pending, self.floor, self.ceil - self.wf_top_offset);
                 self.wf_pending = pending;
                 self.wf_pending.fill(f32::MIN);
                 self.wf_last = Some(std::time::Instant::now());
@@ -258,6 +275,49 @@ impl App {
     }
 }
 
+/// A labelled settings row: legend on the left, control on the right, so the
+/// modal reads as a column of settings rather than a wall of widgets.
+fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new(legend(label)));
+        add(ui);
+    });
+}
+
+/// Resolution bandwidth, which is what the bin count actually buys you.
+fn bin_hint(rate: f64, bins: usize) -> String {
+    let hz = rate / bins as f64;
+    if hz >= 1000.0 {
+        format!("{:.1} kHz per bin", hz / 1e3)
+    } else {
+        format!("{hz:.0} Hz per bin")
+    }
+}
+
+/// Settings affordance in a pane corner.
+fn cog_rect(pane: &Rect) -> Rect {
+    let s = 18.0;
+    Rect::from_min_size(Pos2::new(pane.right() - s - 6.0, pane.top() + 6.0), Vec2::splat(s))
+}
+
+fn cog(p: &egui::Painter, r: &Rect, hot: bool) {
+    let col = if hot { theme::READOUT } else { Color32::from_rgb(0x6A, 0x72, 0x7C) };
+    let c = r.center();
+    let rad = r.width() * 0.30;
+    for i in 0..6 {
+        let a = std::f32::consts::TAU * i as f32 / 6.0;
+        let (s, co) = a.sin_cos();
+        p.line_segment(
+            [
+                Pos2::new(c.x + co * rad * 0.95, c.y + s * rad * 0.95),
+                Pos2::new(c.x + co * rad * 1.55, c.y + s * rad * 1.55),
+            ],
+            Stroke::new(1.6, col),
+        );
+    }
+    p.circle_stroke(c, rad, Stroke::new(1.6, col));
+}
+
 fn fmt_hz(hz: f64) -> String {
     if hz.abs() >= 1e6 {
         format!("{:.4} MHz", hz / 1e6)
@@ -285,10 +345,13 @@ impl eframe::App for App {
             let _s = tracing::info_span!("strip").entered();
             self.strip(ui);
         }
-        let _s = tracing::info_span!("scope").entered();
-        CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(theme::CHASSIS))
-            .show(ui, |ui| self.scope(ui));
+        {
+            let _s = tracing::info_span!("scope").entered();
+            CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(theme::CHASSIS))
+                .show(ui, |ui| self.scope(ui));
+        }
+        self.settings_modal(ui.ctx());
     }
 }
 
@@ -391,17 +454,25 @@ impl App {
 
                     ui.vertical(|ui| {
                         ui.label(legend("span"));
-                        ui.horizontal(|ui| {
-                            for (name, r) in SPANS {
-                                let on = (self.rate - r).abs() < 1.0;
-                                if ui.selectable_label(on, name).clicked() && !on {
-                                    self.rate = r;
-                                    self.send(Cmd::Rate(Sps(r as u64)));
-                                    self.reset_waterfall();
-                                    self.retune_listener();
+                        let cur = SPANS
+                            .iter()
+                            .find(|(_, r)| (self.rate - r).abs() < 1.0)
+                            .map(|(n, _)| *n)
+                            .unwrap_or("custom");
+                        egui::ComboBox::from_id_salt("span")
+                            .selected_text(cur)
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for (name, r) in SPANS {
+                                    let on = (self.rate - r).abs() < 1.0;
+                                    if ui.selectable_label(on, name).clicked() && !on {
+                                        self.rate = r;
+                                        self.send(Cmd::Rate(Sps(r as u64)));
+                                        self.reset_waterfall();
+                                        self.retune_listener();
+                                    }
                                 }
-                            }
-                        });
+                            });
                     });
 
                     ui.add_space(18.0);
@@ -441,49 +512,7 @@ impl App {
                     });
                 });
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(legend("fft bins"));
-                    for n in FFTS {
-                        let on = self.fft_size == n;
-                        if ui.selectable_label(on, n.to_string()).clicked() && !on {
-                            self.fft_size = n;
-                            self.send(Cmd::Fft(n));
-                            self.reset_waterfall();
-                        }
-                    }
-
-                    ui.add_space(14.0);
-                    ui.label(legend("rows/sec"));
-                    for (name, v) in SPEEDS {
-                        let on = (self.rows_per_sec - v).abs() < 0.01;
-                        if ui.selectable_label(on, name).clicked() {
-                            self.rows_per_sec = v;
-                        }
-                    }
-
-                    ui.add_space(14.0);
-                    ui.label(legend("fps"));
-                    for (name, v) in REFRESH {
-                        let on = (self.refresh - v).abs() < 0.01;
-                        if ui.selectable_label(on, name).clicked() && !on {
-                            self.refresh = v;
-                            self.send(Cmd::Refresh(v));
-                        }
-                    }
-
-                    ui.add_space(14.0);
-                    ui.label(legend("scale"));
-                    if ui.selectable_label(self.auto_scale, "AUTO").clicked() {
-                        self.auto_scale = !self.auto_scale;
-                    }
-                    if !self.auto_scale {
-                        ui.add(egui::Slider::new(&mut self.floor, -140.0..=0.0).text("floor"));
-                        ui.add(egui::Slider::new(&mut self.ceil, -140.0..=20.0).text("ceil"));
-                    }
-                });
-
-                if let Some(e) = &self.err {
+            if let Some(e) = &self.err {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(e)
@@ -492,6 +521,164 @@ impl App {
                     );
                 }
             });
+    }
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        let Some(which) = self.open else { return };
+        let title = match which {
+            Settings::Spectrum => "Spectrum",
+            Settings::Waterfall => "Waterfall",
+        };
+        let r = egui::containers::Modal::new(egui::Id::new(title))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.label(legend(title));
+                ui.add_space(10.0);
+                match which {
+                    Settings::Spectrum => self.spectrum_settings(ui),
+                    Settings::Waterfall => self.waterfall_settings(ui),
+                }
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("CLOSE").clicked() {
+                            self.open = None;
+                        }
+                    });
+                });
+            });
+        if r.should_close() {
+            self.open = None;
+        }
+    }
+
+    fn spectrum_settings(&mut self, ui: &mut egui::Ui) {
+        row(ui, "FFT bins", |ui| {
+            let mut n = self.fft_size;
+            egui::ComboBox::from_id_salt("fft")
+                .selected_text(n.to_string())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for v in FFTS {
+                        ui.selectable_value(&mut n, v, v.to_string());
+                    }
+                });
+            if n != self.fft_size {
+                self.fft_size = n;
+                self.send(Cmd::Fft(n));
+                self.reset_waterfall();
+            }
+        });
+        ui.label(
+            egui::RichText::new(bin_hint(self.rate, self.fft_size))
+                .small()
+                .color(theme::LEGEND),
+        );
+        ui.add_space(8.0);
+
+        row(ui, "Refresh", |ui| {
+            let mut v = self.refresh;
+            egui::ComboBox::from_id_salt("fps")
+                .selected_text(format!("{} fps", v as i32))
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for (n, f) in REFRESH {
+                        ui.selectable_value(&mut v, f, format!("{n} fps"));
+                    }
+                });
+            if (v - self.refresh).abs() > 0.01 {
+                self.refresh = v;
+                self.send(Cmd::Refresh(v));
+            }
+        });
+        ui.add_space(8.0);
+
+        row(ui, "Averaging", |ui| {
+            if ui
+                .add(egui::Slider::new(&mut self.smoothing, 0.02..=1.0).show_value(false))
+                .changed()
+            {
+                self.send(Cmd::Smoothing(self.smoothing));
+            }
+            ui.label(value(if self.smoothing > 0.95 {
+                "off".to_string()
+            } else {
+                format!("{:.0}%", (1.0 - self.smoothing) * 100.0)
+            }));
+        });
+        ui.add_space(8.0);
+        self.scale_settings(ui);
+    }
+
+    fn waterfall_settings(&mut self, ui: &mut egui::Ui) {
+        row(ui, "Scroll rate", |ui| {
+            let mut v = self.rows_per_sec;
+            egui::ComboBox::from_id_salt("rows")
+                .selected_text(format!("{} rows/s", v as i32))
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for (n, f) in SPEEDS {
+                        ui.selectable_value(&mut v, f, format!("{n} rows/s"));
+                    }
+                });
+            self.rows_per_sec = v;
+        });
+        ui.add_space(8.0);
+
+        row(ui, "History", |ui| {
+            let mut n = self.wf_rows;
+            egui::ComboBox::from_id_salt("hist")
+                .selected_text(format!("{n} rows"))
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for v in [256usize, 512, 1024, 2048] {
+                        ui.selectable_value(&mut n, v, format!("{v} rows"));
+                    }
+                });
+            if n != self.wf_rows {
+                self.wf_rows = n;
+                self.wf.set_height(n);
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "{:.0} s of history at {:.0} rows/s",
+                self.wf.height() as f32 / self.rows_per_sec,
+                self.rows_per_sec
+            ))
+            .small()
+            .color(theme::LEGEND),
+        );
+        ui.add_space(8.0);
+
+        row(ui, "Contrast", |ui| {
+            ui.add(egui::Slider::new(&mut self.wf_top_offset, 0.0..=20.0).show_value(false));
+            ui.label(value(format!("{:.0} dB", self.wf_top_offset)));
+        });
+        ui.label(
+            egui::RichText::new("How far below the trace ceiling the hottest colour sits.")
+                .small()
+                .color(theme::LEGEND),
+        );
+        ui.add_space(8.0);
+        self.scale_settings(ui);
+    }
+
+    fn scale_settings(&mut self, ui: &mut egui::Ui) {
+        row(ui, "Scale", |ui| {
+            ui.checkbox(&mut self.auto_scale, "Auto");
+        });
+        ui.add_enabled_ui(!self.auto_scale, |ui| {
+            row(ui, "Floor", |ui| {
+                ui.add(egui::Slider::new(&mut self.floor, -140.0..=0.0).suffix(" dB"));
+            });
+            row(ui, "Ceiling", |ui| {
+                ui.add(egui::Slider::new(&mut self.ceil, -140.0..=20.0).suffix(" dB"));
+            });
+        });
     }
 
     fn divider(&self, ui: &mut egui::Ui) {
@@ -637,6 +824,8 @@ impl App {
 
         let resp = ui.allocate_rect(full, Sense::click_and_drag());
         let p = ui.painter_at(full).to_owned();
+        let plot_cog = cog_rect(&plot);
+        let fall_cog = cog_rect(&fall);
         p.rect_filled(plot, 0.0, theme::WELL);
 
         self.grid(&p, &plot);
@@ -653,15 +842,36 @@ impl App {
         }
 
         self.markers(&p, &full);
-        self.cursor(&p, &full, &resp);
+
+        let hover = resp.hover_pos();
+        let plot_hot = hover.is_some_and(|h| plot_cog.contains(h));
+        let fall_hot = hover.is_some_and(|h| fall_cog.contains(h));
+
+        // Reaching for the cog is not reading the spectrum, so the crosshair
+        // and its readout get out of the way rather than sitting under the
+        // pointer while it is over a button.
+        cog(&p, &plot_cog, plot_hot);
+        cog(&p, &fall_cog, fall_hot);
+
+        if !plot_hot && !fall_hot {
+            self.cursor(&p, &full, &resp);
+        }
 
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let hz = self.hz_at(&full, pos.x);
-                let tol = self.rate / full.width() as f64 * 6.0;
-                match self.channels.iter().position(|c| (c.freq - hz).abs() < tol) {
-                    Some(i) => self.listen(i),
-                    None => self.add_channel(hz),
+                // Cogs sit inside the pane, so they get first refusal on a
+                // click; otherwise opening settings would also drop a channel.
+                if plot_cog.contains(pos) {
+                    self.open = Some(Settings::Spectrum);
+                } else if fall_cog.contains(pos) {
+                    self.open = Some(Settings::Waterfall);
+                } else {
+                    let hz = self.hz_at(&full, pos.x);
+                    let tol = self.rate / full.width() as f64 * 6.0;
+                    match self.channels.iter().position(|c| (c.freq - hz).abs() < tol) {
+                        Some(i) => self.listen(i),
+                        None => self.add_channel(hz),
+                    }
                 }
             }
         }
@@ -675,7 +885,7 @@ impl App {
         // Wheel over the pane scrubs the centre frequency. A notch moves a
         // twentieth of the span, so the gesture means the same thing at every
         // zoom level.
-        if resp.hovered() {
+        if resp.hovered() && !plot_hot && !fall_hot {
             let n = self.scrub.notches(ui);
             if n != 0 {
                 self.retune(self.center - n as f64 * self.rate / 20.0);

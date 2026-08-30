@@ -68,6 +68,25 @@ impl Waterfall {
         self.filled = (self.filled + 1).min(self.height);
     }
 
+    /// Change how many rows of history are kept.
+    pub fn set_height(&mut self, rows: usize) {
+        let rows = rows.max(16);
+        if rows == self.height {
+            return;
+        }
+        self.height = rows;
+        self.pixels = vec![Color32::BLACK; self.width * rows];
+        self.cursor = 0;
+        self.filled = 0;
+        self.tex = None;
+        self.dirty_all = true;
+        self.dirty_row = None;
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
     /// Slide the history sideways when the radio is retuned.
     ///
     /// Panning is a shift of the frequency axis, not a new view, so the rows
@@ -242,6 +261,31 @@ mod tests {
         }
         assert_eq!(w.pixels.len(), 8 * 4);
         assert_eq!(w.filled, 4);
+    }
+
+    #[test]
+    fn resizing_history_drops_the_texture_so_it_is_rebuilt() {
+        let mut w = Waterfall::new(32);
+        w.push(&[-50.0; 16], -100.0, 0.0);
+        w.set_height(64);
+        assert_eq!(w.height(), 64);
+        assert_eq!(w.filled, 0, "old rows no longer line up with the new ring");
+        assert!(w.dirty_all);
+    }
+
+    #[test]
+    fn resizing_to_the_same_height_is_a_no_op() {
+        let mut w = Waterfall::new(32);
+        w.push(&[-50.0; 16], -100.0, 0.0);
+        w.set_height(32);
+        assert_eq!(w.filled, 1, "history was thrown away needlessly");
+    }
+
+    #[test]
+    fn history_has_a_floor_so_the_ring_stays_usable() {
+        let mut w = Waterfall::new(32);
+        w.set_height(1);
+        assert!(w.height() >= 16, "height fell to {}", w.height());
     }
 
     #[test]

@@ -135,6 +135,11 @@ cargo run --release -p rtlsdr --example listen -- 446.0 nfm
 cargo run --release -p app
 ```
 
+The top bar carries only what you change while tuning: frequency, band, span,
+gain, and the fault lamps. Everything else lives behind a cog in the corner of
+the pane it affects, because spectrum and waterfall settings are unrelated and
+a single settings screen makes both harder to find.
+
 Spectrum and waterfall over a live RTL-SDR. Click the pane to place a channel
 and start listening, click an existing marker to switch to it, drag to pan the
 centre frequency. Mode defaults from the band plan (WFM in the broadcast band,

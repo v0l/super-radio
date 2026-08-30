@@ -78,6 +78,8 @@ pub enum Cmd {
     Fft(usize),
     /// Spectrum frames per second delivered to the UI.
     Refresh(f32),
+    /// Exponential averaging applied to the spectrum, 1.0 for none.
+    Smoothing(f32),
     Stop,
 }
 
@@ -301,9 +303,12 @@ fn run(
                 }
                 Cmd::Volume(v) => volume = v,
                 Cmd::Fft(n) => {
+                    let keep = spec.smoothing;
                     spec = Spectrum::new(n);
+                    spec.smoothing = keep;
                 }
                 Cmd::Refresh(hz) => refresh = hz.clamp(1.0, 120.0),
+                Cmd::Smoothing(v) => spec.smoothing = v.clamp(0.01, 1.0),
             }
         }
 
