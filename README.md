@@ -54,23 +54,32 @@ integers. That is what makes supporting hundreds of protocols affordable.
 ## Measured throughput
 
 512 channels, each running a full envelope / pulse-detect / protocol-decode
-chain, on a 48-core machine. `x real` above 1.0 means it keeps up with a live
-radio at that rate.
+chain, on a 48-core machine. `x real` above 1.0 keeps up with a live radio.
 
 | input rate | 64 ch | 256 ch | 512 ch |
 |---|---|---|---|
 | 2.4 MS/s (RTL-SDR) | 10.3x | 9.0x | 11.9x |
-| 20 MS/s (HackRF) | 1.22x | 1.20x | 1.20x |
-| 50 MS/s | 0.52x | 0.46x | 0.47x |
+| 20 MS/s (HackRF) | 4.9x | 5.6x | 6.1x |
+| 50 MS/s | 1.93x | 2.54x | 2.96x |
+| 100 MS/s | - | 1.27x | 1.54x |
+| 200 MS/s | - | 0.65x | 0.84x |
 
-Going from 8 to 512 channels costs under 45% more time, which is the polyphase
-bank behaving as advertised: channel count is nearly free, and the per-channel
-decode work parallelises cleanly.
+Real-time ceiling is around 150 MS/s. Channel count is nearly free: 8 to 512
+channels costs well under half again as much time, which is the polyphase bank
+behaving as advertised.
 
-50 MS/s is not yet real time. The limit is the channelizer, which runs
-single-threaded at about 57 MS/s on its own; the per-channel graphs are not the
-problem. Fixing it means block-partitioning the channelizer across threads and
-SIMD in the polyphase inner loop, neither of which is done.
+Getting there needed three things, each found by measuring rather than
+guessing, and each initially wrong:
+
+- The **burst detector** ran frame by frame on one thread: 200 million channel
+  updates per second of input at 50 MS/s. It now processes channel-major lanes
+  in parallel. This was by far the largest cost, and it was invisible until a
+  benchmark with *no decode chain at all* still ran at 0.72x.
+- The **channelizer** ran on one thread at about 50 MS/s. Overlap-save makes
+  every frame independent of every other, so it parallelises; 6x faster.
+- The **transpose** wants to be blocked, not eliminated. Letting each channel
+  gather its own column has a `channels * 8` byte stride and wastes seven
+  eighths of the memory bandwidth.
 
 ## Building
 

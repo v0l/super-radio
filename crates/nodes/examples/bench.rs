@@ -49,7 +49,7 @@ fn main() {
     let sig = signal(n, rate);
     for &chans in &[8usize, 16, 32, 64, 128, 256, 512] {
         let mut bank = ChannelBank::new(chans, 12, rate, Hz::mhz(433));
-        bank.set_gating(Gating::Always);
+        bank.set_gating(if std::env::args().nth(2).is_some() { Gating::OnDetection } else { Gating::Always });
         if bank.set_all_chains(&chain(), &registry()).is_err() {
             continue;
         }

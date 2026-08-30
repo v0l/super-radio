@@ -25,11 +25,17 @@
 //! 1.15 s against the channelizer's own 0.88 s. It was the single largest
 //! cost in the bank.
 //!
-//! So there is no transpose pass. Each channel's parallel task gathers its own
-//! column straight out of the staged frame matrix and into its graph's input
-//! buffer. The strided read remains, and is unavoidable, but a whole
-//! write-then-read of the entire matrix disappears and what is left is spread
-//! across the pool.
+//! The fix is a *blocked* transpose, not the absence of one. Reading frames
+//! row-wise while writing a tile of channels keeps both sides cache-resident:
+//! measured at 50 MS/s with 512 channels, a tiled parallel transpose costs
+//! 0.05 s against 1.15 s for the naive single-threaded version that first
+//! suggested transposing was expensive at all.
+//!
+//! Letting each channel gather its own column instead looks like it saves a
+//! pass, and does not. A column walk has a `channels * 8` byte stride, so every
+//! 8-byte sample drags in a full 64-byte cache line and eight ninths of the
+//! memory bandwidth is wasted. Doing it once, in tiles, then handing each graph
+//! a contiguous run, is far cheaper than doing it lazily per channel.
 
 use common::{Error, Hz, Result, C32};
 use dsp::{Channelizer, Detector, DetectorConfig};
@@ -76,6 +82,8 @@ pub struct ChannelBank {
     /// Staged frames, `channels` samples per frame, row-major.
     frames: Vec<C32>,
     n_frames: usize,
+    /// Per-channel contiguous samples, filled by a tiled transpose.
+    lanes: Vec<Vec<C32>>,
 
     graphs: Vec<Option<Graph>>,
     detector: Detector,
@@ -97,6 +105,7 @@ impl ChannelBank {
             channels,
             frames: Vec::new(),
             n_frames: 0,
+            lanes: (0..channels).map(|_| Vec::new()).collect(),
             graphs: (0..channels).map(|_| None).collect(),
             detector: Detector::new(channels, DetectorConfig::default()),
             gating: Gating::Always,
@@ -199,6 +208,9 @@ impl ChannelBank {
         for g in self.graphs.iter_mut().flatten() {
             g.reset();
         }
+        for l in &mut self.lanes {
+            l.clear();
+        }
         self.frames.clear();
         self.n_frames = 0;
     }
@@ -207,28 +219,53 @@ impl ChannelBank {
     pub fn process(&mut self, input: &[C32]) -> Result<&[ChannelEvent]> {
         let n = self.channels;
 
-        // 1. Channelize, staging frames row-major.
-        self.frames.clear();
-        self.n_frames = 0;
-        let frames = &mut self.frames;
-        let mut count = 0usize;
-        self.ch.process(input, |f| {
-            frames.extend_from_slice(f.samples);
-            count += 1;
-        });
+        // 1. Channelize across the pool, staging frames row-major.
+        //
+        //    The serial channelizer runs at about 50 MS/s on one core no
+        //    matter how many are idle, which caps the entire receiver: at
+        //    50 MS/s it alone consumed 0.98 of every second of real time,
+        //    leaving nothing for the decoders. Overlap-save makes every frame
+        //    independent, and the same work then takes 0.17 s.
+        let count = self.ch.process_parallel(input, &mut self.frames);
         self.n_frames = count;
 
-        // 2. Feed the detector, which needs the frame-major layout anyway.
-        for f in 0..count {
-            self.detector.push_frame(&self.frames[f * n..(f + 1) * n]);
-        }
+        // 2. Tiled transpose to channel-major. Rows are read contiguously and
+        //    a tile of channels is written at a time, so both sides stay in
+        //    cache. TILE is chosen so a tile's worth of write cursors fits
+        //    comfortably in L1.
+        const TILE: usize = 32;
+        const FBLOCK: usize = 64;
+        let frames = &self.frames;
+        self.lanes.par_chunks_mut(TILE).enumerate().for_each(|(gi, group)| {
+            let c0 = gi * TILE;
+            for lane in group.iter_mut() {
+                lane.clear();
+                lane.reserve(count);
+            }
+            let mut f0 = 0;
+            while f0 < count {
+                let fe = (f0 + FBLOCK).min(count);
+                for f in f0..fe {
+                    let row = &frames[f * n..(f + 1) * n];
+                    for (j, lane) in group.iter_mut().enumerate() {
+                        lane.push(row[c0 + j]);
+                    }
+                }
+                f0 = fe;
+            }
+        });
 
-        // 3. Run the graphs in parallel, each gathering its own column as it
-        //    goes. No separate transpose pass, and nothing shared is mutated,
-        //    so there is no locking anywhere in here.
+        // 3. Update the burst detector, in parallel over the now channel-major
+        //    lanes. Doing this frame by frame instead is single-threaded and
+        //    was, by a wide margin, the most expensive thing in the bank.
+        self.detector.process_lanes(&self.lanes);
+
+        // 4. Run the graphs in parallel. Each reads a contiguous lane, owns
+        //    its own state, and mutates nothing shared, so there is no locking
+        //    anywhere in here.
         let gating = self.gating;
         let detector = &self.detector;
-        let frames = &self.frames;
+        let lanes = &self.lanes;
         let results: Vec<(usize, Vec<Event>)> = self
             .graphs
             .par_iter_mut()
@@ -240,11 +277,7 @@ impl ChannelBank {
                 }
                 let buf = g.input_buf();
                 buf.clear();
-                let dst = buf.iq_mut();
-                dst.reserve(count);
-                for f in 0..count {
-                    dst.push(frames[f * n + c]);
-                }
+                buf.iq_mut().extend_from_slice(&lanes[c]);
                 match g.run() {
                     Ok(ev) if ev.is_empty() => None,
                     Ok(ev) => Some((c, ev.to_vec())),
@@ -259,7 +292,7 @@ impl ChannelBank {
             })
             .collect();
 
-        // 4. Flatten, in channel order so output is deterministic regardless
+        // 5. Flatten, in channel order so output is deterministic regardless
         //    of how rayon happened to schedule the work.
         self.out.clear();
         let mut results = results;

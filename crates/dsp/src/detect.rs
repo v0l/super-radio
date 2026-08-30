@@ -20,6 +20,7 @@
 //! estimator is not, because a strong continuous carrier drags an average up
 //! until it masks itself.
 
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 /// Per-channel noise floor tracker using minimum statistics.
@@ -271,11 +272,71 @@ impl Detector {
         self.frame += 1;
     }
 
+    /// Feed one contiguous block per channel, in parallel.
+    ///
+    /// Frame-at-a-time updating is the natural way to write this and the wrong
+    /// way to run it. At 50 MS/s with 512 channels it is 200 million channel
+    /// updates per second of input, all on one thread, and it dominated
+    /// everything else in the bank: with no decode chain configured at all the
+    /// receiver still reached only 0.72x real time, and this was why.
+    ///
+    /// Channel states are entirely independent, so the work parallelises
+    /// perfectly once samples are laid out channel-major, which the bank's
+    /// transpose has already done.
+    pub fn process_lanes(&mut self, lanes: &[Vec<common::C32>]) {
+        debug_assert_eq!(lanes.len(), self.ch.len());
+        let n = lanes.first().map(|l| l.len()).unwrap_or(0);
+        let cfg = self.cfg;
+        let alpha = self.alpha;
+        let start = self.frame;
+
+        let finished: Vec<Vec<Burst>> = self
+            .ch
+            .par_iter_mut()
+            .zip(lanes.par_iter())
+            .enumerate()
+            .map(|(i, (st, lane))| {
+                let mut out = Vec::new();
+                for (k, s) in lane.iter().enumerate() {
+                    st.step(i, s.norm_sqr(), start + k as u64, &cfg, alpha, &mut out);
+                }
+                out
+            })
+            .collect();
+
+        for mut b in finished {
+            self.finished.append(&mut b);
+        }
+        // Keep bursts in channel then time order so output is deterministic
+        // regardless of how rayon scheduled the channels.
+        self.finished.sort_by_key(|b| (b.channel, b.start_frame));
+        self.frame += n as u64;
+    }
+
     /// Feed one channel's instantaneous power. Use when powers are computed
     /// elsewhere, for instance already accumulated over several frames.
     fn push_channel(&mut self, i: usize, power: f32) {
         let cfg = self.cfg;
+        let alpha = self.alpha;
+        let frame = self.frame;
         let st = &mut self.ch[i];
+        st.step(i, power, frame, &cfg, alpha, &mut self.finished);
+    }
+}
+
+impl ChannelState {
+    /// One channel's update for one frame. Split out of `Detector` so it can
+    /// run under a parallel iterator holding only this channel's state.
+    fn step(
+        &mut self,
+        i: usize,
+        power: f32,
+        frame: u64,
+        cfg: &DetectorConfig,
+        alpha: f32,
+        finished: &mut Vec<Burst>,
+    ) {
+        let st = self;
         // Peak hold stays on the instantaneous value: it exists for display,
         // where seeing the true peak of a short burst is the whole point.
         st.peak_hold = st.peak_hold.max(power);
@@ -293,7 +354,7 @@ impl Detector {
             Some(r) => power.min(st.smoothed * r),
             None => power,
         };
-        st.smoothed += self.alpha * (limited - st.smoothed);
+        st.smoothed += alpha * (limited - st.smoothed);
         let p = st.smoothed;
 
         // Discard the integrator's settling time entirely, so it never reaches
@@ -318,7 +379,7 @@ impl Detector {
         if !st.open {
             if snr_db >= cfg.open_db {
                 st.open = true;
-                st.start = self.frame;
+                st.start = frame;
                 st.peak = snr_db;
                 st.sum_snr = snr_db as f64;
                 st.n_snr = 1;
@@ -328,10 +389,10 @@ impl Detector {
             st.sum_snr += snr_db as f64;
             st.n_snr += 1;
             if st.since_active > cfg.hang_frames {
-                let end = self.frame - st.since_active.min(self.frame);
+                let end = frame - st.since_active.min(frame);
                 let dur = end.saturating_sub(st.start);
                 if dur >= cfg.min_frames {
-                    self.finished.push(Burst {
+                    finished.push(Burst {
                         channel: i,
                         start_frame: st.start,
                         end_frame: Some(end),
@@ -343,7 +404,9 @@ impl Detector {
             }
         }
     }
+}
 
+impl Detector {
     /// Bursts that completed since the last call. Drains the queue.
     pub fn take_bursts(&mut self) -> Vec<Burst> {
         std::mem::take(&mut self.finished)
