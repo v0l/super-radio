@@ -13,6 +13,7 @@
 
 use common::Result;
 use dsp::rds::{BlockSync, GroupDecoder, RdsDemod};
+use dsp::NoiseMeter;
 use dsp::{FmDemod, StereoDecoder};
 use pipeline::event::{media, Decoded, Event};
 use pipeline::node::{Node, NodeCtx, PortSpec};
@@ -25,6 +26,7 @@ const DEVIATION_HZ: f64 = 75_000.0;
 pub struct WfmDemodNode {
     demod: FmDemod,
     stereo: StereoDecoder,
+    noise: NoiseMeter,
     rds: Option<RdsDemod>,
     sync: BlockSync,
     groups: GroupDecoder,
@@ -52,6 +54,7 @@ impl WfmDemodNode {
         Self {
             demod: FmDemod::new(1.0, DEVIATION_HZ),
             stereo: StereoDecoder::new(1.0),
+            noise: NoiseMeter::new(1.0),
             rds: None,
             sync: BlockSync::new(),
             groups: GroupDecoder::new(),
@@ -79,6 +82,11 @@ impl WfmDemodNode {
     }
 
     /// Station information accumulated so far.
+    /// Groups decoded, blocks rejected, and whether framing is held.
+    pub fn rds_stats(&self) -> (u64, u64, bool) {
+        (self.sync.groups, self.sync.errors, self.sync.is_synced())
+    }
+
     pub fn station(&self) -> &dsp::rds::Station {
         self.groups.station()
     }
@@ -137,6 +145,10 @@ impl Node for WfmDemodNode {
         "wfm_demod"
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn num_inputs(&self) -> usize {
         1
     }
@@ -160,12 +172,14 @@ impl Node for WfmDemodNode {
         }
         self.demod = FmDemod::new(rate, DEVIATION_HZ);
         self.stereo = StereoDecoder::new(rate);
+        self.noise = NoiseMeter::new(rate);
         self.rds = self.rds_enabled.then(|| RdsDemod::new(rate));
         self.sync = BlockSync::new();
         self.groups.reset();
-        // Two interleaved channels, so the sample rate on the port is twice
-        // the frame rate.
-        Ok(vec![i.spec.with_kind(PortKind::Real).with_rate(rate * 2.0)])
+        // Two interleaved channels. The port's sample rate is twice the frame
+        // rate, which the channel count now says outright rather than leaving
+        // downstream filters to infer it from a rate that looks too high.
+        Ok(vec![i.spec.with_kind(PortKind::Real).with_rate(rate).with_channels(2)])
     }
 
     fn process(
@@ -177,6 +191,17 @@ impl Node for WfmDemodNode {
         let iq = inputs[0].as_iq().unwrap();
         self.mpx.clear();
         self.demod.process(iq, &mut self.mpx);
+
+        // Measured here because it needs the discriminator output above the
+        // audio band, which no longer exists after decimation. Tagged rather
+        // than emitted so it rate-scales down the chain to whatever is
+        // listening for it.
+        let noise = self.noise.process(&self.mpx);
+        c.tag(Tag::new(
+            self.samples * 2,
+            "noise",
+            TagValue::Float(noise as f64),
+        ));
 
         if self.stereo_enabled {
             self.stereo.process(&self.mpx, &mut self.left, &mut self.right);

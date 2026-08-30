@@ -4,11 +4,13 @@
 use audio::AudioPlayer;
 use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use dsp::rds::{BlockSync, GroupDecoder, RdsDemod};
-use dsp::{
-    DcBlock, Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum,
-    StereoDecoder,
+use dsp::{DcBlock, Spectrum};
+use nodes::{
+    DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, HighBlendNode, MixerNode,
+    RealDecimateNode, WfmDemodNode,
 };
+use pipeline::graph::{Graph, NodeId};
+use pipeline::port::StreamSpec;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
@@ -127,6 +129,10 @@ pub struct Status {
     blend: AtomicU32,
     /// Station name, programme type and radiotext, when RDS is decoding.
     station: parking_lot::Mutex<StationInfo>,
+    /// Shape of the chain currently demodulating, republished on every rebuild.
+    chain: parking_lot::Mutex<Option<pipeline::graph::Topology>>,
+    /// Delay through that chain in milliseconds, as f32 bits.
+    chain_latency: AtomicU32,
 }
 
 /// What the UI shows about the tuned station.
@@ -158,6 +164,8 @@ impl Default for Status {
             error: parking_lot::Mutex::new(None),
             blend: AtomicU32::new(0),
             station: parking_lot::Mutex::new(StationInfo::default()),
+            chain: parking_lot::Mutex::new(None),
+            chain_latency: AtomicU32::new(0),
         }
     }
 }
@@ -169,6 +177,19 @@ impl Status {
 
     fn set_blend(&self, v: f32) {
         self.blend.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn chain(&self) -> Option<pipeline::graph::Topology> {
+        self.chain.lock().clone()
+    }
+
+    pub fn chain_latency(&self) -> f64 {
+        f64::from(f32::from_bits(self.chain_latency.load(Ordering::Relaxed)))
+    }
+
+    fn set_chain(&self, t: Option<pipeline::graph::Topology>, latency_ms: f64) {
+        *self.chain.lock() = t;
+        self.chain_latency.store((latency_ms as f32).to_bits(), Ordering::Relaxed);
     }
 
     pub fn station(&self) -> StationInfo {
@@ -251,36 +272,22 @@ impl Drop for Radio {
 }
 
 /// Audio chain for one channel, rebuilt whenever the tuning or mode changes.
+///
+/// Built as a `pipeline::Graph` from the same nodes the rest of the app uses.
+/// The chain was hand-wired before, which meant the graph engine existed and
+/// nothing ran on it: rate negotiation, latency reporting and per-node
+/// parameters were all reimplemented here or simply absent.
 pub struct Audio {
-    mixer: Mixer,
-    if_dec: FirDecim,
-    demod: FmDemod,
-    am: bool,
-    au_dec: FirDecimReal,
-    deemph: Deemphasis,
-    noise: NoiseMeter,
-    blend: HighBlend,
+    graph: Graph,
+    wfm: Option<NodeId>,
     audio_rate: f64,
-    shifted: Vec<C32>,
+    channels: usize,
     iq: Vec<C32>,
-    disc: Vec<f32>,
     pcm: Vec<f32>,
-    /// Stereo and RDS, both driven by one pilot PLL. Only built for WFM: the
-    /// pilot exists nowhere else.
-    stereo: Option<StereoDecoder>,
-    rds: Option<RdsDemod>,
-    sync: BlockSync,
-    groups: GroupDecoder,
-    au_dec_r: FirDecimReal,
-    deemph_r: Deemphasis,
-    /// Per-channel filter state. Sharing one instance across both channels
-    /// runs each block through the other channel's history.
-    blend_r: HighBlend,
-    inter: Vec<f32>,
-    left: Vec<f32>,
-    right: Vec<f32>,
-    pcm_r: Vec<f32>,
-    bits: Vec<u8>,
+    detail: String,
+    station: dsp::rds::Station,
+    stats: (u64, u64, bool),
+    blend: f32,
 }
 
 impl Audio {
@@ -288,132 +295,130 @@ impl Audio {
         let if_dec = ((rate / mode.if_rate()).round() as usize).max(1);
         let if_rate = rate / if_dec as f64;
         let au_dec = ((if_rate / target).round() as usize).max(1);
-        let audio_rate = if_rate / au_dec as f64;
 
+        let mut b = Graph::builder(StreamSpec::iq(rate, Hz(0)));
+        let mix = b.add_labeled("Mixer", Box::new(MixerNode::new(-offset)));
+        // Sized from the signal's bandwidth, not from the decimation factor:
+        // the stopband has to land where the first alias folds down.
+        let mut dec = DecimateNode::new(if_dec);
+        dec.set_passband_hz(rate, mode.bandwidth() / 2.0);
+        let ifd = b.add_labeled("IF decimator", Box::new(dec));
+        b.source(mix.i());
+        b.connect(mix.o(), ifd.i());
+
+        let stereo = mode == Demod::Wfm && if_rate >= 130_000.0;
+        let mut wfm = None;
+        let demod = if stereo {
+            let id = b.add_labeled("WFM demod", Box::new(WfmDemodNode::new()));
+            wfm = Some(id);
+            id
+        } else if mode == Demod::Am {
+            b.add_labeled("AM envelope", Box::new(EnvelopeNode))
+        } else {
+            b.add_labeled("FM discriminator", Box::new(FmDemodNode::new(mode.deviation())))
+        };
+        b.connect(ifd.o(), demod.i());
+
+        let mut ad = RealDecimateNode::new(au_dec);
+        ad.set_passband_hz(if_rate, mode.audio_bw());
+        let aud = b.add_labeled("Audio decimator", Box::new(ad));
+        b.connect(demod.o(), aud.i());
+        let last = if mode == Demod::Am {
+            aud
+        } else {
+            let de = b.add_labeled("De-emphasis", Box::new(DeemphasisNode::new(50.0)));
+            b.connect(aud.o(), de.i());
+            de
+        };
+        let hb = b.add_labeled("High blend", Box::new(HighBlendNode::new()));
+        b.connect(last.o(), hb.i());
+        b.output(hb.o());
+
+        let graph = b.build().expect("audio chain");
+        let spec = graph.output_spec();
+        let detail = format!(
+            "if /{if_dec} to {:.0} kHz, audio /{au_dec} to {:.1} kHz{}",
+            if_rate / 1e3,
+            spec.frame_rate() / 1e3,
+            if stereo { ", stereo" } else { "" }
+        );
         Self {
-            mixer: Mixer::new(-offset, rate),
-            if_dec: FirDecim::design_hz(rate, if_dec, mode.bandwidth() / 2.0, 70.0),
-            demod: FmDemod::new(if_rate, mode.deviation().max(1.0)),
-            am: mode == Demod::Am,
-            au_dec: FirDecimReal::design_hz(if_rate, au_dec, mode.audio_bw(), 70.0),
-            deemph: Deemphasis::eu(audio_rate),
-            noise: NoiseMeter::new(if_rate),
-            blend: HighBlend::new(audio_rate),
-            audio_rate,
-            shifted: Vec::new(),
+            graph,
+            wfm,
+            audio_rate: spec.frame_rate(),
+            channels: spec.channels,
             iq: Vec::new(),
-            disc: Vec::new(),
             pcm: Vec::new(),
-            // RDS sits at 57 kHz, so it needs an IF that actually reaches it.
-            stereo: (mode == Demod::Wfm).then(|| StereoDecoder::new(if_rate)),
-            rds: (mode == Demod::Wfm && if_rate > 130_000.0)
-                .then(|| RdsDemod::new(if_rate)),
-            sync: BlockSync::new(),
-            groups: GroupDecoder::new(),
-            au_dec_r: FirDecimReal::design_hz(if_rate, au_dec, mode.audio_bw(), 70.0),
-            deemph_r: Deemphasis::eu(audio_rate),
-            blend_r: HighBlend::new(audio_rate),
-            inter: Vec::new(),
-            left: Vec::new(),
-            right: Vec::new(),
-            pcm_r: Vec::new(),
-            bits: Vec::new(),
+            detail,
+            station: dsp::rds::Station::default(),
+            stats: (0, 0, false),
+            blend: 0.0,
         }
     }
 
-    /// Whether `process` returns interleaved stereo.
     pub fn is_stereo(&self) -> bool {
-        self.stereo.is_some()
+        self.channels == 2
     }
 
-    /// Applied separation, 0 mono to 1 full.
     pub fn stereo_blend(&self) -> f32 {
-        self.stereo.as_ref().map(|s| s.blend()).unwrap_or(0.0)
+        self.blend
     }
 
     pub fn station(&self) -> &dsp::rds::Station {
-        self.groups.station()
+        &self.station
     }
 
     /// Groups decoded, blocks rejected, and whether framing is currently held.
     pub fn rds_stats(&self) -> (u64, u64, bool) {
-        (self.sync.groups, self.sync.errors, self.sync.is_synced())
+        self.stats
     }
 
     pub fn cost(&self) -> String {
-        format!("if {} taps /{}, audio {} taps /{}",
-            self.if_dec.taps(), self.if_dec.factor(),
-            self.au_dec.taps(), self.au_dec.factor())
+        self.detail.clone()
+    }
+
+    /// Delay through the whole chain, in milliseconds of audio.
+    ///
+    /// Every filter reports its own group delay and the graph adds them up, so
+    /// this is the number to watch rather than any single tap count: a chain
+    /// can be built from short filters and still be slow.
+    pub fn latency_ms(&self) -> f64 {
+        self.graph.output_latency() as f64 / self.audio_rate.max(1.0) * 1e3
+    }
+
+    /// The running chain, for the graph view.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
     }
 
     pub fn process(&mut self, input: &[C32], gain: f32) -> &[f32] {
-        // Every one of these appends, so they must all be cleared. Missing
-        // one makes the buffer grow without bound and each block re-filters
-        // the whole accumulated history.
-        self.shifted.clear();
-        self.mixer.process(input, &mut self.shifted);
         self.iq.clear();
-        self.if_dec.process(&self.shifted, &mut self.iq);
-
-        self.disc.clear();
-        if self.am {
-            self.disc.extend(self.iq.iter().map(|c| c.norm()));
-        } else {
-            self.demod.process(&self.iq, &mut self.disc);
+        self.iq.extend_from_slice(input);
+        let buf = self.graph.input_buf();
+        buf.clear();
+        buf.iq_mut().extend_from_slice(&self.iq);
+        if self.graph.run().is_err() {
+            self.pcm.clear();
+            return &self.pcm;
         }
-        let n = self.noise.process(&self.disc);
-
-        if self.stereo.is_some() {
-            return self.process_stereo(n, gain);
-        }
-
         self.pcm.clear();
-        self.au_dec.process(&self.disc, &mut self.pcm);
-        for v in self.pcm.iter_mut() {
-            *v *= gain;
+        if let Some(out) = self.graph.output().as_real() {
+            self.pcm.extend(out.iter().map(|v| v * gain));
         }
-        if !self.am {
-            self.deemph.process(&mut self.pcm);
-        }
-        self.blend.process(n, &mut self.pcm);
-        &self.pcm
-    }
-
-    /// Interleaved stereo, plus RDS off the same PLL.
-    fn process_stereo(&mut self, noise: f32, gain: f32) -> &[f32] {
-        let st = self.stereo.as_mut().unwrap();
-        st.process(&self.disc, &mut self.left, &mut self.right);
-
-        if let Some(rds) = &mut self.rds {
-            self.bits.clear();
-            rds.process(&self.disc, st.phases(), &mut self.bits);
-            for b in &self.bits {
-                if let Some(g) = self.sync.push(*b) {
-                    self.groups.push(&g);
+        // Read back what the demodulator learned. Events carry the same
+        // information but only when it changes, and the status panel wants a
+        // current value on every frame rather than the last one it happened to
+        // catch.
+        if let Some(id) = self.wfm {
+            if let Some(n) = self.graph.node(id).and_then(|n| n.as_any()) {
+                if let Some(w) = n.downcast_ref::<WfmDemodNode>() {
+                    self.station = w.station().clone();
+                    self.stats = w.rds_stats();
+                    self.blend = w.blend();
                 }
             }
         }
-
-        self.pcm.clear();
-        self.pcm_r.clear();
-        self.au_dec.process(&self.left, &mut self.pcm);
-        self.au_dec_r.process(&self.right, &mut self.pcm_r);
-        for v in self.pcm.iter_mut().chain(self.pcm_r.iter_mut()) {
-            *v *= gain;
-        }
-        self.deemph.process(&mut self.pcm);
-        self.deemph_r.process(&mut self.pcm_r);
-        self.blend.process(noise, &mut self.pcm);
-        self.blend_r.process(noise, &mut self.pcm_r);
-
-        let n = self.pcm.len().min(self.pcm_r.len());
-        self.inter.clear();
-        self.inter.reserve(n * 2);
-        for i in 0..n {
-            self.inter.push(self.pcm[i]);
-            self.inter.push(self.pcm_r[i]);
-        }
-        &self.inter
+        &self.pcm
     }
 }
 
@@ -514,6 +519,10 @@ fn run(
 
         if retune {
             audio = listen.map(|off| Audio::new(off, cur_rate, mode, 48_000.0));
+            status.set_chain(
+                audio.as_ref().map(|a| a.graph().topology()),
+                audio.as_ref().map(|a| a.latency_ms()).unwrap_or(0.0),
+            );
             // The old station's name must not linger over the new one.
             status.clear_station();
             retune = false;
@@ -616,14 +625,28 @@ mod tests {
         // Every stage appends to its output. If one is not cleared it grows
         // without bound and each block re-filters the whole history, which
         // looks like the radio slowly seizing up rather than an obvious fault.
+        // Measured by time rather than by reaching into buffers, which the
+        // chain no longer exposes now it is a graph. A buffer that is never
+        // cleared refilters its whole history, so the cost per block climbs;
+        // that is the symptom either way.
         let mut a = Audio::new(120_000.0, 2_304_000.0, Demod::Wfm, 48_000.0);
         let b = block(8192);
-        for _ in 0..20 {
-            a.process(&b, 0.5);
+        let mut cost = |a: &mut Audio| {
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                a.process(&b, 0.5);
+            }
+            t.elapsed().as_secs_f64()
+        };
+        let first = cost(&mut a);
+        for _ in 0..5 {
+            cost(&mut a);
         }
-        assert_eq!(a.shifted.len(), b.len(), "mixer output grew");
-        assert!(a.iq.len() <= b.len(), "if output grew");
-        assert!(a.disc.len() <= b.len(), "discriminator output grew");
+        let later = cost(&mut a);
+        assert!(
+            later < first * 3.0,
+            "cost per block climbed from {first:.4}s to {later:.4}s"
+        );
         assert!(a.pcm.len() <= b.len(), "audio output grew");
     }
 
@@ -660,18 +683,37 @@ mod tests {
     }
 
     #[test]
-    fn filters_stay_short_enough_to_sit_in_cache() {
+    fn the_chain_does_not_delay_the_audio_audibly() {
         // Driving the IF rate down to the channel bandwidth leaves no
-        // transition band and asks for thousands of taps.
+        // transition band and asks for thousands of taps, which shows up as
+        // delay. The graph adds up each filter's group delay, so this catches
+        // it wherever in the chain it happens rather than at one filter that
+        // was remembered to be checked.
         for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
             let a = Audio::new(0.0, 2_304_000.0, mode, 48_000.0);
-            assert!(
-                a.if_dec.taps() < 600,
-                "{} if filter is {} taps",
-                mode.label(),
-                a.if_dec.taps()
-            );
+            let ms = a.latency_ms();
+            assert!(ms < 40.0, "{} delays audio by {ms:.1} ms", mode.label());
         }
+    }
+
+    #[test]
+    fn the_chain_is_a_graph_with_every_stage_named() {
+        // The point of building on the graph: the stages can be listed, which
+        // is what the chain view draws.
+        let a = Audio::new(0.0, 2_304_000.0, Demod::Wfm, 48_000.0);
+        let names: Vec<&str> = a.graph().order().map(|(_, l)| l).collect();
+        assert!(names.contains(&"Mixer"), "{names:?}");
+        assert!(names.contains(&"WFM demod"), "{names:?}");
+        assert!(names.contains(&"High blend"), "{names:?}");
+        assert!(names.iter().all(|n| !n.is_empty()));
+    }
+
+    #[test]
+    fn am_skips_de_emphasis_and_uses_an_envelope_detector() {
+        let a = Audio::new(0.0, 2_304_000.0, Demod::Am, 48_000.0);
+        let names: Vec<&str> = a.graph().order().map(|(_, l)| l).collect();
+        assert!(names.contains(&"AM envelope"), "{names:?}");
+        assert!(!names.contains(&"De-emphasis"), "{names:?}");
     }
 
     #[test]

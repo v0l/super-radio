@@ -3,6 +3,7 @@ mod wheel;
 mod bands;
 mod devices;
 mod dial;
+mod chainview;
 mod theme;
 mod radio;
 mod ui;
@@ -369,6 +370,9 @@ fn main() -> eframe::Result<()> {
                 app.tune_to(mhz, radio::Demod::Wfm);
             }
             app.shot = shot;
+            if a.iter().any(|x| x == "--chain") {
+                app.show_chain();
+            }
             app.soak = soak;
             Ok(Box::new(app))
         }),

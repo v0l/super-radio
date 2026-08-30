@@ -12,9 +12,11 @@ pub mod dsp_nodes;
 pub mod wfm;
 
 pub use bank::{ChannelBank, ChannelEvent, Gating};
+pub use wfm::WfmDemodNode;
 pub use decode_nodes::{ProtocolDecodeNode, PulseDetectNode};
 pub use dsp_nodes::{
-    DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, MixerNode, RealDecimateNode,
+    DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, HighBlendNode, MixerNode,
+    RealDecimateNode,
 };
 
 use common::Result;

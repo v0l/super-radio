@@ -58,6 +58,12 @@ pub struct App {
     /// Remove the direct-conversion centre spur. On by default: it is an
     /// artefact of the receiver, not something being received.
     dc_block: bool,
+    view: View,
+    /// Shape of the running chain, republished by the radio thread whenever it
+    /// rebuilds one. Cloned rather than shared so drawing never blocks the
+    /// thread that has to keep draining USB.
+    chain_topo: Option<pipeline::graph::Topology>,
+    chain_latency: f64,
     /// Channel whose marker is being dragged in the spectrum.
     drag_ch: Option<usize>,
     /// Shared per-digit readout for the channel strip. Only one channel can be
@@ -91,6 +97,22 @@ const SPEEDS: [(&str, f32); 5] = [
     ("40", 40.0),
     ("80", 80.0),
 ];
+
+/// What the main pane shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Spectrum,
+    Chain,
+}
+
+impl View {
+    fn label(self) -> &'static str {
+        match self {
+            View::Spectrum => "Spectrum",
+            View::Chain => "Signal chain",
+        }
+    }
+}
 
 /// How near the pointer must be to a channel marker to grab it, in pixels.
 ///
@@ -148,6 +170,9 @@ impl Default for App {
             shot_at: None,
             shot_sent: false,
             dc_block: true,
+            view: View::Spectrum,
+            chain_topo: None,
+            chain_latency: 0.0,
         }
     }
 }
@@ -237,6 +262,8 @@ impl App {
         while let Ok(f) = radio.frames.try_recv() {
             latest = Some(f);
         }
+        self.chain_topo = radio.status.chain();
+        self.chain_latency = radio.status.chain_latency();
         if let Some(f) = latest {
             // The requested centre is not overwritten by the frame's. Retunes
             // are spaced out because each blocks the radio thread, so frames
@@ -466,7 +493,10 @@ impl eframe::App for App {
             let _s = tracing::info_span!("scope").entered();
             CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(theme::CHASSIS))
-                .show(ui, |ui| self.scope(ui));
+                .show(ui, |ui| match self.view {
+                    View::Spectrum => self.scope(ui),
+                    View::Chain => self.chain(ui),
+                });
         }
         self.settings_modal(ui.ctx());
     }
@@ -655,6 +685,24 @@ impl App {
                             self.reset_waterfall();
                             self.retune_listener();
                         }
+                    });
+
+                    ui.add_space(18.0);
+                    self.divider(ui);
+                    ui.add_space(18.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(legend("view"));
+                        let mut v = self.view;
+                        egui::ComboBox::from_id_salt("view")
+                            .selected_text(v.label())
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                for opt in [View::Spectrum, View::Chain] {
+                                    ui.selectable_value(&mut v, opt, opt.label());
+                                }
+                            });
+                        self.view = v;
                     });
 
                     ui.add_space(18.0);
@@ -1064,6 +1112,30 @@ impl App {
                 }
 
             });
+    }
+
+    /// Open on the chain view, for screenshots and for starting where the
+    /// operator left off.
+    pub fn show_chain(&mut self) {
+        self.view = View::Chain;
+    }
+
+    /// The signal chain the listening channel is running.
+    fn chain(&mut self, ui: &mut egui::Ui) {
+        let Some(topo) = self.chain_topo.clone() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "No channel is being listened to, so no chain is running.",
+                    )
+                    .color(theme::LEGEND),
+                );
+            });
+            return;
+        };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            crate::chainview::draw(ui, &topo, self.chain_latency);
+        });
     }
 
     fn scope(&mut self, ui: &mut egui::Ui) {

@@ -6,10 +6,10 @@
 //! DSP is written.
 
 use common::{Result, C32};
-use dsp::{Deemphasis, FirDecim, FmDemod, Mixer};
+use dsp::{Deemphasis, FirDecim, FmDemod, HighBlend, Mixer};
 use pipeline::param::{Param, ParamValue};
 use pipeline::node::{NodeCtx, PortSpec, Simple};
-use pipeline::port::{Payload, PortKind, StreamSpec};
+use pipeline::port::{Payload, PortKind, StreamSpec, TagValue};
 
 /// Shift a signal in frequency.
 ///
@@ -81,6 +81,15 @@ pub struct DecimateNode {
 }
 
 impl DecimateNode {
+    /// Place the passband edge at a real frequency rather than a fraction of
+    /// Nyquist. What matters is the signal's bandwidth: a filter sized from the
+    /// decimation factor alone puts the transition band wherever it lands,
+    /// which is either wasteful or lets an alias through.
+    pub fn set_passband_hz(&mut self, input_rate: f64, hz: f64) {
+        let out = input_rate / self.factor as f64;
+        self.passband = (hz / (out / 2.0)).clamp(0.1, 0.99);
+    }
+
     pub fn new(factor: usize) -> Self {
         Self {
             factor: factor.max(1),
@@ -234,12 +243,15 @@ impl Simple for FmDemodNode {
 /// FM de-emphasis, undoing the transmitter's treble boost.
 pub struct DeemphasisNode {
     tau_us: f64,
-    filt: Deemphasis,
+    /// One per channel. A single filter run over interleaved samples feeds
+    /// each channel the other's history, which is both crosstalk and a cutoff
+    /// at half the intended frequency.
+    filt: Vec<Deemphasis>,
 }
 
 impl DeemphasisNode {
     pub fn new(tau_us: f64) -> Self {
-        Self { tau_us, filt: Deemphasis::new(1.0, tau_us) }
+        Self { tau_us, filt: vec![Deemphasis::new(1.0, tau_us)] }
     }
 }
 
@@ -252,19 +264,27 @@ impl Simple for DeemphasisNode {
         if i.spec.kind != PortKind::Real {
             return Err(common::Error::other("deemphasis needs a real input"));
         }
-        self.filt = Deemphasis::new(i.spec.rate, self.tau_us);
+        let ch = i.spec.channels.max(1);
+        self.filt = (0..ch).map(|_| Deemphasis::new(i.spec.frame_rate(), self.tau_us)).collect();
         Ok(i.spec)
     }
 
     fn process(&mut self, i: &Payload, o: &mut Payload, _c: &mut NodeCtx<'_>) -> Result<()> {
         let out = o.real_mut();
         out.extend_from_slice(i.as_real().unwrap());
-        self.filt.process(out);
+        let ch = self.filt.len().max(1);
+        if ch == 1 {
+            self.filt[0].process(out);
+            return Ok(());
+        }
+        for (c, f) in self.filt.iter_mut().enumerate() {
+            f.process_strided(out, c, ch);
+        }
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.filt.reset();
+        self.filt.iter_mut().for_each(|f| f.reset());
     }
 
     fn params(&self) -> Vec<Param> {
@@ -287,7 +307,8 @@ impl Simple for DeemphasisNode {
 /// Decimate a real-valued stream, for audio after a demodulator.
 pub struct RealDecimateNode {
     factor: usize,
-    dec: FirDecim,
+    passband: f64,
+    dec: Vec<FirDecim>,
     scratch: Vec<C32>,
     out: Vec<C32>,
 }
@@ -296,10 +317,18 @@ impl RealDecimateNode {
     pub fn new(factor: usize) -> Self {
         Self {
             factor: factor.max(1),
-            dec: FirDecim::design(factor.max(1), 0.9, 80.0),
+            passband: 0.9,
+            dec: vec![FirDecim::design(factor.max(1), 0.9, 80.0)],
             scratch: Vec::new(),
             out: Vec::new(),
         }
+    }
+
+    /// Put the passband edge at an audio frequency rather than a fraction of
+    /// Nyquist, so the filter is sized by what has to survive it.
+    pub fn set_passband_hz(&mut self, input_frame_rate: f64, hz: f64) {
+        let out = input_frame_rate / self.factor as f64;
+        self.passband = (hz / (out / 2.0)).clamp(0.1, 0.99);
     }
 }
 
@@ -312,19 +341,37 @@ impl Simple for RealDecimateNode {
         if i.spec.kind != PortKind::Real {
             return Err(common::Error::other("real_decimate needs a real input"));
         }
-        self.dec = FirDecim::design(self.factor, 0.9, 80.0);
-        Ok(i.spec.with_rate(i.spec.rate / self.factor as f64))
+        let ch = i.spec.channels.max(1);
+        self.dec =
+            (0..ch).map(|_| FirDecim::design(self.factor, self.passband, 80.0)).collect();
+        Ok(i.spec.with_rate(i.spec.frame_rate() / self.factor as f64))
     }
 
     fn process(&mut self, i: &Payload, o: &mut Payload, _c: &mut NodeCtx<'_>) -> Result<()> {
         // Reuses the complex decimator with a zero imaginary part. Wasteful by
         // half, but it keeps one well-tested filter implementation instead of
         // two that can drift apart.
-        self.scratch.clear();
-        self.scratch.extend(i.as_real().unwrap().iter().map(|v| C32::new(*v, 0.0)));
-        self.out.clear();
-        self.dec.process(&self.scratch, &mut self.out);
-        o.real_mut().extend(self.out.iter().map(|c| c.re));
+        let src = i.as_real().unwrap();
+        let ch = self.dec.len().max(1);
+        let frames = src.len() / ch;
+        let out = o.real_mut();
+        let base = out.len();
+        for c in 0..ch {
+            self.scratch.clear();
+            self.scratch
+                .extend((0..frames).map(|k| C32::new(src[k * ch + c], 0.0)));
+            self.out.clear();
+            self.dec[c].process(&self.scratch, &mut self.out);
+            if c == 0 {
+                out.resize(base + self.out.len() * ch, 0.0);
+            }
+            for (k, v) in self.out.iter().enumerate() {
+                let idx = base + k * ch + c;
+                if idx < out.len() {
+                    out[idx] = v.re;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -342,5 +389,92 @@ impl Simple for RealDecimateNode {
             }
             _ => Err(common::Error::other(format!("real_decimate: unknown parameter {name:?}"))),
         }
+    }
+}
+
+/// Roll the treble off as the signal gets noisy, reading the noise estimate a
+/// demodulator upstream tagged onto the stream.
+///
+/// The measurement has to happen before decimation, since it looks at
+/// discriminator output above the audio band, so this node cannot make it
+/// itself and takes it from a tag instead.
+pub struct HighBlendNode {
+    /// Empty until negotiation. There is no placeholder rate worth inventing:
+    /// the lowpass clamps its cutoff against the sample rate, so constructing
+    /// one at a made-up rate panics rather than being merely wrong.
+    blend: Vec<HighBlend>,
+    noise: f32,
+}
+
+impl Default for HighBlendNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HighBlendNode {
+    pub fn new() -> Self {
+        Self { blend: Vec::new(), noise: 0.0 }
+    }
+
+    /// Current cutoff, for display.
+    pub fn cutoff(&self) -> f64 {
+        self.blend.first().map(|b| b.cutoff()).unwrap_or(0.0)
+    }
+}
+
+impl Simple for HighBlendNode {
+    fn name(&self) -> &str {
+        "high_blend"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Real {
+            return Err(common::Error::other("high_blend needs a real input"));
+        }
+        let ch = i.spec.channels.max(1);
+        self.blend = (0..ch).map(|_| HighBlend::new(i.spec.frame_rate())).collect();
+        Ok(i.spec)
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
+        // Last tag in the window rather than the first: it is the most recent
+        // estimate, and a block covers many of them at audio rate.
+        for t in c.in_tags {
+            if t.key == "noise" {
+                if let TagValue::Float(v) = t.value {
+                    self.noise = v as f32;
+                }
+            }
+        }
+        let out = o.real_mut();
+        out.extend_from_slice(i.as_real().unwrap());
+        let ch = self.blend.len();
+        if ch == 0 {
+            return Err(common::Error::other("high_blend ran before negotiation"));
+        }
+        if ch == 1 {
+            self.blend[0].process(self.noise, out);
+            return Ok(());
+        }
+        // Deinterleave, filter, put back. Each channel must keep its own
+        // history or the filter mixes the two together.
+        let frames = out.len() / ch;
+        let mut lane = vec![0.0f32; frames];
+        for (k, b) in self.blend.iter_mut().enumerate() {
+            for f in 0..frames {
+                lane[f] = out[f * ch + k];
+            }
+            b.process(self.noise, &mut lane);
+            for f in 0..frames {
+                out[f * ch + k] = lane[f];
+            }
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.blend.iter_mut().for_each(|b| b.reset());
+        self.noise = 0.0;
     }
 }

@@ -158,6 +158,33 @@ impl GraphBuilder {
     }
 }
 
+/// A node as it exists in a built graph.
+#[derive(Clone, Debug)]
+pub struct TopoNode {
+    pub id: NodeId,
+    pub label: String,
+    /// The node type's own name, which is what a registry would call it.
+    pub kind: String,
+    pub latency: u64,
+    pub inputs: Vec<(usize, StreamSpec)>,
+    pub outputs: Vec<(usize, StreamSpec)>,
+}
+
+/// The built graph's shape, in execution order.
+#[derive(Clone, Debug)]
+pub struct Topology {
+    pub input: StreamSpec,
+    pub nodes: Vec<TopoNode>,
+    pub output_slot: usize,
+}
+
+impl Topology {
+    /// Which node writes a slot, for drawing edges.
+    pub fn producer(&self, slot: usize) -> Option<&TopoNode> {
+        self.nodes.iter().find(|n| n.outputs.iter().any(|(s, _)| *s == slot))
+    }
+}
+
 pub struct Graph {
     entries: Vec<Entry>,
     /// Execution order, a topological sort of `entries`.
@@ -399,6 +426,30 @@ impl Graph {
     /// Execution order, for display and debugging.
     pub fn order(&self) -> impl Iterator<Item = (NodeId, &str)> {
         self.order.iter().map(|&k| (NodeId(k), self.entries[k].label.as_str()))
+    }
+
+    /// Structure and negotiated rates, for drawing the graph.
+    ///
+    /// Reported from the built graph rather than from whatever assembled it, so
+    /// a view of the chain shows the chain that is running.
+    pub fn topology(&self) -> Topology {
+        let mut nodes = Vec::new();
+        for &k in &self.order {
+            let e = &self.entries[k];
+            nodes.push(TopoNode {
+                id: NodeId(k),
+                label: e.label.clone(),
+                kind: e.node.name().to_string(),
+                latency: self.latency[e.out_slots[0]],
+                inputs: e
+                    .in_slots
+                    .iter()
+                    .map(|&s| (s, self.specs[s]))
+                    .collect(),
+                outputs: e.out_slots.iter().map(|&s| (s, self.specs[s])).collect(),
+            });
+        }
+        Topology { input: self.specs[INPUT_SLOT], nodes, output_slot: self.output_slot }
     }
 
     pub fn reset(&mut self) {

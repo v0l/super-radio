@@ -108,9 +108,17 @@ impl Deemphasis {
     }
 
     pub fn process(&mut self, buf: &mut [f32]) {
-        for v in buf.iter_mut() {
-            self.state += self.alpha * (*v - self.state);
-            *v = self.state;
+        self.process_strided(buf, 0, 1);
+    }
+
+    /// Filter one channel of an interleaved buffer in place.
+    pub fn process_strided(&mut self, buf: &mut [f32], offset: usize, stride: usize) {
+        let stride = stride.max(1);
+        let mut i = offset;
+        while i < buf.len() {
+            self.state += self.alpha * (buf[i] - self.state);
+            buf[i] = self.state;
+            i += stride;
         }
     }
 }
