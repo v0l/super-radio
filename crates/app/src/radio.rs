@@ -33,8 +33,11 @@ impl Demod {
     /// Occupied channel bandwidth, two-sided.
     pub fn bandwidth(self) -> f64 {
         match self {
-            // Carson: 2 * (75 kHz deviation + 15 kHz audio).
-            Demod::Wfm => 180_000.0,
+            // Carson: 2 * (75 kHz deviation + 57 kHz highest modulating
+            // frequency). The highest is RDS, not audio: taking 15 kHz gives
+            // 180 kHz and cuts off precisely the sidebands that carry the
+            // subcarrier, which decodes audio perfectly and RDS barely at all.
+            Demod::Wfm => 264_000.0,
             Demod::Nfm => 12_500.0,
             Demod::Am => 10_000.0,
         }
@@ -48,7 +51,9 @@ impl Demod {
     /// against 281 here, with a history buffer too big for L2.
     fn if_rate(self) -> f64 {
         match self {
-            Demod::Wfm => 288_000.0,
+            // Must clear the 264 kHz occupied bandwidth with room for a
+            // transition band.
+            Demod::Wfm => 330_000.0,
             Demod::Nfm | Demod::Am => 48_000.0,
         }
     }

@@ -12,29 +12,96 @@
 //! between successive symbols rather than their absolute level.
 
 use crate::fir::{lowpass, FirDecimReal};
+use std::f64::consts::TAU;
 
 pub const CARRIER_HZ: f64 = 57_000.0;
 pub const BAUD: f64 = 1187.5;
 /// Bandwidth of the data either side of the carrier.
 const DATA_BW: f64 = 2_400.0;
 
+/// Number of symbol-timing hypotheses run in parallel.
+///
+/// The pilot fixes the clock *frequency* exactly, so the symbol phase is a
+/// constant to be found rather than a drift to be tracked. That makes a bank
+/// of fixed hypotheses simpler and more robust than a timing loop: there is no
+/// loop bandwidth to tune and nothing to lose lock on.
+const ARMS: usize = 8;
+
+/// Symbols between timing re-selections.
+const RESELECT_SYMS: u64 = 64;
+
+/// Smoothing for timing and carrier estimates, as a fraction per symbol.
+/// About fifty symbols, so both resolve well inside the first block sync
+/// attempt rather than after it.
+const ENERGY_ALPHA: f64 = 0.02;
+const CARRIER_ALPHA: f64 = 0.02;
+
+/// Symbols before timing may be frozen, and the margin over the runner-up
+/// required to freeze it.
+const LOCK_SYMS: u64 = 128;
+const LOCK_MARGIN: f64 = 1.05;
+
+/// How far ahead a rival must be to take over, so noise cannot flip the
+/// choice back and forth once timing has settled.
+const SWITCH_MARGIN: f64 = 1.05;
+
+/// One symbol-timing hypothesis.
+#[derive(Clone)]
+struct Arm {
+    phase: f64,
+    first: (f64, f64),
+    second: (f64, f64),
+    n1: u32,
+    n2: u32,
+    /// Long-run mean step magnitude. The arm sampling on the symbol boundary
+    /// integrates across a transition and averages towards zero, so this
+    /// separates the correct phase from the rest.
+    energy: f64,
+    /// Accumulated square of the symbol vector. BPSK has a 180 degree
+    /// ambiguity that squaring removes, so the argument of this is twice the
+    /// carrier phase offset.
+    carrier: (f64, f64),
+    prev_sym: Option<u8>,
+}
+
+impl Arm {
+    fn new(phase: f64) -> Self {
+        Self {
+            phase,
+            first: (0.0, 0.0),
+            second: (0.0, 0.0),
+            n1: 0,
+            n2: 0,
+            energy: 0.0,
+            carrier: (0.0, 0.0),
+            prev_sym: None,
+        }
+    }
+
+    fn reset(&mut self, phase: f64) {
+        *self = Arm::new(phase);
+    }
+}
+
 pub struct RdsDemod {
     rate: f64,
-    /// Symbol phase, one cycle per bit.
-    sym_phase: f64,
     i_lp: FirDecimReal,
     q_lp: FirDecimReal,
     i_buf: Vec<f32>,
     q_buf: Vec<f32>,
-    /// Integrators for the two halves of the current symbol.
-    first: f64,
-    second: f64,
-    first_n: u32,
-    second_n: u32,
-    prev_half: bool,
-    /// Previous symbol decision, for the differential decode.
-    prev_bit: Option<u8>,
-    /// Running estimate of symbol magnitude, used to report signal quality.
+    i_out: Vec<f32>,
+    q_out: Vec<f32>,
+    arms: Vec<Arm>,
+    /// Which hypothesis is currently believed correct.
+    best: usize,
+    /// Symbols since the last re-selection. Counted rather than re-selecting
+    /// per block, so the output does not depend on how the caller chunks its
+    /// input.
+    syms: u64,
+    /// Timing has settled: reported, but not used to stop adapting.
+    locked: bool,
+    /// Previous pilot phase, for unwrapping.
+    prev_pilot: Option<f64>,
     level: f64,
 }
 
@@ -45,17 +112,17 @@ impl RdsDemod {
         let taps = lowpass(255, DATA_BW / rate, 60.0);
         Self {
             rate,
-            sym_phase: 0.0,
             i_lp: FirDecimReal::new(taps.clone(), 1),
             q_lp: FirDecimReal::new(taps, 1),
             i_buf: Vec::new(),
             q_buf: Vec::new(),
-            first: 0.0,
-            second: 0.0,
-            first_n: 0,
-            second_n: 0,
-            prev_half: false,
-            prev_bit: None,
+            i_out: Vec::new(),
+            q_out: Vec::new(),
+            arms: (0..ARMS).map(|k| Arm::new(k as f64 / ARMS as f64)).collect(),
+            best: 0,
+            syms: 0,
+            locked: false,
+            prev_pilot: None,
             level: 0.0,
         }
     }
@@ -65,15 +132,35 @@ impl RdsDemod {
         self.level as f32
     }
 
+    /// Which timing hypothesis is in use, and how far ahead of the runner-up
+    /// it is. A ratio near 1 means timing is not resolved.
+    /// Whether symbol timing has been decided and frozen.
+    pub fn timing_locked(&self) -> bool {
+        self.locked
+    }
+
+    pub fn timing(&self) -> (usize, f64) {
+        let best = self.arms[self.best].energy;
+        let next = self
+            .arms
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.best)
+            .map(|(_, a)| a.energy)
+            .fold(0.0f64, f64::max);
+        (self.best, if next > 1e-12 { best / next } else { 1.0 })
+    }
+
     pub fn reset(&mut self) {
-        self.sym_phase = 0.0;
         self.i_lp.reset();
         self.q_lp.reset();
-        self.first = 0.0;
-        self.second = 0.0;
-        self.first_n = 0;
-        self.second_n = 0;
-        self.prev_bit = None;
+        for (k, a) in self.arms.iter_mut().enumerate() {
+            a.reset(k as f64 / ARMS as f64);
+        }
+        self.best = 0;
+        self.syms = 0;
+        self.locked = false;
+        self.prev_pilot = None;
         self.level = 0.0;
     }
 
@@ -88,59 +175,136 @@ impl RdsDemod {
         self.i_buf.reserve(mpx.len());
         self.q_buf.reserve(mpx.len());
 
-        // Coherent mix to baseband using the pilot's third harmonic.
+        // Coherent mix to baseband using the pilot's third harmonic. Both
+        // quadratures are kept: the standard locks the 57 kHz subcarrier to
+        // the pilot's third harmonic but not its phase, so which axis carries
+        // the data is not known in advance.
         for (&x, &p) in mpx.iter().zip(pilot_phase) {
             let c = 3.0 * p;
             let (s, co) = c.sin_cos();
             self.i_buf.push((x as f64 * co) as f32);
             self.q_buf.push((x as f64 * s) as f32);
         }
-        let mut i_out = Vec::new();
-        let mut q_out = Vec::new();
+        self.i_out.clear();
+        self.q_out.clear();
+        let mut i_out = std::mem::take(&mut self.i_out);
+        let mut q_out = std::mem::take(&mut self.q_out);
         self.i_lp.process(&self.i_buf, &mut i_out);
         self.q_lp.process(&self.q_buf, &mut q_out);
 
-        let inc = BAUD / self.rate;
-        for k in 0..i_out.len() {
-            // RDS is BPSK on a carrier locked to the pilot, but the absolute
-            // phase offset is not defined, so take the magnitude along the
-            // stronger axis rather than assuming the data is on I.
+        // The symbol clock is the pilot divided by sixteen, so advance it from
+        // the tracked pilot phase rather than from the nominal baud rate. A
+        // receiver crystal is tens of ppm off, and a fixed increment drifts
+        // against the transmitter by that much for as long as it runs; taking
+        // the increment from the pilot cancels the error exactly, which is the
+        // whole reason the standard tied the two together.
+        let n = i_out.len().min(q_out.len()).min(pilot_phase.len());
+        for k in 0..n {
+            let best = self.best;
+            let mut boundary = false;
             let v = i_out[k] as f64;
             let w = q_out[k] as f64;
 
-            self.sym_phase += inc;
-            let in_second_half = self.sym_phase % 1.0 >= 0.5;
-
-            if in_second_half {
-                self.second += v;
-                self.second_n += 1;
-            } else {
-                self.first += v;
-                self.first_n += 1;
-            }
-            let _ = w;
-
-            // A symbol ends when the phase wraps.
-            if self.sym_phase >= 1.0 {
-                self.sym_phase -= 1.0;
-                let a = if self.first_n > 0 { self.first / self.first_n as f64 } else { 0.0 };
-                let b = if self.second_n > 0 { self.second / self.second_n as f64 } else { 0.0 };
-                // Manchester: the sign of the mid-symbol step is the symbol.
-                let step = a - b;
-                self.level += 0.01 * (step.abs() - self.level);
-                let sym = if step >= 0.0 { 1u8 } else { 0u8 };
-                if let Some(p) = self.prev_bit {
-                    // Differential: the transmitted bit is the change.
-                    bits.push(sym ^ p);
+            let p = pilot_phase[k];
+            let inc = match self.prev_pilot {
+                Some(prev) => {
+                    let mut d = p - prev;
+                    // Unwrap: the tracked phase is kept within one turn.
+                    while d > std::f64::consts::PI {
+                        d -= TAU;
+                    }
+                    while d < -std::f64::consts::PI {
+                        d += TAU;
+                    }
+                    (d / TAU / 16.0).clamp(0.0, 0.5)
                 }
-                self.prev_bit = Some(sym);
-                self.first = 0.0;
-                self.second = 0.0;
-                self.first_n = 0;
-                self.second_n = 0;
+                None => BAUD / self.rate,
+            };
+            self.prev_pilot = Some(p);
+
+            for (ai, arm) in self.arms.iter_mut().enumerate() {
+                arm.phase += inc;
+                if arm.phase % 1.0 >= 0.5 {
+                    arm.second.0 += v;
+                    arm.second.1 += w;
+                    arm.n2 += 1;
+                } else {
+                    arm.first.0 += v;
+                    arm.first.1 += w;
+                    arm.n1 += 1;
+                }
+
+                if arm.phase < 1.0 {
+                    continue;
+                }
+                arm.phase -= 1.0;
+
+                let inv1 = if arm.n1 > 0 { 1.0 / arm.n1 as f64 } else { 0.0 };
+                let inv2 = if arm.n2 > 0 { 1.0 / arm.n2 as f64 } else { 0.0 };
+                // Manchester: the mid-symbol step carries the symbol.
+                let sx = arm.first.0 * inv1 - arm.second.0 * inv2;
+                let sy = arm.first.1 * inv1 - arm.second.1 * inv2;
+                arm.first = (0.0, 0.0);
+                arm.second = (0.0, 0.0);
+                arm.n1 = 0;
+                arm.n2 = 0;
+
+                arm.energy += ENERGY_ALPHA * ((sx * sx + sy * sy).sqrt() - arm.energy);
+                // Squaring folds the two BPSK phases together, so this
+                // converges on the modulation axis rather than cancelling.
+                arm.carrier.0 += CARRIER_ALPHA * ((sx * sx - sy * sy) - arm.carrier.0);
+                arm.carrier.1 += CARRIER_ALPHA * ((2.0 * sx * sy) - arm.carrier.1);
+
+                let theta = 0.5 * arm.carrier.1.atan2(arm.carrier.0);
+                let (st, ct) = theta.sin_cos();
+                // Rotate onto the estimated axis and take its sign.
+                let proj = sx * ct + sy * st;
+                let sym = if proj >= 0.0 { 1u8 } else { 0u8 };
+
+                if ai == best {
+                    boundary = true;
+                    self.level += 0.01 * (proj.abs() - self.level);
+                    if let Some(p) = arm.prev_sym {
+                        // Differential: the transmitted bit is the change.
+                        bits.push(sym ^ p);
+                    }
+                }
+                arm.prev_sym = Some(sym);
             }
-            self.prev_half = in_second_half;
+
+            if boundary {
+                self.syms += 1;
+                // Switching arms slips a bit, because a different hypothesis
+                // wraps at a different moment, and block sync has to recover.
+                // Freezing the choice to avoid that is worse: measured on air
+                // the frozen arm was not the strongest one, so it stayed on a
+                // worse hypothesis indefinitely. Hysteresis keeps switching
+                // rare instead.
+                if self.syms % RESELECT_SYMS == 0 {
+                    // Hysteresis against the incumbent only. Comparing each
+                    // candidate against a running maximum instead means an arm
+                    // that leads by less than the margin can never take over,
+                    // which pins the choice to whichever arm happened to be
+                    // ahead first.
+                    let (arg, top) = self
+                        .arms
+                        .iter()
+                        .enumerate()
+                        .fold((0usize, f64::MIN), |acc, (i, a)| {
+                            if a.energy > acc.1 { (i, a.energy) } else { acc }
+                        });
+                    if top > self.arms[self.best].energy * SWITCH_MARGIN {
+                        self.best = arg;
+                    }
+                    if self.syms >= LOCK_SYMS && self.timing().1 > LOCK_MARGIN {
+                        self.locked = true;
+                    }
+                }
+            }
         }
+
+        self.i_out = i_out;
+        self.q_out = q_out;
     }
 }
 
@@ -153,7 +317,14 @@ mod tests {
 
     /// Modulate bits onto a 57 kHz subcarrier the way a transmitter does, and
     /// return the multiplex along with the pilot phase per sample.
+    pub(super) fn modulate_pub(bits: &[u8]) -> (Vec<f32>, Vec<f64>) { modulate(bits) }
+
     fn modulate(bits: &[u8]) -> (Vec<f32>, Vec<f64>) {
+        modulate_rot(bits, 0.0)
+    }
+
+    /// As `modulate`, but with the subcarrier rotated against the pilot.
+    fn modulate_rot(bits: &[u8], rot: f64) -> (Vec<f32>, Vec<f64>) {
         let sps = RATE / BAUD;
         let n = (bits.len() as f64 * sps) as usize;
         let mut mpx = Vec::with_capacity(n);
@@ -176,7 +347,7 @@ mod tests {
             // Manchester: high then low for a 1, inverted for a 0.
             let chip = if (frac < 0.5) == (s == 1) { 1.0 } else { -1.0 };
             let pilot_ph = TAU * 19_000.0 * t;
-            mpx.push((0.2 * chip * (3.0 * pilot_ph).cos()) as f32);
+            mpx.push((0.2 * chip * (3.0 * pilot_ph + rot).cos()) as f32);
             phase.push(pilot_ph % TAU);
         }
         (mpx, phase)
@@ -191,10 +362,10 @@ mod tests {
         d.process(&mpx, &ph, &mut out);
 
         assert!(out.len() > 300, "only {} bits recovered", out.len());
-        // Skip the filter's settling time, then find the alignment and check
-        // the run matches: the absolute bit offset depends on filter delay.
+        // Skip acquisition: the timing search and the carrier estimate both
+        // need about a hundred symbols, and block sync has not started yet.
         let want = &bits[..];
-        let got = &out[40..];
+        let got = &out[120..];
         let mut best = 0usize;
         let mut best_score = 0usize;
         for off in 0..40usize {
@@ -211,6 +382,60 @@ mod tests {
         }
         let _ = best;
         assert!(best_score > 190, "only {best_score}/200 bits matched");
+    }
+
+    #[test]
+    fn timing_is_found_from_any_symbol_phase() {
+        // The pilot fixes the clock frequency but not where the symbol
+        // boundary falls: that depends on transmitter and receiver filter
+        // delay. Starting every test at phase zero hid this entirely, and on
+        // real signal it was the difference between decoding and not.
+        let bits: Vec<u8> = (0..500).map(|i| ((i * 5 + i / 7) % 2) as u8).collect();
+        let (mpx, ph) = modulate(&bits);
+        let sps = (RATE / BAUD) as usize;
+        for shift in [0usize, sps / 4, sps / 2, 3 * sps / 4] {
+            let mut d = RdsDemod::new(RATE);
+            let mut out = Vec::new();
+            d.process(&mpx[shift..], &ph[shift..], &mut out);
+            let got = &out[150..];
+            let best = (0..60usize)
+                .map(|off| {
+                    got.iter().zip(bits[off..].iter()).take(200).filter(|(a, b)| a == b).count()
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                best > 195,
+                "phase shift {shift}: only {best}/200 bits matched, timing not recovered"
+            );
+        }
+    }
+
+    #[test]
+    fn the_data_is_recovered_whichever_axis_the_carrier_lands_on() {
+        // The standard locks the 57 kHz subcarrier to the pilot's third
+        // harmonic but not to its phase, so a receiver that keeps only the
+        // in-phase component loses everything when the station happens to
+        // transmit in quadrature.
+        let bits: Vec<u8> = (0..500).map(|i| ((i * 3 + 1) % 2) as u8).collect();
+        for rot in [0.0f64, std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_2] {
+            let (mpx, ph) = modulate_rot(&bits, rot);
+            let mut d = RdsDemod::new(RATE);
+            let mut out = Vec::new();
+            d.process(&mpx, &ph, &mut out);
+            let got = &out[150..];
+            let best = (0..60usize)
+                .map(|off| {
+                    got.iter().zip(bits[off..].iter()).take(200).filter(|(a, b)| a == b).count()
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                best > 195,
+                "carrier rotated {:.0} deg: only {best}/200 matched",
+                rot.to_degrees()
+            );
+        }
     }
 
     #[test]
@@ -252,5 +477,43 @@ mod tests {
         };
         assert_eq!(whole.len(), split.len(), "block splitting changed the bit count");
         assert_eq!(whole, split, "block splitting changed the bits");
+    }
+}
+
+#[cfg(test)]
+mod diag {
+    use super::*;
+    use std::f64::consts::TAU;
+    const RATE: f64 = 228_000.0;
+
+    #[test]
+    #[ignore]
+    fn timing_search() {
+        let bits: Vec<u8> = (0..400).map(|i| ((i * 7 + i / 3) % 2) as u8).collect();
+        let (mpx, ph) = super::tests::modulate_pub(&bits);
+        let mut d = RdsDemod::new(RATE);
+        let mut out = Vec::new();
+        for (m, p) in mpx.chunks(20_000).zip(ph.chunks(20_000)) {
+            d.process(m, p, &mut out);
+            let e: Vec<String> = d.arms.iter().map(|a| format!("{:.3}", a.energy)).collect();
+            println!(
+                "bits {:4} best {} margin {:.2} locked {} | {}",
+                out.len(),
+                d.best,
+                d.timing().1,
+                d.locked,
+                e.join(" ")
+            );
+        }
+        // Where do the errors fall?
+        let mut best_off = 0;
+        let mut best_score = 0;
+        for off in 0..40usize {
+            let sc = out[40..].iter().zip(bits[off..].iter()).take(200).filter(|(a, b)| a == b).count();
+            if sc > best_score { best_score = sc; best_off = off; }
+        }
+        let mism: Vec<usize> = out[40..].iter().zip(bits[best_off..].iter()).take(200)
+            .enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+        println!("off {best_off} score {best_score}/200 mismatches at {mism:?}");
     }
 }
