@@ -131,11 +131,22 @@ impl Dial {
                 out = (hz + 10f64.powi(dec) * n as f64).clamp(0.0, 3e9);
                 changed = true;
             }
+            if response.secondary_clicked() {
+                out = zero_below(hz, dec);
+                changed = out != hz;
+            }
         }
 
-        let _ = response;
         DialOut { changed, hz: out }
     }
+}
+
+/// Clear a decade and everything under it, the way a receiver's dial does when
+/// you want a round number: right-clicking the kHz digit of 95.8437 leaves
+/// 95.8000, not 95.8437 with one digit changed.
+fn zero_below(hz: f64, dec: i32) -> f64 {
+    let step = 10f64.powi(dec + 1);
+    (hz / step).floor() * step
 }
 
 /// Decades shown by the compact dial: 1 GHz down to 100 Hz. Finer than any
@@ -174,7 +185,7 @@ impl Dial {
         let gap = size * 0.26;
         let width = SMALL_DECADES.len() as f32 * digit_w + gap;
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(width, size * 1.25), Sense::hover());
+            ui.allocate_exact_size(Vec2::new(width, size * 1.25), Sense::click());
         let p = ui.painter_at(rect);
 
         let digits = small_digits(hz);
@@ -230,6 +241,10 @@ impl Dial {
                 out = (hz + 10f64.powi(dec) * n as f64).clamp(0.0, 3e9);
                 changed = true;
             }
+            if response.secondary_clicked() {
+                out = zero_below(hz, dec);
+                changed = out != hz;
+            }
         }
         DialOut { changed, hz: out }
     }
@@ -270,6 +285,28 @@ mod tests {
             let diff = stepped - hz;
             assert!((diff - 10f64.powi(dec)).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn zeroing_a_digit_clears_everything_under_it() {
+        // Right-clicking the 100 kHz digit of 95.8437 MHz gives 95.0000.
+        assert_eq!(zero_below(95_843_700.0, 5), 95_000_000.0);
+        // And the 1 kHz digit gives 95.843 MHz exactly.
+        assert_eq!(zero_below(95_843_700.0, 3), 95_840_000.0);
+        // The units digit clears only the sub-Hz part, so nothing moves.
+        assert_eq!(zero_below(95_843_700.0, 0), 95_843_700.0);
+    }
+
+    #[test]
+    fn zeroing_the_top_digit_goes_to_zero() {
+        assert_eq!(zero_below(1_090_000_000.0, 9), 0.0);
+    }
+
+    #[test]
+    fn zeroing_an_already_round_frequency_changes_nothing() {
+        // No change means no retune, so a stray right-click cannot interrupt
+        // a station that is already on a round frequency.
+        assert_eq!(zero_below(95_000_000.0, 5), 95_000_000.0);
     }
 
     #[test]

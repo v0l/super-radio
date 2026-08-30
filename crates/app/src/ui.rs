@@ -285,6 +285,20 @@ impl App {
         self.ceil += (hi.max(lo + 20.0) - self.ceil) * 0.05;
     }
 
+    /// Frequency under the pointer, snapped to the band's channel plan while
+    /// shift is held.
+    ///
+    /// Snapping is opt-in rather than always on because most of the spectrum
+    /// has no legal raster, and a band that does still carries signals off it.
+    fn hz_at_snapped(&self, rect: &Rect, x: f32, ui: &egui::Ui) -> f64 {
+        let hz = self.hz_at(rect, x);
+        if ui.input(|i| i.modifiers.shift) {
+            bands::snap(hz)
+        } else {
+            hz
+        }
+    }
+
     fn hz_at(&self, rect: &Rect, x: f32) -> f64 {
         let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
         self.center - self.rate / 2.0 + t * self.rate
@@ -1044,7 +1058,8 @@ impl App {
         cog(&p, &fall_cog, fall_hot);
 
         if !plot_hot && !fall_hot {
-            self.cursor(&p, &full, &resp);
+            let shift = ui.input(|i| i.modifiers.shift);
+            self.cursor(&p, &full, &resp, shift);
         }
 
         if resp.clicked() && self.drag_ch.is_none() {
@@ -1056,11 +1071,14 @@ impl App {
                 } else if fall_cog.contains(pos) {
                     self.open = Some(Settings::Waterfall);
                 } else {
+                    // Hit testing uses the true position; only the frequency a
+                    // new channel lands on is snapped, so shift-clicking an
+                    // existing channel still selects it.
                     let hz = self.hz_at(&full, pos.x);
                     let tol = self.rate / full.width() as f64 * 6.0;
                     match self.channels.iter().position(|c| (c.freq - hz).abs() < tol) {
                         Some(i) => self.listen(i),
-                        None => self.add_channel(hz),
+                        None => self.add_channel(self.hz_at_snapped(&full, pos.x, ui)),
                     }
                 }
             }
@@ -1085,7 +1103,7 @@ impl App {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         // Follow the pointer rather than accumulating deltas,
                         // so the marker cannot drift away from the cursor.
-                        self.channels[i].freq = self.hz_at(&full, pos.x);
+                        self.channels[i].freq = self.hz_at_snapped(&full, pos.x, ui);
                         if self.listening == Some(i) {
                             self.listen(i);
                         }
@@ -1267,14 +1285,39 @@ impl App {
         }
     }
 
-    fn cursor(&self, p: &egui::Painter, full: &Rect, resp: &egui::Response) {
+    fn cursor(&self, p: &egui::Painter, full: &Rect, resp: &egui::Response, shift: bool) {
         let Some(pos) = resp.hover_pos() else { return };
-        let hz = self.hz_at(full, pos.x);
+        let raw = self.hz_at(full, pos.x);
+        let raster = bands::raster_at(raw);
+        // With shift held the readout shows where a channel would actually
+        // land, not where the pointer is, so the snap is visible before
+        // committing to it.
+        let hz = if shift { bands::snap(raw) } else { raw };
         p.line_segment(
             [Pos2::new(pos.x, full.top()), Pos2::new(pos.x, full.bottom())],
             Stroke::new(1.0, Color32::from_rgb(0x55, 0x5E, 0x69)),
         );
-        let text = format!("{}   {}", fmt_hz(hz), bands::name_at(hz));
+        if shift {
+            // Mark the snapped frequency when it differs from the pointer.
+            let sx = self.x_of(full, hz);
+            if (sx - pos.x).abs() > 1.0 && full.x_range().contains(sx) {
+                p.line_segment(
+                    [Pos2::new(sx, full.top()), Pos2::new(sx, full.bottom())],
+                    Stroke::new(1.0, theme::READOUT),
+                );
+            }
+        }
+        let text = match (shift, raster) {
+            (true, Some(r)) => {
+                format!("{}   {}   snap {}", fmt_hz(hz), bands::name_at(hz), fmt_hz(r.step))
+            }
+            (true, None) => format!("{}   {}   no channel plan", fmt_hz(hz), bands::name_at(hz)),
+            _ => match raster {
+                // Advertise the gesture only where it would do something.
+                Some(_) => format!("{}   {}   shift to snap", fmt_hz(hz), bands::name_at(hz)),
+                None => format!("{}   {}", fmt_hz(hz), bands::name_at(hz)),
+            },
+        };
         let g = p.layout_no_wrap(
             text,
             FontId::new(11.0, FontFamily::Name(theme::READOUT_FONT.into())),
