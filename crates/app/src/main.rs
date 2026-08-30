@@ -236,6 +236,11 @@ fn main() -> eframe::Result<()> {
         .iter()
         .position(|x| x == "--soak")
         .map(|i| a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(12.0f32));
+    let tune = a
+        .iter()
+        .position(|x| x == "--tune")
+        .and_then(|i| a.get(i + 1))
+        .and_then(|v| v.parse::<f64>().ok());
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
@@ -248,6 +253,9 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(move |cc| {
             let mut app = ui::App::new(cc);
+            if let Some(mhz) = tune {
+                app.tune_to(mhz, radio::Demod::Wfm);
+            }
             app.shot = shot;
             app.soak = soak;
             Ok(Box::new(app))

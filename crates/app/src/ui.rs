@@ -2,7 +2,7 @@
 
 use crate::bands;
 use crate::dial::Dial;
-use crate::radio::{Cmd, Demod, Frame, Radio};
+use crate::radio::{Cmd, Demod, Frame, Radio, StationInfo};
 use crate::theme::{self, legend, readout, value};
 use crate::waterfall::Waterfall;
 use crate::wheel::Wheel;
@@ -139,6 +139,22 @@ impl App {
         app.device = app.devices.first().cloned();
         app.connect(&cc.egui_ctx);
         app
+    }
+
+    /// Start tuned to a station and listening to it.
+    ///
+    /// Useful for screenshots and for checking a change against real RF
+    /// without a dozen clicks first.
+    pub fn tune_to(&mut self, mhz: f64, demod: Demod) {
+        let freq = mhz * 1e6;
+        self.center = freq;
+        self.send(Cmd::Center(common::Hz(freq as u64)));
+        self.channels.push(Channel {
+            freq,
+            demod,
+            label: format!("{mhz:.1}"),
+        });
+        self.listen(self.channels.len() - 1);
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
@@ -781,60 +797,49 @@ impl App {
             ui.add_space(4.0);
             lamp(ui, "drops", dropped > 0, theme::FAULT, &format!("{dropped}"));
             lamp(ui, "rx", running, theme::TRACE, if running { "on" } else { "off" });
-            // Brightness follows the blend rather than switching, matching what
-            // the audio is actually doing: separation is scaled, not toggled.
-            let blend = r.status.blend();
-            lamp_level(
-                ui,
-                "stereo",
-                blend,
-                theme::READOUT,
-                if blend > 0.99 {
-                    "full".to_string()
-                } else if blend < 0.01 {
-                    "mono".to_string()
-                } else {
-                    format!("{:.0}%", blend * 100.0)
-                },
-            );
         });
     }
 
-    /// Station identification from RDS, shown only once it has arrived.
-    fn rds(&self, ui: &mut egui::Ui) {
-        let Some(r) = &self.radio else { return };
-        let st = r.status.station();
-        if st.is_empty() {
+    /// What the radio is hearing on the channel being listened to.
+    ///
+    /// This belongs inside the channel rather than beside the list: a station
+    /// name is a property of one tuned frequency, and with several channels
+    /// configured a panel-level readout gives no clue which one it describes.
+    fn channel_rds(ui: &mut egui::Ui, st: &StationInfo, blend: f32) {
+        if st.is_empty() && blend <= 0.01 {
             return;
         }
-        ui.add_space(8.0);
-        egui::Frame::NONE
-            .fill(theme::WELL)
-            .stroke(Stroke::new(1.0, theme::ETCH))
-            .corner_radius(2.0)
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(legend("rds"));
-                    if let Some(pi) = st.pi {
-                        ui.label(legend(&format!("PI {pi:04X}")));
-                    }
-                });
-                if let Some(n) = &st.name {
-                    ui.label(value(n).size(16.0).color(theme::READOUT));
-                }
-                if let Some(p) = st.pty {
-                    ui.label(legend(p));
-                }
-                if let Some(rt) = &st.radiotext {
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(rt)
-                            .color(theme::LEGEND)
-                            .size(11.0),
-                    );
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(legend("rds"));
+            if let Some(pi) = st.pi {
+                ui.label(legend(&format!("PI {pi:04X}")));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Stereo belongs here too: it is a property of this station,
+                // and it fades with the blend because the audio does.
+                let t = blend.clamp(0.0, 1.0);
+                if t > 0.01 {
+                    let c = theme::TRACE.gamma_multiply(0.35 + 0.65 * t);
+                    ui.label(value(if t > 0.99 { "STEREO" } else { "BLEND" }).size(10.0).color(c));
                 }
             });
+        });
+        if let Some(n) = &st.name {
+            // Cyan, not amber: this is what the radio heard, not something the
+            // operator set.
+            ui.label(value(n).size(15.0).color(theme::TRACE));
+        }
+        if let Some(p) = st.pty {
+            ui.label(legend(p));
+        }
+        if let Some(rt) = &st.radiotext {
+            ui.add_space(2.0);
+            // Radiotext is up to 64 characters and the strip is narrow, so let
+            // it wrap rather than truncating a song title mid-word.
+            ui.label(egui::RichText::new(rt).color(theme::LEGEND).size(11.0));
+        }
     }
 
     fn strip(&mut self, ui: &mut egui::Ui) {
@@ -863,7 +868,6 @@ impl App {
                     }
                 });
 
-                self.rds(ui);
                 ui.add_space(8.0);
 
                 if self.channels.is_empty() {
@@ -874,6 +878,11 @@ impl App {
                     );
                 }
 
+                // Read once rather than per channel: this takes a lock.
+                let live = self
+                    .radio
+                    .as_ref()
+                    .map(|r| (r.status.station(), r.status.blend()));
                 let mut remove = None;
                 let mut tune = None;
                 for (i, ch) in self.channels.iter_mut().enumerate() {
@@ -922,6 +931,13 @@ impl App {
                                     tune = Some(i);
                                 }
                             });
+                            // Only the channel being listened to has a decoder
+                            // running, so only it has anything to show.
+                            if active {
+                                if let Some((st, blend)) = &live {
+                                    Self::channel_rds(ui, st, *blend);
+                                }
+                            }
                         });
                     ui.add_space(6.0);
                 }
@@ -1199,31 +1215,6 @@ fn lamp(ui: &mut egui::Ui, label: &str, lit: bool, col: Color32, text: &str) {
         }
         ui.label(legend(label));
         ui.label(value(text).size(11.0).color(if lit { col } else { theme::LEGEND }));
-    });
-}
-
-/// A lamp whose brightness tracks a continuous level.
-fn lamp_level(ui: &mut egui::Ui, label: &str, level: f32, col: Color32, text: String) {
-    let t = level.clamp(0.0, 1.0);
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
-        let dark = Color32::from_rgb(0x2C, 0x31, 0x38);
-        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-        let c = Color32::from_rgb(
-            mix(dark.r(), col.r()),
-            mix(dark.g(), col.g()),
-            mix(dark.b(), col.b()),
-        );
-        ui.painter().circle_filled(r.center(), 3.5, c);
-        if t > 0.02 {
-            ui.painter().circle_filled(
-                r.center(),
-                6.0,
-                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (30.0 * t) as u8),
-            );
-        }
-        ui.label(legend(label));
-        ui.label(value(&text).size(11.0).color(c));
     });
 }
 
