@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a CI failure costs nothing and saves a round trip.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            librtlsdr-dev pkg-config libclang-dev \
+            libasound2-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        # Release: several tests assert throughput against real time, and a
+        # debug build misses those by a wide enough margin to be meaningless.
+        run: cargo test --workspace --release
+
+      - name: Build with no radio attached
+        run: cargo build --workspace --release --all-targets

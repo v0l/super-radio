@@ -91,6 +91,18 @@ sudo apt install librtlsdr-dev     # or rtl-sdr-devel / rtl-sdr
 cargo test --workspace
 ```
 
+Run the tests in release. Several of them assert the audio chain keeps ahead of
+real time, and a debug build misses by enough that the numbers mean nothing.
+
+### Prebuilt binaries
+
+`.github/workflows/build.yml` builds Linux, macOS (Intel and Apple Silicon) and
+Windows on every push, and attaches them to a release on a `v*` tag. The
+binaries link librtlsdr rather than bundling it, so the copy matching your udev
+rules is the one already installed; the Windows zip does ship the DLLs, since
+there is no system package to point a Windows user at. Windows also needs
+WinUSB bound to the RTL2832U with Zadig before the device can be opened.
+
 ## Test fixtures
 
 Recorded IQ lives on nostr.download, not in git; it is near-incompressible and

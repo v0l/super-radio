@@ -1,0 +1,151 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built on the oldest runner image available so the glibc the binary
+      # needs is older than the one on the machine running it. Building on
+      # latest produces something that will not start on a stable distribution.
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            librtlsdr-dev pkg-config libclang-dev \
+            libasound2-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: macOS libraries
+        if: runner.os == 'macOS'
+        run: brew install librtlsdr pkg-config
+
+      # rtlsdr-sys takes an explicit path in preference to pkg-config, which is
+      # the way in on Windows: vcpkg ships the library and headers but getting
+      # pkg-config itself working under MSVC is a job of its own.
+      - name: Windows libraries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install rtlsdr:x64-windows
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "RTLSDR_LIB_DIR=$root\lib"         | Out-File -Append $env:GITHUB_ENV
+          "RTLSDR_INCLUDE_DIR=$root\include" | Out-File -Append $env:GITHUB_ENV
+          "VCPKG_BIN=$root\bin"              | Out-File -Append $env:GITHUB_ENV
+          # bindgen needs libclang, which is present on the runner but not on
+          # a path it looks in by itself.
+          "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p app
+
+      - name: Stage (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p stage
+          cp target/${{ matrix.target }}/release/super-radio stage/
+          cp README.md LICENSE* stage/ 2>/dev/null || true
+          cat > stage/RUNNING.txt <<'EOF'
+          super-radio links librtlsdr at run time rather than bundling it,
+          because the copy that matches your udev rules and your USB stack is
+          the one already on your machine.
+
+            Debian/Ubuntu   sudo apt install librtlsdr0 libasound2
+            Fedora          sudo dnf install rtl-sdr alsa-lib
+            Arch            sudo pacman -S rtl-sdr alsa-lib
+            macOS           brew install librtlsdr
+
+          Verified against the built binary, which links librtlsdr.so.0,
+          libasound.so.2 and libusb-1.0.so.0 and nothing else out of the
+          ordinary.
+
+          On Linux a plain user needs permission to claim the device. The
+          rtl-sdr package usually installs the udev rules that grant it; if
+          the radio is only visible as root, that is what is missing.
+          EOF
+          tar -C stage -czf super-radio-${{ matrix.name }}.tar.gz .
+
+      # The DLLs go in the zip: there is no system package to point a Windows
+      # user at, so an executable on its own would not start.
+      - name: Stage (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\super-radio.exe" stage\
+          Copy-Item "$env:VCPKG_BIN\*.dll" stage\ -ErrorAction SilentlyContinue
+          Copy-Item README.md stage\ -ErrorAction SilentlyContinue
+          @"
+          Plug the radio in before starting super-radio.
+
+          Windows needs WinUSB bound to the device rather than the DVB-T
+          driver it ships with. Use Zadig (https://zadig.akeo.ie) and replace
+          the driver on the RTL2832U interface with WinUSB. Without this the
+          device enumerates but cannot be opened.
+          "@ | Out-File -Encoding utf8 stage\RUNNING.txt
+          Compress-Archive -Path stage\* -DestinationPath super-radio-${{ matrix.name }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: super-radio-${{ matrix.name }}
+          path: |
+            super-radio-*.tar.gz
+            super-radio-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+          generate_release_notes: true
