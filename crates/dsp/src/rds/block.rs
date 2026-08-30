@@ -124,7 +124,16 @@ pub fn data_of(block: u32) -> u16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Group {
     pub words: [u16; 4],
+    /// Which blocks passed their syndrome check. A block that did not is
+    /// whatever noise happened to be there, so a consumer must not read it.
+    pub valid: [bool; 4],
     pub c_prime: bool,
+}
+
+impl Group {
+    pub fn all_valid(&self) -> bool {
+        self.valid.iter().all(|v| *v)
+    }
 }
 
 /// Recovers group framing from a bit stream.
@@ -139,11 +148,14 @@ pub struct BlockSync {
     slot: usize,
     synced: bool,
     words: [u16; 4],
+    valid: [bool; 4],
     c_prime: bool,
     good: u32,
     bad: u32,
     pub groups: u64,
     pub errors: u64,
+    /// Groups discarded because their identifying blocks did not check out.
+    pub rejected: u64,
 }
 
 /// Consecutive bad blocks tolerated before sync is dropped.
@@ -163,11 +175,13 @@ impl BlockSync {
             slot: 0,
             synced: false,
             words: [0; 4],
+            valid: [false; 4],
             c_prime: false,
             good: 0,
             bad: 0,
             groups: 0,
             errors: 0,
+            rejected: 0,
         }
     }
 
@@ -192,6 +206,8 @@ impl BlockSync {
                 self.synced = true;
                 self.slot = 0;
                 self.words[0] = data_of(self.reg);
+                self.valid = [false; 4];
+                self.valid[0] = true;
                 self.c_prime = false;
                 self.slot = 1;
                 self.bits = 0;
@@ -232,12 +248,28 @@ impl BlockSync {
             self.c_prime = found == Some(Offset::CPrime);
         }
         self.words[self.slot] = data_of(self.reg);
+        self.valid[self.slot] = expected_ok;
 
         self.slot += 1;
         if self.slot == 4 {
             self.slot = 0;
+            // Blocks A and B carry the identifier and the group type, so
+            // without them there is nothing to interpret the rest against.
+            // Emitting a group assembled from blocks that failed their check
+            // is worse than emitting nothing: measured against stations with
+            // no RDS at all it produced about eight groups per sixty-eight
+            // block times, each with a different identifier, which reads as a
+            // working decoder finding a station that is not there.
+            if !(self.valid[0] && self.valid[1]) {
+                self.rejected += 1;
+                return None;
+            }
             self.groups += 1;
-            return Some(Group { words: self.words, c_prime: self.c_prime });
+            return Some(Group {
+                words: self.words,
+                valid: self.valid,
+                c_prime: self.c_prime,
+            });
         }
         None
     }
@@ -353,6 +385,47 @@ mod tests {
             s.push(((n >> 16) & 1) as u8);
         }
         assert!(!s.is_synced(), "held sync on pure noise");
+    }
+
+    #[test]
+    fn noise_does_not_produce_groups() {
+        // Against a station with no RDS this used to emit roughly one group
+        // per eight block times, each with a different identifier, which is
+        // indistinguishable from a working decoder until the identifier is
+        // noticed to change on every run.
+        let mut s = BlockSync::new();
+        let mut n = 0x1234_5678u32;
+        let mut got = 0;
+        for _ in 0..26 * 4000 {
+            n = n.wrapping_mul(1103515245).wrapping_add(12345);
+            if s.push(((n >> 16) & 1) as u8).is_some() {
+                got += 1;
+            }
+        }
+        assert!(got <= 1, "{got} groups out of pure noise");
+    }
+
+    #[test]
+    fn a_group_reports_which_blocks_checked_out() {
+        let words = [0xF212, 0x0408, 0x2037, 0x4D41];
+        let mut s = BlockSync::new();
+        for b in group_bits(words) {
+            s.push(b);
+        }
+        // Corrupt block D only.
+        let mut bits = group_bits(words);
+        let last = bits.len() - 10;
+        bits[last] ^= 1;
+        let mut got = None;
+        for b in bits {
+            if let Some(g) = s.push(b) {
+                got = Some(g);
+            }
+        }
+        let g = got.expect("group should still be delivered");
+        assert!(g.valid[0] && g.valid[1] && g.valid[2]);
+        assert!(!g.valid[3], "corrupt block reported as good");
+        assert!(!g.all_valid());
     }
 
     #[test]

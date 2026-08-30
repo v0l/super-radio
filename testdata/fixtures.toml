@@ -62,3 +62,33 @@ that merely sounds plausible can still be wrong; one that puts the pilot at
 station_offset_hz = 300_000
 pilot_hz = 19_000
 pilot_snr_db_min = 30.0
+
+[[capture]]
+name = "rds_92.4M_1024k.cu8"
+sha256 = "97e34827e2f219d671393c0604de0bf1a04cf7248e6419f8c415ceb84105b306"
+url = "https://nostr.download/97e34827e2f219d671393c0604de0bf1a04cf7248e6419f8c415ceb84105b306.xz"
+compression = "xz"
+center_hz = 92_400_000
+rate_sps = 1_024_000
+format = "cu8"
+description = """
+Twenty seconds of Spirit Radio on 92.4 MHz, carrying RDS. RTL-SDR with an R820T
+tuner at 40.2 dB gain, telescopic antenna.
+
+This exists because the earlier FM fixture does not. Development against
+95.8 MHz spent a long time on a decoder that appeared broken, when measuring
+the band around 57 kHz showed it sat at the noise floor: that station radiates
+a pilot but no subcarriers, so there was nothing there to decode. A capture
+with RDS actually present is the difference between testing a decoder and
+testing an antenna.
+
+The station name and the identifier are the useful assertions. An identifier is
+constant for a station, so one that changes between runs is the signature of a
+decoder reading noise through valid-looking syndromes rather than decoding.
+"""
+
+[capture.expect]
+pi = 0x2208
+station_name = "SPIRIT"
+radiotext_contains = "Spirit"
+group_yield_min_pct = 60.0
