@@ -223,12 +223,103 @@ fn bench_audio() {
     }
 }
 
+/// How long a retune actually costs, which decides whether a drag can send one
+/// per frame.
+fn bench_tune() {
+    use common::Hz;
+    let Some(entry) = devices::list().into_iter().next() else {
+        println!("no radio found");
+        return;
+    };
+    println!("using {}", entry.label);
+    let mut dev = match devices::open(&entry) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("open failed: {e}");
+            return;
+        }
+    };
+    let mut best = f64::MAX;
+    let mut worst: f64 = 0.0;
+    let mut total = 0.0;
+    const N: usize = 60;
+    for i in 0..N {
+        let f = 95_000_000 + (i as u64 % 20) * 25_000;
+        let t = std::time::Instant::now();
+        let _ = dev.set_center(Hz(f));
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        best = best.min(ms);
+        worst = worst.max(ms);
+        total += ms;
+    }
+    println!(
+        "set_center x{N}:  min {best:.2} ms   mean {:.2} ms   max {worst:.2} ms",
+        total / N as f64
+    );
+    println!("a 60 fps drag spends {:.0}% of each frame retuning", total / N as f64 / 16.7 * 100.0);
+}
+
+/// Frames still delivered while the centre is being dragged.
+///
+/// A drag issues one retune per displayed frame, and a retune blocks the thread
+/// that reads samples, so without coalescing the spectrum stops updating for as
+/// long as the drag lasts.
+fn bench_pan() {
+    use common::{Hz, Sps};
+    let Some(entry) = devices::list().into_iter().next() else {
+        println!("no radio found");
+        return;
+    };
+    println!("using {}", entry.label);
+    let r = radio::Radio::start(entry, Hz(95_800_000), Sps(2_304_000), 2048, || {});
+
+    let count = |label: &str, drag: bool| {
+        // Settle, then count for three seconds.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        while r.frames.try_recv().is_ok() {}
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        let mut step = 0u64;
+        while t.elapsed() < std::time::Duration::from_secs(3) {
+            if drag {
+                // One per frame at 60 fps, which is what a drag produces.
+                step = (step + 1) % 200;
+                r.send(radio::Cmd::Center(Hz(95_800_000 + step * 500)));
+            }
+            while r.frames.try_recv().is_ok() {
+                n += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        println!("{label:22}  {:.1} frames/s", n as f64 / 3.0);
+    };
+    count("idle", false);
+    count(
+        if std::env::var("SR_TUNE_GAP_MS").as_deref() == Ok("0") {
+            "dragging, uncoalesced"
+        } else {
+            "dragging the centre"
+        },
+        true,
+    );
+    r.send(radio::Cmd::Stop);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
 fn soak_enabled(a: &[String]) -> bool {
     a.iter().any(|x| x == "--soak")
 }
 
 fn main() -> eframe::Result<()> {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().any(|x| x == "--bench-pan") {
+        bench_pan();
+        return Ok(());
+    }
+    if a.iter().any(|x| x == "--bench-tune") {
+        bench_tune();
+        return Ok(());
+    }
     if a.iter().any(|x| x == "--bench-audio") {
         bench_audio();
         return Ok(());
