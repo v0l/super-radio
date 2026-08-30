@@ -36,3 +36,29 @@ wind_gust_ms = 0.0
 rain_total_mm = 84.3
 battery_ok = true
 crc_valid = true
+
+[[capture]]
+name = "wfm_stereo_95.5M_1024k.cu8"
+sha256 = "659e95cd8458fba622e40cb31b118318ce5eac7e7d1ada0e39fcd9c11c46e837"
+url = "https://nostr.download/659e95cd8458fba622e40cb31b118318ce5eac7e7d1ada0e39fcd9c11c46e837.xz"
+compression = "xz"
+center_hz = 95_500_000
+rate_sps = 1_024_000
+format = "cu8"
+description = """
+Broadcast stereo FM at 95.8 MHz, captured with the receiver tuned 300 kHz low
+so the station avoids the RTL2832U's DC spur. RTL-SDR with an R820T tuner at
+49.6 dB gain, telescopic antenna.
+
+The value of this capture is the 19 kHz stereo pilot. Every stereo FM broadcast
+carries a tone at exactly 19000 Hz, so its presence and its exact frequency
+verify the whole receive chain at once: tuning, mixing, decimation, the
+discriminator, and all the sample-rate bookkeeping behind them. A demodulator
+that merely sounds plausible can still be wrong; one that puts the pilot at
+19000.0 Hz is not.
+"""
+
+[capture.expect]
+station_offset_hz = 300_000
+pilot_hz = 19_000
+pilot_snr_db_min = 30.0

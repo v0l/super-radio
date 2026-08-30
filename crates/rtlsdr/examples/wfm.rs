@@ -88,7 +88,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mixer = Mixer::new(-offset, RF_RATE as f64);
     let mut if_dec = FirDecim::design(IF_DECIM, 0.9, 80.0);
     let mut demod = FmDemod::new(IF_RATE, 75_000.0);
-    let mut audio_dec = FirDecim::design(AUDIO_DECIM, 0.9, 80.0);
+    // Cut at 15 kHz, not at the audio Nyquist. A wider filter passes the
+    // 19 kHz stereo pilot straight into the mono output, where it sits ~43 dB
+    // up, eats headroom and aliases the moment anything resamples it. The
+    // broadcast mono baseband ends at 15 kHz by definition, so anything above
+    // that is pilot and subcarrier, never programme audio.
+    const AUDIO_RATE: f64 = IF_RATE / AUDIO_DECIM as f64;
+    let mut audio_dec =
+        FirDecim::design(AUDIO_DECIM, 15_000.0 / (AUDIO_RATE / 2.0), 80.0);
     let mut deemph = Deemphasis::eu(IF_RATE / AUDIO_DECIM as f64);
 
     let (mut shifted, mut iq_if, mut disc) = (Vec::new(), Vec::new(), Vec::new());
@@ -138,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if snr > 10.0 {
         println!("PILOT DETECTED. WFM demodulation chain verified end to end.");
         // Sweep for the exact peak; it should land within a few Hz of 19000.
+        const STEP: f64 = 0.25;
         let mut best = (0.0f64, 0.0f64);
         let mut f = 18_950.0;
         while f <= 19_050.0 {
@@ -145,10 +153,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if m > best.1 {
                 best = (f, m);
             }
-            f += 1.0;
+            f += STEP;
         }
-        println!("peak at {:.0} Hz (error {:+.0} Hz -> {:+.2} ppm tuning offset)",
-            best.0, best.0 - 19_000.0, (best.0 - 19_000.0) / 19_000.0 * 1e6);
+        let err = best.0 - 19_000.0;
+        // Only quote a ppm figure when the error exceeds the sweep resolution.
+        // Converting a one-step error into ppm gives an alarming 53 ppm from
+        // what is really just the search grid, which would send someone
+        // chasing a crystal problem that does not exist.
+        if err.abs() <= STEP * 1.5 {
+            println!("peak at {:.2} Hz (within the {STEP} Hz search resolution of 19000)", best.0);
+        } else {
+            println!("peak at {:.2} Hz (error {err:+.2} Hz -> {:+.2} ppm tuning offset)",
+                best.0, err / 19_000.0 * 1e6);
+        }
     } else {
         println!("No pilot. Either a mono station, or too weak.");
     }
