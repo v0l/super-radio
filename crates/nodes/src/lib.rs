@@ -9,6 +9,7 @@
 pub mod bank;
 pub mod decode_nodes;
 pub mod dsp_nodes;
+pub mod wfm;
 
 pub use bank::{ChannelBank, ChannelEvent, Gating};
 pub use decode_nodes::{ProtocolDecodeNode, PulseDetectNode};
