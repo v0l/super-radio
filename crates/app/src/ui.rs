@@ -52,6 +52,9 @@ pub struct App {
     pub shot: Option<String>,
     shot_at: Option<std::time::Instant>,
     shot_sent: bool,
+    /// Remove the direct-conversion centre spur. On by default: it is an
+    /// artefact of the receiver, not something being received.
+    dc_block: bool,
     /// Channel whose marker is being dragged in the spectrum.
     drag_ch: Option<usize>,
     /// Shared per-digit readout for the channel strip. Only one channel can be
@@ -134,6 +137,7 @@ impl Default for App {
             chan_dial: crate::dial::Dial::new(),
             shot_at: None,
             shot_sent: false,
+            dc_block: true,
         }
     }
 }
@@ -751,6 +755,18 @@ impl App {
             } else {
                 format!("{:.0}%", (1.0 - self.smoothing) * 100.0)
             }));
+        });
+        ui.add_space(8.0);
+
+        row(ui, "Centre spur", |ui| {
+            if ui.checkbox(&mut self.dc_block, "Remove").changed() {
+                self.send(Cmd::DcBlock(self.dc_block));
+            }
+            ui.label(
+                egui::RichText::new("LO leakage at the tuned frequency")
+                    .color(theme::LEGEND)
+                    .size(10.0),
+            );
         });
         ui.add_space(8.0);
         self.scale_settings(ui);

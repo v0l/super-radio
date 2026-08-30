@@ -6,6 +6,7 @@
 
 pub mod blend;
 pub mod channelizer;
+pub mod dc;
 pub mod demod;
 pub mod detect;
 pub mod fir;
@@ -18,6 +19,7 @@ pub mod window;
 
 pub use blend::{HighBlend, NoiseMeter, VariableLowpass};
 pub use channelizer::Channelizer;
+pub use dc::DcBlock;
 pub use demod::{AmDemod, Deemphasis, FmDemod};
 pub use detect::{Burst, Detector, DetectorConfig, NoiseFloor};
 pub use fir::{Fir, FirDecim, FirDecimReal};
