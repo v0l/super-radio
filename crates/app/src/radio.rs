@@ -2,7 +2,7 @@
 //! demodulates whichever channel is selected for audio.
 
 use audio::AudioPlayer;
-use common::{Device, GainMode, Hz, Sps, C32};
+use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dsp::{Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum};
 use std::sync::{
@@ -119,7 +119,7 @@ impl Radio {
     /// Start streaming from an RTL-SDR. `repaint` is called on every frame so
     /// the UI wakes without polling.
     pub fn start(
-        index: u32,
+        entry: crate::devices::Entry,
         center: Hz,
         rate: Sps,
         fft: usize,
@@ -135,7 +135,7 @@ impl Radio {
         let handle = std::thread::Builder::new()
             .name("radio".into())
             .spawn(move || {
-                if let Err(e) = run(index, center, rate, fft, cmd_rx, frame_tx, &st, repaint) {
+                if let Err(e) = run(entry, center, rate, fft, cmd_rx, frame_tx, &st, repaint) {
                     *st.error.lock() = Some(e.to_string());
                 }
                 st.running.store(false, Ordering::Relaxed);
@@ -238,7 +238,7 @@ impl Audio {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    index: u32,
+    entry: crate::devices::Entry,
     center: Hz,
     rate: Sps,
     fft: usize,
@@ -247,7 +247,11 @@ fn run(
     status: &Status,
     repaint: impl Fn(),
 ) -> anyhow::Result<()> {
-    let mut dev = rtlsdr::RtlSdr::open(index)?;
+    let mut dev = crate::devices::open(&entry)?;
+    // Clamp to what this radio can actually do: the app's last span may have
+    // come from a different device entirely.
+    let info_rates = dev.info().rate_range.clone();
+    let rate = Sps(rate.0.clamp(info_rates.start().0, info_rates.end().0));
     dev.set_rate(rate)?;
     dev.set_center(center)?;
     dev.set_gain("tuner", GainMode::Auto)?;

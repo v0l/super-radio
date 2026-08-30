@@ -27,6 +27,7 @@ our own assumptions.
 | `audio` | cpal playback with a drift-tracking resampler |
 | `app` | egui front end: spectrum, waterfall, tuner, channels |
 | `rtlsdr-sys` | bindgen FFI to librtlsdr |
+| `hackrf` | HackRF One, adapting `rs-hackrf` to the `Device` trait |
 | `rtlsdr` | safe driver with an async streaming thread |
 | `hackrf` | pure-Rust USB driver (not started) |
 | `app` | egui front end (not started) |
@@ -180,3 +181,19 @@ To check the signal path without a display:
 ```
 cargo run --release -p app -- --probe 95.8
 ```
+
+## Reference implementations
+
+Decoders worth reading before writing our own, all MIT and all pure Rust:
+
+| crate | covers |
+|---|---|
+| `fmradio` | FM with RDS and adaptive resampling |
+| `dabradio` | DAB/DAB+, OFDM and AAC |
+| `voracious` | VOR / ILS / DME |
+| `jet1090` | ADS-B |
+| `ship162` | AIS |
+| `datalink` | VDL2 and ARINC 629 |
+
+They share the Desperado workspace with `rs-hackrf`, which this repo already
+depends on for HackRF USB support.
