@@ -76,6 +76,23 @@ impl Demod {
     }
 }
 
+/// Shortest gap between retunes.
+///
+/// A retune is a blocking USB control transfer costing about 25 ms on the
+/// RTL-SDR, and it stalls sample reading while it happens. At this spacing it
+/// takes roughly a fifth of the time and the spectrum keeps updating; issuing
+/// one per frame instead leaves nothing over to read with and the display
+/// freezes for as long as the drag lasts.
+const MIN_TUNE_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Overridable so the benchmark can measure what happens without the spacing.
+fn tune_gap() -> std::time::Duration {
+    match std::env::var("SR_TUNE_GAP_MS").ok().and_then(|v| v.parse().ok()) {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => MIN_TUNE_GAP,
+    }
+}
+
 pub enum Cmd {
     Center(Hz),
     Rate(Sps),
@@ -443,6 +460,9 @@ fn run(
     let mut cur_rate = dev.rate().as_f64();
     let mut cur_center = dev.center().as_f64();
     let mut retune = false;
+    let mut want_center: Option<Hz> = None;
+    let gap = tune_gap();
+    let mut last_tune = std::time::Instant::now() - gap;
 
     loop {
         for c in cmd.try_iter() {
@@ -451,14 +471,11 @@ fn run(
                     stream.stop();
                     return Ok(());
                 }
-                Cmd::Center(f) => {
-                    dev.set_center(f)?;
-                    cur_center = dev.center().as_f64();
-                    spec.reset();
-                    // The offset differs from tuning to tuning, so re-measure
-                    // rather than dragging the old one to the new frequency.
-                    dc = None;
-                }
+                // Held rather than applied. A drag issues one of these per
+                // displayed frame and only the last is worth anything, so
+                // applying each in turn spends the whole budget retuning to
+                // frequencies already superseded.
+                Cmd::Center(f) => want_center = Some(f),
                 Cmd::Rate(r) => {
                     dev.set_rate(r)?;
                     cur_rate = dev.rate().as_f64();
@@ -500,6 +517,25 @@ fn run(
             // The old station's name must not linger over the new one.
             status.clear_station();
             retune = false;
+        }
+
+        // Retuning costs about 25 ms on the RTL-SDR, more than a frame at
+        // 60 Hz, and it blocks the thread that reads samples. Spacing them out
+        // keeps the spectrum live while a drag is in progress; the last
+        // requested frequency is always reached because the pending one is
+        // held until it can be applied.
+        if let Some(f) = want_center {
+            if last_tune.elapsed() >= gap {
+                let _t = tracing::info_span!("set_center").entered();
+                dev.set_center(f)?;
+                cur_center = dev.center().as_f64();
+                spec.reset();
+                // The offset differs from tuning to tuning, so re-measure
+                // rather than dragging the old one to the new frequency.
+                dc = None;
+                want_center = None;
+                last_tune = std::time::Instant::now();
+            }
         }
 
         let read_span = tracing::info_span!("rf_read").entered();

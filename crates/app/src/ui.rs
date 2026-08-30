@@ -28,6 +28,9 @@ pub struct App {
     /// Centre the waterfall history currently corresponds to, so a retune can
     /// slide it instead of throwing it away.
     wf_center: f64,
+    /// Centre frequency of the spectrum currently held in `db`, which lags the
+    /// requested centre while a retune is pending.
+    db_center: f64,
     wf_pending: Vec<f32>,
     wf_last: Option<std::time::Instant>,
     rows_per_sec: f32,
@@ -119,6 +122,7 @@ impl Default for App {
             auto_scale: true,
             dial: Dial::new(),
             wf_center: 95_800_000.0,
+            db_center: 95_800_000.0,
             wf_pending: Vec::new(),
             wf_last: None,
             rows_per_sec: 20.0,
@@ -234,12 +238,17 @@ impl App {
             latest = Some(f);
         }
         if let Some(f) = latest {
-            self.center = f.center;
+            // The requested centre is not overwritten by the frame's. Retunes
+            // are spaced out because each blocks the radio thread, so frames
+            // arrive from the old frequency for a while after a drag moves the
+            // view. Adopting their centre would drag the view back under the
+            // pointer every time one landed.
+            self.db_center = f.center;
             self.rate = f.rate;
             if self.auto_scale {
                 self.rescale(&f.db);
             }
-            self.slide_waterfall(f.db.len());
+            self.slide_waterfall(f.center, f.db.len());
 
             // Hold the peak between rows rather than sampling one frame in N,
             // or a short burst lands between rows and is never drawn.
@@ -269,12 +278,14 @@ impl App {
     }
 
     /// Slide the waterfall to match a new centre frequency.
-    fn slide_waterfall(&mut self, bins: usize) {
+    fn slide_waterfall(&mut self, center: f64, bins: usize) {
         if bins == 0 {
             return;
         }
+        // Aligned to where the rows' data actually is, not to where the view
+        // has been moved to, or the history smears as the two drift apart.
         let hz_per_bin = self.rate / bins as f64;
-        let d = ((self.center - self.wf_center) / hz_per_bin).round();
+        let d = ((center - self.wf_center) / hz_per_bin).round();
         if d != 0.0 {
             self.wf.shift(d as i32);
             self.wf_center += d * hz_per_bin;
@@ -1213,6 +1224,28 @@ impl App {
         }
     }
 
+    /// Which bins of the held spectrum belong under screen column `c`.
+    ///
+    /// `None` where the column falls outside the data, which happens while a
+    /// retune is pending and the view has moved past what has been received.
+    fn column_bins(
+        &self,
+        plot: &Rect,
+        c: usize,
+        _cols: usize,
+        n: usize,
+    ) -> Option<(usize, usize)> {
+        let lo = self.db_center - self.rate / 2.0;
+        let bin = |f: f64| ((f - lo) / self.rate * n as f64).floor();
+        let a = bin(self.hz_at(plot, plot.left() + c as f32));
+        let b = bin(self.hz_at(plot, plot.left() + c as f32 + 1.0));
+        if a < 0.0 || a >= n as f64 {
+            return None;
+        }
+        let a = a as usize;
+        Some((a, (b.clamp(0.0, n as f64) as usize).max(a + 1).min(n)))
+    }
+
     fn trace(&self, p: &egui::Painter, plot: &Rect) {
         if self.db.is_empty() {
             return;
@@ -1220,14 +1253,21 @@ impl App {
         let span = (self.ceil - self.floor).max(1.0);
         let n = self.db.len();
         let cols = plot.width().max(1.0) as usize;
+        // Columns are placed by frequency rather than by bin index. While a
+        // retune is pending the held spectrum belongs to a different centre,
+        // and drawing it stretched across the pane would put every signal at
+        // the wrong frequency. Positioning it by its own centre slides it under
+        // the drag instead, which is where its data really is.
         let mut pts = Vec::with_capacity(cols);
         for c in 0..cols {
-            let a = c * n / cols;
-            let b = ((c + 1) * n / cols).max(a + 1).min(n);
+            let Some((a, b)) = self.column_bins(plot, c, cols, n) else { continue };
             // Max, not mean: averaging hides the narrow carriers that matter.
             let v = self.db[a..b].iter().copied().fold(f32::MIN, f32::max);
             let t = ((v - self.floor) / span).clamp(0.0, 1.0);
             pts.push(Pos2::new(plot.left() + c as f32, plot.bottom() - t * plot.height()));
+        }
+        if pts.len() < 2 {
+            return;
         }
         // Fill under the trace so occupied spectrum reads as mass. Built as a
         // quad strip: a spectrum outline is wildly concave, and asking for a
@@ -1466,6 +1506,46 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
         let a = with_channels(&[95_000_000.0]);
         assert_eq!(a.channel_at(&rect, a.x_of(&rect, 94_500_000.0)), None);
+    }
+
+    #[test]
+    fn the_trace_covers_the_whole_pane_when_nothing_is_pending() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        let mut a = app();
+        a.center = 95_000_000.0;
+        a.db_center = 95_000_000.0;
+        a.rate = 2_400_000.0;
+        assert_eq!(a.column_bins(&rect, 0, 1000, 2048).map(|x| x.0), Some(0));
+        assert_eq!(a.column_bins(&rect, 999, 1000, 2048).map(|x| x.0), Some(2045));
+    }
+
+    #[test]
+    fn a_pending_retune_slides_the_trace_instead_of_stretching_it() {
+        // The held spectrum belongs to the old centre. Drawing it across the
+        // whole pane would put every signal at the wrong frequency; it has to
+        // move with the drag, because that is where its data is.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        let mut a = app();
+        a.rate = 2_400_000.0;
+        a.db_center = 95_000_000.0;
+        // View dragged a quarter span right, data not yet caught up.
+        a.center = 95_600_000.0;
+        // A quarter of a 2.4 MHz span is 512 bins of 2048, so the left of the
+        // pane now shows what was a quarter of the way in.
+        assert_eq!(a.column_bins(&rect, 0, 1000, 2048).map(|x| x.0), Some(512));
+        // And the right quarter has no data at all yet.
+        assert_eq!(a.column_bins(&rect, 900, 1000, 2048), None);
+    }
+
+    #[test]
+    fn dragging_the_other_way_leaves_the_left_empty() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+        let mut a = app();
+        a.rate = 2_400_000.0;
+        a.db_center = 95_000_000.0;
+        a.center = 94_400_000.0;
+        assert_eq!(a.column_bins(&rect, 0, 1000, 2048), None);
+        assert_eq!(a.column_bins(&rect, 999, 1000, 2048).map(|x| x.0), Some(1533));
     }
 
     #[test]
