@@ -23,6 +23,9 @@ use crate::fir::{lowpass, FirDecimReal};
 use std::f64::consts::TAU;
 
 const PILOT_HZ: f64 = 19_000.0;
+/// Stereo blend glide time. Long enough that a brief dropout does not audibly
+/// pump, short enough to follow a real change in reception.
+const BLEND_TAU_S: f64 = 0.1;
 /// Audio bandwidth of each channel.
 const AUDIO_HZ: f64 = 15_000.0;
 
@@ -38,6 +41,14 @@ pub struct StereoDecoder {
     ki: f64,
     /// Low-passed in-phase pilot amplitude, the lock indicator.
     lock_lp: f64,
+    /// Current stereo blend, 0 for mono and 1 for full separation. Smoothed
+    /// per block so a signal hovering at the threshold does not pump.
+    blend: f32,
+    blend_lo: f32,
+    blend_hi: f32,
+    /// Per-sample smoothing coefficient, so the glide takes the same wall time
+    /// regardless of how the caller happens to block up its input.
+    blend_alpha: f32,
     /// Low-passed input magnitude, to normalise the lock indicator.
     level_lp: f64,
     sum_lp: FirDecimReal,
@@ -69,6 +80,12 @@ impl StereoDecoder {
             kp: 0.15,
             ki: 0.0005,
             lock_lp: 0.0,
+            blend: 0.0,
+            // Below the first the pilot is too weak to trust, above the second
+            // it is solid. Between them separation is scaled continuously.
+            blend_lo: 0.20,
+            blend_hi: 0.55,
+            blend_alpha: (1.0 - (-1.0 / (BLEND_TAU_S * rate)).exp()) as f32,
             level_lp: 0.0,
             sum_lp: FirDecimReal::new(taps.clone(), 1),
             diff_lp: FirDecimReal::new(taps, 1),
@@ -104,9 +121,26 @@ impl StereoDecoder {
         self.freq = PILOT_HZ;
         self.err_lp = 0.0;
         self.lock_lp = 0.0;
+        self.blend = 0.0;
         self.level_lp = 0.0;
         self.sum_lp.reset();
         self.diff_lp.reset();
+    }
+
+    /// How much separation is currently being applied, 0 mono to 1 full.
+    ///
+    /// A hard mono/stereo switch pumps audibly when the signal sits near the
+    /// threshold, so this glides instead, in the same spirit as the high
+    /// blend. Mono is just the endpoint, not a different output format: the
+    /// channel count never changes.
+    pub fn blend(&self) -> f32 {
+        self.blend
+    }
+
+    /// Pilot confidence range over which separation is scaled in.
+    pub fn set_blend_range(&mut self, lo: f32, hi: f32) {
+        self.blend_lo = lo;
+        self.blend_hi = hi.max(lo + 1e-3);
     }
 
     /// Decode one block of multiplex into left and right.
@@ -156,11 +190,19 @@ impl StereoDecoder {
         self.sum_lp.process(mpx, &mut self.sum);
         self.diff_lp.process(&self.mixed, &mut self.diff);
 
+        // Smoothstep so the ends of the range are flat and the transition has
+        // no corner for the ear to catch.
+        let t = ((self.lock() - self.blend_lo) / (self.blend_hi - self.blend_lo)).clamp(0.0, 1.0);
+        let target = t * t * (3.0 - 2.0 * t);
+        let alpha = self.blend_alpha;
+
         left.clear();
         right.clear();
         left.reserve(self.sum.len());
         right.reserve(self.sum.len());
         for (s, d) in self.sum.iter().zip(&self.diff) {
+            self.blend += alpha * (target - self.blend);
+            let d = d * self.blend;
             left.push(s + d);
             right.push(s - d);
         }
@@ -304,6 +346,50 @@ mod tests {
         for (i, (a, b)) in one.iter().zip(&split).enumerate().skip(1000) {
             assert!((a - b).abs() < 1e-3, "sample {i} differs: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn a_weak_pilot_blends_down_to_mono() {
+        // A pilot too weak to trust must collapse separation rather than
+        // decode noise into the difference channel.
+        let n = 300_000;
+        let l_in = tone(n, 1000.0, 0.4, 0.0);
+        let mpx = multiplex(&l_in, &vec![0.0; n], 0.002);
+        let mut d = StereoDecoder::new(RATE);
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        d.process(&mpx, &mut l, &mut r);
+        assert!(d.blend() < 0.2, "held stereo on a weak pilot: blend {:.2}", d.blend());
+        let sep = 20.0 * (rms(settled(&l)) / rms(settled(&r)).max(1e-12)).log10();
+        assert!(sep < 6.0, "still separating at {sep:.1} dB with no usable pilot");
+    }
+
+    #[test]
+    fn a_strong_pilot_reaches_full_separation() {
+        let n = 300_000;
+        let mpx = multiplex(&tone(n, 1000.0, 0.4, 0.0), &vec![0.0; n], 0.1);
+        let mut d = StereoDecoder::new(RATE);
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        d.process(&mpx, &mut l, &mut r);
+        assert!(d.blend() > 0.99, "blend only reached {:.3}", d.blend());
+    }
+
+    #[test]
+    fn the_blend_glide_does_not_depend_on_block_size() {
+        // Smoothing per block rather than per sample makes the glide time a
+        // function of how the caller chunks its input, which is a bug that
+        // only shows up once the graph feeds a different block size.
+        let n = 200_000;
+        let mpx = multiplex(&tone(n, 1000.0, 0.4, 0.0), &vec![0.0; n], 0.1);
+        let run = |chunk: usize| {
+            let mut d = StereoDecoder::new(RATE);
+            let (mut l, mut r) = (Vec::new(), Vec::new());
+            for c in mpx.chunks(chunk) {
+                d.process(c, &mut l, &mut r);
+            }
+            d.blend()
+        };
+        let (a, b) = (run(1024), run(65536));
+        assert!((a - b).abs() < 1e-3, "blend {a:.4} at 1024 but {b:.4} at 65536");
     }
 
     #[test]

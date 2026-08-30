@@ -31,11 +31,33 @@ pub enum Event {
     Warning { stage: String, message: String },
 }
 
+/// Media types for [`Decoded::media_type`].
+///
+/// These describe what `payload` holds, which is a separate question from
+/// [`crate::port::PortKind`]: that one picks the buffer layout a port carries,
+/// while these say what a finished frame's bytes mean. A JPEG from SSTV and a
+/// JSON object from RDS are both `Vec<u8>` and only differ here.
+pub mod media {
+    /// Undecoded bytes: packed bits, a raw frame.
+    pub const BYTES: &str = "application/octet-stream";
+    /// A JSON object, for structured decodes with named fields.
+    pub const JSON: &str = "application/json";
+    /// Plain text, for protocols that are text: RDS radiotext, pager messages.
+    pub const TEXT: &str = "text/plain";
+    pub const JPEG: &str = "image/jpeg";
+    pub const PNG: &str = "image/png";
+}
+
 /// A successfully decoded frame from some protocol.
 #[derive(Clone, Debug)]
 pub struct Decoded {
     /// Protocol identifier: "pocsag", "ais", "adsb", "rds".
     pub protocol: &'static str,
+    /// What `payload` actually is, as a media type. A consumer routing output
+    /// to a file or a UI panel needs this: "the bytes of an SSTV frame" and
+    /// "the bytes of a weather station reading" want completely different
+    /// handling, and the protocol name alone does not scale to deciding that.
+    pub media_type: &'static str,
     /// Where it came from, for the log and for correlating across channels.
     pub center: Hz,
     /// Seconds since stream start.
@@ -48,4 +70,100 @@ pub struct Decoded {
     /// which matters: an unchecked decode should never be presented with the
     /// same confidence as a CRC-verified one.
     pub crc_ok: Option<bool>,
+}
+
+impl Decoded {
+    /// A frame of raw bytes, which is what most bit-level protocols produce.
+    pub fn bytes(protocol: &'static str, center: Hz, at: f64, payload: Vec<u8>) -> Self {
+        Self {
+            protocol,
+            media_type: media::BYTES,
+            center,
+            at,
+            payload,
+            text: None,
+            crc_ok: None,
+        }
+    }
+
+    pub fn with_media(mut self, media_type: &'static str) -> Self {
+        self.media_type = media_type;
+        self
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = Some(text.into());
+        self
+    }
+
+    pub fn with_crc(mut self, ok: Option<bool>) -> Self {
+        self.crc_ok = ok;
+        self
+    }
+
+    /// Whether the payload is an image, so a consumer can decide to render it
+    /// rather than print it.
+    pub fn is_image(&self) -> bool {
+        self.media_type.starts_with("image/")
+    }
+
+    /// Match against a media type that may use a `*` subtype, as in `image/*`.
+    pub fn matches_media(&self, pattern: &str) -> bool {
+        if pattern == "*/*" {
+            return true;
+        }
+        // Parameters like ";charset=utf-8" do not affect the match.
+        let mine = self.media_type.split(';').next().unwrap_or("").trim();
+        match pattern.split_once("/*") {
+            Some((prefix, "")) => mine.starts_with(prefix) && mine[prefix.len()..].starts_with('/'),
+            _ => mine == pattern,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(media: &'static str) -> Decoded {
+        Decoded::bytes("test", Hz::hz(1), 0.0, vec![1, 2, 3]).with_media(media)
+    }
+
+    #[test]
+    fn a_plain_frame_defaults_to_opaque_bytes() {
+        let f = Decoded::bytes("fineoffset", Hz::hz(433_920_000), 0.0, vec![0xAB]);
+        assert_eq!(f.media_type, media::BYTES);
+        assert!(!f.is_image());
+    }
+
+    #[test]
+    fn images_are_recognised_by_family_not_by_protocol() {
+        assert!(d(media::JPEG).is_image());
+        assert!(d(media::PNG).is_image());
+        assert!(!d(media::JSON).is_image());
+    }
+
+    #[test]
+    fn wildcard_patterns_match_a_family() {
+        let jpeg = d(media::JPEG);
+        assert!(jpeg.matches_media("image/*"));
+        assert!(jpeg.matches_media("*/*"));
+        assert!(jpeg.matches_media("image/jpeg"));
+        assert!(!jpeg.matches_media("image/png"));
+        assert!(!jpeg.matches_media("audio/*"));
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_a_family_boundary_does_not_match() {
+        // "image/*" must not match "imagery/x", which a naive starts_with does.
+        let odd = d("imagery/x");
+        assert!(!odd.matches_media("image/*"));
+    }
+
+    #[test]
+    fn parameters_do_not_break_matching() {
+        let t = d("text/plain;charset=utf-8");
+        assert!(t.matches_media("text/plain"));
+        assert!(t.matches_media("text/*"));
+    }
 }

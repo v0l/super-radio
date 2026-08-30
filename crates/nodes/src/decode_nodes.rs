@@ -175,14 +175,16 @@ impl Simple for ProtocolDecodeNode {
                     Ok(report) => {
                         matched = true;
                         out.extend_from_slice(&report.raw);
-                        c.emit(Event::Decoded(Decoded {
-                            protocol: report.model,
-                            center: c.inputs[0].spec.center,
-                            at: pkg.start_sample as f64,
-                            payload: report.raw.clone(),
-                            text: Some(report.to_string()),
-                            crc_ok: report.crc_valid,
-                        }));
+                        c.emit(Event::Decoded(
+                            Decoded::bytes(
+                                report.model,
+                                c.inputs[0].spec.center,
+                                pkg.start_sample as f64,
+                                report.raw.clone(),
+                            )
+                            .with_text(report.to_string())
+                            .with_crc(report.crc_valid),
+                        ));
                         if !self.report_all {
                             break;
                         }
