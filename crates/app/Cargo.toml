@@ -9,3 +9,14 @@ name = "super-radio"
 path = "src/main.rs"
 
 [dependencies]
+eframe = "0.35"
+egui = "0.35"
+
+common.workspace = true
+dsp.workspace = true
+audio.workspace = true
+rtlsdr.workspace = true
+sources.workspace = true
+crossbeam-channel.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
