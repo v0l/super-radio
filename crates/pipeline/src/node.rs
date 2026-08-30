@@ -66,8 +66,16 @@ impl<'a> NodeCtx<'a> {
 /// accumulate (a framer waiting for a full packet) it buffers internally and
 /// emits nothing that call. This removes the single largest class of bugs in
 /// GNU Radio block authoring at the cost of each node owning a little state.
-pub trait Node: Send {
+pub trait Node: Send + 'static {
     fn name(&self) -> &str;
+
+    /// Downcast hook, so a host can read state a node exposes beyond its
+    /// ports: an RDS decoder's station, a PLL's lock. Returns `None` unless a
+    /// node opts in, which keeps the trait usable for nodes that have nothing
+    /// extra to say.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 
     fn num_inputs(&self) -> usize {
         1
@@ -136,7 +144,7 @@ pub trait Simple: Send {
     }
 }
 
-impl<T: Simple> Node for T {
+impl<T: Simple + 'static> Node for T {
     fn name(&self) -> &str {
         Simple::name(self)
     }

@@ -192,18 +192,40 @@ pub struct StreamSpec {
     /// Occupied bandwidth, which may be narrower than `rate`. Detectors and
     /// squelch use this rather than assuming the full Nyquist span is signal.
     pub bandwidth: f64,
+    /// Interleaved channels in the stream.
+    ///
+    /// `rate` counts samples, so a two channel stream at 48 kHz per ear has a
+    /// rate of 96000 and a `frame_rate` of 48000. Carrying the count instead of
+    /// leaving it implicit is what lets a filter keep separate state per
+    /// channel: running one filter over interleaved samples feeds each channel
+    /// the other's history, which is a lowpass at half the intended cutoff and
+    /// crosstalk besides.
+    pub channels: usize,
 }
 
 impl StreamSpec {
     pub fn iq(rate: f64, center: Hz) -> Self {
-        Self { kind: PortKind::Iq, rate, center, bandwidth: rate }
+        Self { kind: PortKind::Iq, rate, center, bandwidth: rate, channels: 1 }
+    }
+
+    /// Interleave `n` channels, which multiplies the sample rate by `n`.
+    pub fn with_channels(self, n: usize) -> Self {
+        let n = n.max(1);
+        Self { rate: self.frame_rate() * n as f64, channels: n, ..self }
+    }
+
+    /// Frames per second, which is the rate a listener hears.
+    pub fn frame_rate(&self) -> f64 {
+        self.rate / self.channels.max(1) as f64
     }
 
     pub fn with_kind(self, kind: PortKind) -> Self {
         Self { kind, ..self }
     }
 
+    /// Set the per-channel rate, keeping the channel count.
     pub fn with_rate(self, rate: f64) -> Self {
+        let rate = rate * self.channels.max(1) as f64;
         Self { rate, bandwidth: self.bandwidth.min(rate), ..self }
     }
 }
