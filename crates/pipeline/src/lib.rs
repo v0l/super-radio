@@ -24,5 +24,6 @@ pub use event::{Decoded, Event};
 pub use graph::{chain, Graph, GraphBuilder, In, NodeId, Out, GRAPH_INPUT};
 pub use node::{Node, NodeCtx, PortSpec, Simple};
 pub use param::{Param, ParamRange, ParamValue};
+pub use registry::Registry as NodeRegistry;
 pub use port::{Payload, PortKind, StreamSpec, Tag, TagValue};
 pub use registry::{Registry, Settings, SettingsExt, StageDesc};

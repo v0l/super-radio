@@ -17,4 +17,4 @@ pub use demod::{AmDemod, Deemphasis, FmDemod};
 pub use detect::{Burst, Detector, DetectorConfig, NoiseFloor};
 pub use fir::{Fir, FirDecim};
 pub use mixer::Mixer;
-pub use pulse::{OokDetector, Package, Pulse, PulseConfig};
+pub use pulse::{OokDetector, Package, Pulse, PulseConfig, PulseStats};

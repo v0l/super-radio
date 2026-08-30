@@ -139,6 +139,22 @@ impl FirDecim {
         self.factor
     }
 
+    pub fn taps(&self) -> usize {
+        self.taps.len()
+    }
+
+    /// Group delay in *output* samples. A symmetric FIR delays by half its
+    /// length, and the graph needs this to align the branches of a fan-in.
+    pub fn latency(&self) -> usize {
+        self.taps.len() / 2 / self.factor
+    }
+
+    pub fn reset(&mut self) {
+        self.hist.fill(C32::new(0.0, 0.0));
+        self.pos = 0;
+        self.phase = 0;
+    }
+
     pub fn process(&mut self, input: &[C32], out: &mut Vec<C32>) {
         let n = self.taps.len();
         out.reserve(input.len() / self.factor + 1);

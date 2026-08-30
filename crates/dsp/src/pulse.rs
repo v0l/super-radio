@@ -19,68 +19,7 @@
 //! signals ranging from a meter away to the edge of sensitivity, and the AGC
 //! moves the floor underneath everything.
 
-/// One mark/gap pair, in microseconds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pulse {
-    /// Carrier present, in microseconds.
-    pub mark: u32,
-    /// Carrier absent, in microseconds. The final gap of a package is the
-    /// timeout that ended it, and carries no information.
-    pub gap: u32,
-}
-
-/// A complete burst: the pulses between two long silences.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Package {
-    pub pulses: Vec<Pulse>,
-    /// Estimated SNR of the burst, in dB.
-    pub snr_db: f32,
-    /// Sample index where the burst started, for correlating with a waterfall.
-    pub start_sample: u64,
-}
-
-impl Package {
-    pub fn len(&self) -> usize {
-        self.pulses.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.pulses.is_empty()
-    }
-    /// Total on-air duration in microseconds, excluding the trailing timeout.
-    pub fn duration_us(&self) -> u64 {
-        self.pulses.iter().map(|p| p.mark as u64 + p.gap as u64).sum::<u64>()
-            - self.pulses.last().map(|p| p.gap as u64).unwrap_or(0)
-    }
-
-    /// Histogram of mark widths, bucketed to `tol_us`. Reading this is how you
-    /// identify an unknown protocol by hand: a PWM signal shows two clear
-    /// clusters, a PPM signal shows one.
-    pub fn mark_histogram(&self, tol_us: u32) -> Vec<(u32, usize)> {
-        histogram(self.pulses.iter().map(|p| p.mark), tol_us)
-    }
-
-    pub fn gap_histogram(&self, tol_us: u32) -> Vec<(u32, usize)> {
-        // The trailing gap is a timeout, not signal, so leave it out.
-        let n = self.pulses.len().saturating_sub(1);
-        histogram(self.pulses[..n].iter().map(|p| p.gap), tol_us)
-    }
-}
-
-fn histogram(vals: impl Iterator<Item = u32>, tol_us: u32) -> Vec<(u32, usize)> {
-    let mut buckets: Vec<(u32, usize, u64)> = Vec::new();
-    for v in vals {
-        match buckets.iter_mut().find(|(c, _, _)| v.abs_diff(*c) <= tol_us) {
-            Some((c, n, sum)) => {
-                *n += 1;
-                *sum += v as u64;
-                *c = (*sum / *n as u64) as u32;
-            }
-            None => buckets.push((v, 1, v as u64)),
-        }
-    }
-    buckets.sort_by_key(|(c, _, _)| *c);
-    buckets.into_iter().map(|(c, n, _)| (c, n)).collect()
-}
+pub use common::pulse::{Package, Pulse};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PulseConfig {
@@ -144,6 +83,34 @@ pub struct OokDetector {
     gap_accum: u32,
     sample: u64,
     seeded: bool,
+    stats: PulseStats,
+}
+
+/// Why bursts were discarded.
+///
+/// A detector that silently drops everything is indistinguishable from a dead
+/// antenna. These counters are what turn "nothing decoded" into "14 bursts
+/// seen, all too short", which points straight at the parameter to change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PulseStats {
+    /// Bursts that ended with fewer than `min_pulses` pulses.
+    pub rejected_too_few_pulses: u64,
+    /// Bursts rejected because the signal never rose far enough above noise.
+    pub rejected_low_snr: u64,
+    /// Marks discarded for being shorter than `min_mark_us`.
+    pub rejected_short_marks: u64,
+    /// Bursts emitted.
+    pub accepted: u64,
+}
+
+impl PulseStats {
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_too_few_pulses + self.rejected_low_snr
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl OokDetector {
@@ -164,7 +131,17 @@ impl OokDetector {
             gap_accum: 0,
             sample: 0,
             seeded: false,
+            stats: PulseStats::default(),
         }
+    }
+
+    /// Rejection counters since the last call, then clear.
+    pub fn take_stats(&mut self) -> PulseStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    pub fn stats(&self) -> PulseStats {
+        self.stats
     }
 
     pub fn rate(&self) -> f64 {
@@ -256,6 +233,7 @@ impl OokDetector {
                         // into two shorter ones and corrupt every timing that
                         // follows, which is far worse than the noise itself.
                         self.gap_accum += dur;
+                        self.stats.rejected_short_marks += 1;
                     }
                 } else {
                     self.gap_accum += dur;
@@ -282,7 +260,12 @@ impl OokDetector {
                         let mut p = std::mem::take(&mut self.current);
                         p.snr_db = snr;
                         out.push(p);
+                        self.stats.accepted += 1;
+                    } else {
+                        self.stats.rejected_low_snr += 1;
                     }
+                } else if !self.current.pulses.is_empty() {
+                    self.stats.rejected_too_few_pulses += 1;
                 }
                 self.current.pulses.clear();
                 self.run = 0;

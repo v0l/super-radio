@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/dsp",
+    "crates/nodes",
     "crates/pipeline",
     "crates/hackrf",
     "crates/rtlsdr-sys",
@@ -24,6 +25,7 @@ license = "MIT OR Apache-2.0"
 common = { path = "crates/common" }
 dsp = { path = "crates/dsp" }
 pipeline = { path = "crates/pipeline" }
+nodes = { path = "crates/nodes" }
 hackrf = { path = "crates/hackrf" }
 rtlsdr = { path = "crates/rtlsdr" }
 rtlsdr-sys = { path = "crates/rtlsdr-sys" }

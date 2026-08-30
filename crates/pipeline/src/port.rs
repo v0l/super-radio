@@ -1,6 +1,6 @@
 //! What flows between stages, and how a stage advertises its rate.
 
-use common::{Hz, C32};
+use common::{Hz, Package, C32};
 
 /// The data type carried on a port. Checked when a chain is built so a
 /// mis-ordered chain fails at construction rather than producing silence.
@@ -14,6 +14,13 @@ pub enum PortKind {
     Soft,
     /// Hard bytes: packed bits, framed packets, decoded payloads.
     Bytes,
+    /// Complete bursts as mark/gap timings.
+    ///
+    /// A first-class port type because it is the junction the whole decoder
+    /// architecture pivots on: everything upstream is expensive per-sample
+    /// DSP, everything downstream is cheap integer parsing, and every OOK or
+    /// two-level FSK protocol meets here.
+    Pulses,
 }
 
 /// A reusable buffer. Stages write into the caller's buffer rather than
@@ -24,6 +31,7 @@ pub enum Payload {
     Real(Vec<f32>),
     Soft(Vec<f32>),
     Bytes(Vec<u8>),
+    Pulses(Vec<Package>),
 }
 
 impl Payload {
@@ -33,6 +41,7 @@ impl Payload {
             PortKind::Real => Payload::Real(Vec::new()),
             PortKind::Soft => Payload::Soft(Vec::new()),
             PortKind::Bytes => Payload::Bytes(Vec::new()),
+            PortKind::Pulses => Payload::Pulses(Vec::new()),
         }
     }
 
@@ -42,6 +51,7 @@ impl Payload {
             Payload::Real(_) => PortKind::Real,
             Payload::Soft(_) => PortKind::Soft,
             Payload::Bytes(_) => PortKind::Bytes,
+            Payload::Pulses(_) => PortKind::Pulses,
         }
     }
 
@@ -50,6 +60,7 @@ impl Payload {
             Payload::Iq(v) => v.len(),
             Payload::Real(v) | Payload::Soft(v) => v.len(),
             Payload::Bytes(v) => v.len(),
+            Payload::Pulses(v) => v.len(),
         }
     }
 
@@ -63,6 +74,7 @@ impl Payload {
             Payload::Iq(v) => v.clear(),
             Payload::Real(v) | Payload::Soft(v) => v.clear(),
             Payload::Bytes(v) => v.clear(),
+            Payload::Pulses(v) => v.clear(),
         }
     }
 
@@ -84,6 +96,20 @@ impl Payload {
         match self {
             Payload::Bytes(v) => Some(v),
             _ => None,
+        }
+    }
+
+    pub fn as_pulses(&self) -> Option<&[Package]> {
+        match self {
+            Payload::Pulses(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn pulses_mut(&mut self) -> &mut Vec<Package> {
+        match self {
+            Payload::Pulses(v) => v,
+            _ => panic!("payload is {:?}, not Pulses", self.kind()),
         }
     }
 

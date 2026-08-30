@@ -78,6 +78,7 @@ pub struct FileSource {
     center: Hz,
     rate: Sps,
     format: SampleFormat,
+    #[allow(dead_code)]
     block: usize,
     /// Loop back to the start on EOF, for driving a UI indefinitely.
     repeat: bool,
@@ -249,6 +250,7 @@ struct FileStream {
     format: SampleFormat,
     center: Hz,
     rate: Sps,
+    #[allow(dead_code)]
     block: usize,
     repeat: bool,
     realtime: bool,

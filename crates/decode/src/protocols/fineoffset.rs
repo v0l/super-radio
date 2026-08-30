@@ -23,7 +23,7 @@
 //! - `CC` CRC-8, polynomial 0x31, init 0xff, over all 11 bytes
 
 use crate::bits::{crc8, BitBuffer};
-use crate::protocol::{DecodeError, Protocol, Report, Value};
+use crate::protocol::{DecodeError, Protocol, Report};
 use crate::slicer::Timing;
 
 /// Wind direction index to degrees, 22.5 degree steps starting at north.
@@ -128,6 +128,7 @@ fn round2(v: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Value;
 
     /// Build a valid weather frame with a correct CRC.
     fn frame(

@@ -22,6 +22,7 @@ our own assumptions.
 | `dsp` | polyphase channelizer, FIR design, mixer, FM/AM demod, burst detector, OOK pulse extraction |
 | `pipeline` | the flow graph: typed DAG, rate negotiation, stream tags, events |
 | `decode` | bit buffers, pulse slicers, protocol registry, device decoders |
+| `nodes` | DSP and decoders as graph nodes, plus the registry that builds them by name |
 | `sources` | file replay with rtl_433-style filename metadata |
 | `rtlsdr-sys` | bindgen FFI to librtlsdr |
 | `rtlsdr` | safe driver with an async streaming thread |
@@ -38,6 +39,12 @@ spreads independent per-channel graphs across the pool. This is the opposite of
 GNU Radio's thread-per-block, and it is deliberate: at 512 channels of five
 nodes, thread-per-block means 2560 threads on 48 cores and the scheduler costs
 more than the DSP.
+
+**Chains are data, not code.** Nodes are registered by name with
+introspectable parameters, so an ambiguous signal is attacked by
+reconfiguring the chain rather than recompiling. A mistuned chain reports what
+it discarded and which parameter to change, because silence is the worst
+possible output for a tool meant to identify unknown signals.
 
 **A shared pulse front end, following rtl_433.** Almost every ISM device is OOK
 or two-level FSK, and both reduce to mark/gap timings. The DSP runs once per
@@ -74,6 +81,11 @@ cargo run --release -p rtlsdr --example ism -- 433.92 30
 
 # Same, from a recorded capture
 cargo run --release -p sources --example pulses -- testdata/fineoffset_wh1080_433.92M_250k.cu8
+
+# Build a decode chain at runtime; no argument lists the available nodes
+cargo run --release -p nodes --example chain -- \
+  testdata/fineoffset_wh1080_433.92M_250k.cu8 \
+  'envelope | pulse_detect:reset_us=10000,min_pulses=20 | protocol_decode'
 
 # WFM receiver; verifies itself by finding the 19 kHz stereo pilot
 cargo run --release -p rtlsdr --example wfm
