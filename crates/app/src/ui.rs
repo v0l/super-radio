@@ -1,10 +1,13 @@
-//! Spectrum + waterfall pane with click-to-tune, and the control panels.
+//! Instrument front panel: readout, spectrum, waterfall, channel strips.
 
+use crate::bands;
+use crate::dial::Dial;
 use crate::radio::{Cmd, Demod, Frame, Radio};
+use crate::theme::{self, legend, readout, value};
 use crate::waterfall::Waterfall;
 use common::{GainMode, Hz, Sps};
 use egui::containers::{CentralPanel, Panel};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 pub struct App {
     radio: Option<Radio>,
@@ -13,36 +16,37 @@ pub struct App {
     center: f64,
     rate: f64,
     gain: GainMode,
-    ppm: f64,
 
-    /// Latest spectrum, held so the plot still draws between radio updates.
     db: Vec<f32>,
     wf: Waterfall,
     floor: f32,
     ceil: f32,
     auto_scale: bool,
 
+    dial: Dial,
     channels: Vec<Channel>,
     listening: Option<usize>,
     volume: f32,
     next_id: u32,
-
     fft: usize,
+    /// Save a PNG to this path once the radio has settled, then quit.
+    pub shot: Option<String>,
+    shot_at: Option<std::time::Instant>,
+    shot_sent: bool,
 }
 
 pub struct Channel {
-    /// Absolute frequency, so it survives retuning the radio.
     freq: f64,
     demod: Demod,
     label: String,
 }
 
-const SPAN_PRESETS: [(&str, f64); 5] = [
-    ("0.25 MS/s", 250_000.0),
-    ("1.024 MS/s", 1_024_000.0),
-    ("2.048 MS/s", 2_048_000.0),
-    ("2.304 MS/s", 2_304_000.0),
-    ("2.4 MS/s", 2_400_000.0),
+const SPANS: [(&str, f64); 5] = [
+    ("250k", 250_000.0),
+    ("1.024M", 1_024_000.0),
+    ("2.048M", 2_048_000.0),
+    ("2.304M", 2_304_000.0),
+    ("2.4M", 2_400_000.0),
 ];
 
 impl Default for App {
@@ -53,24 +57,27 @@ impl Default for App {
             center: 95_800_000.0,
             rate: 2_304_000.0,
             gain: GainMode::Auto,
-            ppm: 0.0,
             db: Vec::new(),
             wf: Waterfall::new(512),
             floor: -90.0,
             ceil: -20.0,
             auto_scale: true,
+            dial: Dial::new(),
             channels: Vec::new(),
             listening: None,
             volume: 0.5,
             next_id: 1,
             fft: 2048,
+            shot: None,
+            shot_at: None,
+            shot_sent: false,
         }
     }
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        theme::install(&cc.egui_ctx);
         let mut app = Self::default();
         app.connect(&cc.egui_ctx);
         app
@@ -78,14 +85,13 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let c = ctx.clone();
-        let radio = Radio::start(
+        self.radio = Some(Radio::start(
             0,
             Hz(self.center as u64),
             Sps(self.rate as u64),
             self.fft,
             move || c.request_repaint(),
-        );
-        self.radio = Some(radio);
+        ));
         self.wf.clear();
     }
 
@@ -110,13 +116,16 @@ impl App {
             if self.auto_scale {
                 self.rescale(&f.db);
             }
-            self.wf.push(&f.db, self.floor, self.ceil);
+            // The waterfall tops out a little below the trace's ceiling. The
+            // plot wants headroom so peaks are not clipped flat; the colour
+            // ramp wants the opposite, or its hottest colours are never used.
+            self.wf.push(&f.db, self.floor, self.ceil - 5.0);
             self.db = f.db;
         }
     }
 
-    /// Track the noise floor rather than the extremes: a single strong carrier
-    /// would otherwise flatten the whole display.
+    /// Track percentiles, not extremes: one strong carrier would otherwise
+    /// flatten everything else in the span.
     fn rescale(&mut self, db: &[f32]) {
         let mut v: Vec<f32> = db.iter().copied().filter(|x| x.is_finite()).collect();
         if v.is_empty() {
@@ -124,8 +133,7 @@ impl App {
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let pct = |p: f32| v[((v.len() - 1) as f32 * p) as usize];
-        let (lo, hi) = (pct(0.10) - 6.0, pct(0.999) + 10.0);
-        // Glide, or the picture flickers on every burst.
+        let (lo, hi) = (pct(0.10) - 6.0, pct(0.999) + 3.0);
         self.floor += (lo - self.floor) * 0.05;
         self.ceil += (hi.max(lo + 20.0) - self.ceil) * 0.05;
     }
@@ -140,11 +148,21 @@ impl App {
         rect.left() + (t as f32) * rect.width()
     }
 
+    fn retune(&mut self, hz: f64) {
+        self.center = hz.clamp(24e6, 1766e6);
+        self.send(Cmd::Center(Hz(self.center as u64)));
+        self.wf.clear();
+        self.retune_listener();
+    }
+
     fn add_channel(&mut self, freq: f64) {
-        let demod = default_demod(freq);
         let id = self.next_id;
         self.next_id += 1;
-        self.channels.push(Channel { freq, demod, label: format!("CH{id}") });
+        self.channels.push(Channel {
+            freq,
+            demod: bands::demod_at(freq),
+            label: format!("CH{id}"),
+        });
         self.listen(self.channels.len() - 1);
     }
 
@@ -168,18 +186,6 @@ impl App {
     }
 }
 
-/// Guess a sensible mode from the band, so a click just works.
-fn default_demod(hz: f64) -> Demod {
-    let mhz = hz / 1e6;
-    if (87.5..108.0).contains(&mhz) {
-        Demod::Wfm
-    } else if (108.0..137.0).contains(&mhz) {
-        Demod::Am
-    } else {
-        Demod::Nfm
-    }
-}
-
 fn fmt_hz(hz: f64) -> String {
     if hz.abs() >= 1e6 {
         format!("{:.4} MHz", hz / 1e6)
@@ -193,217 +199,301 @@ fn fmt_hz(hz: f64) -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         self.drain();
-        self.top_bar(ui);
-        self.side_panel(ui);
-        CentralPanel::default().show(ui, |ui| self.spectrum(ui));
+        self.screenshot(ui.ctx());
+        self.head(ui);
+        self.strip(ui);
+        CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(theme::CHASSIS))
+            .show(ui, |ui| self.scope(ui));
     }
 }
 
 impl App {
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("super-radio");
-                ui.separator();
-
-                ui.label("Centre");
-                let mut mhz = self.center / 1e6;
-                let r = ui.add(
-                    egui::DragValue::new(&mut mhz)
-                        .speed(0.1)
-                        .range(24.0..=1766.0)
-                        .fixed_decimals(4)
-                        .suffix(" MHz"),
-                );
-                if r.changed() {
-                    self.center = mhz * 1e6;
-                    self.send(Cmd::Center(Hz(self.center as u64)));
-                    self.wf.clear();
-                    self.retune_listener();
-                }
-
-                ui.separator();
-                ui.label("Span");
-                let cur = self.rate;
-                egui::ComboBox::from_id_salt("span")
-                    .selected_text(fmt_hz(cur))
-                    .show_ui(ui, |ui| {
-                        for (name, r) in SPAN_PRESETS {
-                            if ui.selectable_label((cur - r).abs() < 1.0, name).clicked() {
-                                self.rate = r;
-                                self.send(Cmd::Rate(Sps(r as u64)));
-                                self.wf.clear();
-                                self.retune_listener();
-                            }
-                        }
-                    });
-
-                ui.separator();
-                ui.label("Gain");
-                let mut auto = matches!(self.gain, GainMode::Auto);
-                if ui.checkbox(&mut auto, "auto").changed() {
-                    self.gain = if auto { GainMode::Auto } else { GainMode::Manual(30.0) };
-                    self.send(Cmd::Gain(self.gain));
-                }
-                if let GainMode::Manual(mut g) = self.gain {
-                    if ui.add(egui::Slider::new(&mut g, 0.0..=50.0).suffix(" dB")).changed() {
-                        self.gain = GainMode::Manual(g);
-                        self.send(Cmd::Gain(self.gain));
-                    }
-                }
-
-                ui.separator();
-                if ui
-                    .add(egui::DragValue::new(&mut self.ppm).speed(0.1).range(-200.0..=200.0).prefix("ppm "))
-                    .changed()
-                {
-                    // Applied on the next retune.
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(r) = &self.radio {
-                        let d = r.status.dropped.load(std::sync::atomic::Ordering::Relaxed);
-                        let col = if d > 0 { Color32::from_rgb(230, 90, 90) } else { Color32::GRAY };
-                        ui.colored_label(col, format!("dropped {d}"));
-                    }
-                });
-            });
-
-            if let Some(e) = &self.err {
-                ui.colored_label(Color32::from_rgb(240, 100, 100), e);
+    fn screenshot(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.shot.clone() else { return };
+        ctx.request_repaint();
+        let t0 = *self.shot_at.get_or_insert_with(std::time::Instant::now);
+        // Wait for the tuner to lock and the waterfall to fill; a screenshot
+        // taken before that reviews an empty screen, not the design.
+        if !self.shot_sent && t0.elapsed().as_secs_f32() > 6.0 {
+            if self.channels.is_empty() {
+                self.add_channel(95.8e6);
+                self.add_channel(95.35e6);
             }
+            self.shot_sent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        let img = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
         });
+        if let Some(img) = img {
+            let (w, h) = (img.width() as u32, img.height() as u32);
+            let buf: Vec<u8> = img.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b(), p.a()]).collect();
+            if let Some(b) = image::RgbaImage::from_raw(w, h, buf) {
+                let _ = b.save(&path);
+                println!("wrote {path} ({w}x{h})");
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
-        Panel::right("channels").default_size(260.0).show(ui, |ui| {
-            ui.heading("Channels");
-            ui.label(
-                egui::RichText::new("Click the spectrum to add one.")
-                    .small()
-                    .color(Color32::GRAY),
-            );
-            ui.separator();
+    /// The readout and the controls that set it.
+    fn head(&mut self, ui: &mut egui::Ui) {
+        Panel::top("head")
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let out = self.dial.show(ui, self.center, 34.0);
+                    if out.changed {
+                        self.retune(out.hz);
+                    }
 
-            ui.horizontal(|ui| {
-                ui.label("Volume");
-                if ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0)).changed() {
-                    self.send(Cmd::Volume(self.volume));
-                }
-            });
-            if ui.button("Mute").clicked() {
-                self.listening = None;
-                self.send(Cmd::Listen(None));
-            }
-            ui.separator();
-
-            let mut remove = None;
-            let mut tune = None;
-            let mut changed = None;
-            for (i, ch) in self.channels.iter_mut().enumerate() {
-                let active = self.listening == Some(i);
-                egui::Frame::group(ui.style())
-                    .fill(if active {
-                        Color32::from_rgb(40, 55, 75)
-                    } else {
-                        ui.style().visuals.faint_bg_color
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut ch.label);
-                            if ui.small_button("x").clicked() {
-                                remove = Some(i);
-                            }
-                        });
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(legend("band"));
                         ui.label(
-                            egui::RichText::new(fmt_hz(ch.freq)).monospace().strong(),
+                            value(bands::name_at(self.center))
+                                .color(theme::TRACE)
+                                .size(14.0),
                         );
+                    });
+
+                    ui.add_space(18.0);
+                    self.divider(ui);
+                    ui.add_space(18.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(legend("span"));
                         ui.horizontal(|ui| {
-                            for m in [Demod::Wfm, Demod::Nfm, Demod::Am] {
-                                if ui.selectable_label(ch.demod == m, m.label()).clicked() {
-                                    ch.demod = m;
-                                    changed = Some(i);
+                            for (name, r) in SPANS {
+                                let on = (self.rate - r).abs() < 1.0;
+                                if ui.selectable_label(on, name).clicked() && !on {
+                                    self.rate = r;
+                                    self.send(Cmd::Rate(Sps(r as u64)));
+                                    self.wf.clear();
+                                    self.retune_listener();
                                 }
                             }
                         });
-                        if ui.selectable_label(active, if active { "listening" } else { "listen" }).clicked() {
-                            tune = Some(i);
-                        }
                     });
-            }
 
-            if let Some(i) = remove {
-                self.channels.remove(i);
-                match self.listening {
-                    Some(l) if l == i => self.listening = None,
-                    Some(l) if l > i => self.listening = Some(l - 1),
-                    _ => {}
+                    ui.add_space(18.0);
+                    self.divider(ui);
+                    ui.add_space(18.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(legend("gain"));
+                        ui.horizontal(|ui| {
+                            let auto = matches!(self.gain, GainMode::Auto);
+                            if ui.selectable_label(auto, "AUTO").clicked() && !auto {
+                                self.gain = GainMode::Auto;
+                                self.send(Cmd::Gain(self.gain));
+                            }
+                            if ui.selectable_label(!auto, "MAN").clicked() && auto {
+                                self.gain = GainMode::Manual(30.0);
+                                self.send(Cmd::Gain(self.gain));
+                            }
+                            if let GainMode::Manual(mut g) = self.gain {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut g, 0.0..=50.0)
+                                            .suffix(" dB")
+                                            .show_value(true),
+                                    )
+                                    .changed()
+                                {
+                                    self.gain = GainMode::Manual(g);
+                                    self.send(Cmd::Gain(self.gain));
+                                }
+                            }
+                        });
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.lamps(ui);
+                    });
+                });
+
+                if let Some(e) = &self.err {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(e)
+                            .color(theme::FAULT)
+                            .font(FontId::proportional(12.0)),
+                    );
                 }
-                self.retune_listener();
-            }
-            if let Some(i) = tune.or(changed) {
-                self.listen(i);
-            }
-
-            ui.separator();
-            ui.collapsing("Display", |ui| {
-                ui.checkbox(&mut self.auto_scale, "auto scale");
-                ui.add_enabled(
-                    !self.auto_scale,
-                    egui::Slider::new(&mut self.floor, -140.0..=0.0).text("floor dB"),
-                );
-                ui.add_enabled(
-                    !self.auto_scale,
-                    egui::Slider::new(&mut self.ceil, -140.0..=20.0).text("ceiling dB"),
-                );
             });
+    }
+
+    fn divider(&self, ui: &mut egui::Ui) {
+        let h = 40.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, h), Sense::hover());
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.center().x, rect.top()),
+                Pos2::new(rect.center().x, rect.bottom()),
+            ],
+            Stroke::new(1.0, theme::ETCH),
+        );
+    }
+
+    /// Status lamps. Dark is good; an unlit lamp means nothing is wrong.
+    fn lamps(&self, ui: &mut egui::Ui) {
+        let Some(r) = &self.radio else { return };
+        use std::sync::atomic::Ordering;
+        let dropped = r.status.dropped.load(Ordering::Relaxed);
+        let running = r.status.running.load(Ordering::Relaxed);
+
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            lamp(ui, "drops", dropped > 0, theme::FAULT, &format!("{dropped}"));
+            lamp(ui, "rx", running, theme::TRACE, if running { "on" } else { "off" });
         });
     }
 
-    fn spectrum(&mut self, ui: &mut egui::Ui) {
+    fn strip(&mut self, ui: &mut egui::Ui) {
+        Panel::right("channels")
+            .default_size(250.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
+            .show(ui, |ui| {
+                ui.label(legend("channels"));
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(legend("vol"));
+                    if ui
+                        .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+                        .changed()
+                    {
+                        self.send(Cmd::Volume(self.volume));
+                    }
+                    if ui.button("MUTE").clicked() {
+                        self.listening = None;
+                        self.send(Cmd::Listen(None));
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                if self.channels.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Click the spectrum to tune a channel.")
+                            .color(theme::LEGEND)
+                            .size(12.0),
+                    );
+                }
+
+                let mut remove = None;
+                let mut tune = None;
+                for (i, ch) in self.channels.iter_mut().enumerate() {
+                    let active = self.listening == Some(i);
+                    egui::Frame::NONE
+                        .fill(if active { Color32::from_rgb(0x2A, 0x2E, 0x36) } else { theme::WELL })
+                        .stroke(Stroke::new(1.0, if active { theme::READOUT } else { theme::ETCH }))
+                        .corner_radius(2.0)
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // A lit bar marks the channel you are hearing.
+                                let (r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                                ui.painter().rect_filled(
+                                    r,
+                                    1.0,
+                                    if active { theme::READOUT } else { theme::ETCH },
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ch.label)
+                                        .desired_width(90.0)
+                                        .frame(egui::Frame::NONE),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("REMOVE").clicked() {
+                                            remove = Some(i);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(readout(format!("{:.4}", ch.freq / 1e6), 17.0));
+                            ui.label(legend(bands::name_at(ch.freq)));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                for m in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+                                    if ui.selectable_label(ch.demod == m, m.label()).clicked() {
+                                        ch.demod = m;
+                                        tune = Some(i);
+                                    }
+                                }
+                                if !active
+                                    && ui.small_button("LISTEN").clicked()
+                                {
+                                    tune = Some(i);
+                                }
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
+                if let Some(i) = remove {
+                    self.channels.remove(i);
+                    match self.listening {
+                        Some(l) if l == i => self.listening = None,
+                        Some(l) if l > i => self.listening = Some(l - 1),
+                        _ => {}
+                    }
+                    self.retune_listener();
+                }
+                if let Some(i) = tune {
+                    self.listen(i);
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.collapsing("Display", |ui| {
+                        ui.checkbox(&mut self.auto_scale, "Auto scale");
+                        ui.add_enabled(
+                            !self.auto_scale,
+                            egui::Slider::new(&mut self.floor, -140.0..=0.0).text("floor"),
+                        );
+                        ui.add_enabled(
+                            !self.auto_scale,
+                            egui::Slider::new(&mut self.ceil, -140.0..=20.0).text("ceiling"),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn scope(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
-        let split = full.top() + full.height() * 0.35;
-        let plot = Rect::from_min_max(full.min, Pos2::new(full.right(), split));
-        let fall = Rect::from_min_max(Pos2::new(full.left(), split + 2.0), full.max);
+        let ribbon_h = 16.0;
+        let plot_h = (full.height() - ribbon_h) * 0.34;
+        let plot = Rect::from_min_max(full.min, Pos2::new(full.right(), full.top() + plot_h));
+        let ribbon = Rect::from_min_max(
+            Pos2::new(full.left(), plot.bottom()),
+            Pos2::new(full.right(), plot.bottom() + ribbon_h),
+        );
+        let fall = Rect::from_min_max(Pos2::new(full.left(), ribbon.bottom()), full.max);
 
         let resp = ui.allocate_rect(full, Sense::click_and_drag());
         let p = ui.painter_at(full);
+        p.rect_filled(plot, 0.0, theme::WELL);
 
-        p.rect_filled(plot, 0.0, Color32::from_rgb(10, 12, 16));
-
-        // Frequency grid.
-        for i in 0..=10 {
-            let x = plot.left() + plot.width() * i as f32 / 10.0;
-            p.line_segment(
-                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                Stroke::new(1.0, Color32::from_gray(30)),
-            );
-            let hz = self.hz_at(&plot, x);
-            p.text(
-                Pos2::new(x, plot.bottom() - 2.0),
-                Align2::CENTER_BOTTOM,
-                format!("{:.3}", hz / 1e6),
-                FontId::monospace(10.0),
-                Color32::from_gray(110),
-            );
-        }
-
-        if !self.db.is_empty() {
-            let span = (self.ceil - self.floor).max(1.0);
-            let n = self.db.len();
-            // More bins than pixels, so take the max per column: averaging
-            // would hide narrow carriers, which are exactly what matters.
-            let cols = plot.width().max(1.0) as usize;
-            let mut pts = Vec::with_capacity(cols);
-            for c in 0..cols {
-                let a = c * n / cols;
-                let b = ((c + 1) * n / cols).max(a + 1).min(n);
-                let v = self.db[a..b].iter().copied().fold(f32::MIN, f32::max);
-                let t = ((v - self.floor) / span).clamp(0.0, 1.0);
-                pts.push(Pos2::new(plot.left() + c as f32, plot.bottom() - t * plot.height()));
-            }
-            p.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 160))));
-        }
+        self.grid(&p, &plot);
+        self.trace(&p, &plot);
+        self.ribbon(&p, &ribbon);
 
         if let Some(tex) = self.wf.texture(ui.ctx()) {
             p.image(
@@ -414,60 +504,12 @@ impl App {
             );
         }
 
-        // Channel markers.
-        let lo = self.center - self.rate / 2.0;
-        let hi = self.center + self.rate / 2.0;
-        for (i, ch) in self.channels.iter().enumerate() {
-            if ch.freq < lo || ch.freq > hi {
-                continue;
-            }
-            let x = self.x_of(&full, ch.freq);
-            let active = self.listening == Some(i);
-            let col = if active {
-                Color32::from_rgb(255, 200, 80)
-            } else {
-                Color32::from_rgb(120, 150, 200)
-            };
-            p.line_segment(
-                [Pos2::new(x, full.top()), Pos2::new(x, full.bottom())],
-                Stroke::new(if active { 2.0 } else { 1.0 }, col),
-            );
-            p.text(
-                Pos2::new(x + 3.0, full.top() + 2.0),
-                Align2::LEFT_TOP,
-                &ch.label,
-                FontId::proportional(11.0),
-                col,
-            );
-        }
-
-        // Hover readout.
-        if let Some(pos) = resp.hover_pos() {
-            let hz = self.hz_at(&full, pos.x);
-            p.line_segment(
-                [Pos2::new(pos.x, full.top()), Pos2::new(pos.x, full.bottom())],
-                Stroke::new(1.0, Color32::from_gray(90)),
-            );
-            let text = fmt_hz(hz);
-            let at = Pos2::new(pos.x + 6.0, full.top() + 18.0);
-            let r = p
-                .text(at, Align2::LEFT_TOP, &text, FontId::monospace(12.0), Color32::WHITE)
-                .expand(3.0);
-            p.rect(
-                r,
-                3.0,
-                Color32::from_black_alpha(200),
-                Stroke::NONE,
-                StrokeKind::Middle,
-            );
-            p.text(at, Align2::LEFT_TOP, text, FontId::monospace(12.0), Color32::WHITE);
-        }
+        self.markers(&p, &full);
+        self.cursor(&p, &full, &resp);
 
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let hz = self.hz_at(&full, pos.x);
-                // Snap to an existing marker if one is close, so clicking a
-                // channel selects it rather than stacking a duplicate.
                 let tol = self.rate / full.width() as f64 * 6.0;
                 match self.channels.iter().position(|c| (c.freq - hz).abs() < tol) {
                     Some(i) => self.listen(i),
@@ -475,18 +517,165 @@ impl App {
                 }
             }
         }
-
-        // Drag to pan the centre frequency.
         if resp.dragged() {
             let dx = resp.drag_delta().x as f64;
             if dx.abs() > 0.0 {
-                self.center -= dx * self.rate / full.width() as f64;
-                self.send(Cmd::Center(Hz(self.center as u64)));
-                self.wf.clear();
-                self.retune_listener();
+                self.retune(self.center - dx * self.rate / full.width() as f64);
             }
         }
     }
+
+    fn grid(&self, p: &egui::Painter, plot: &Rect) {
+        for i in 0..=10 {
+            let x = plot.left() + plot.width() * i as f32 / 10.0;
+            p.line_segment(
+                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                Stroke::new(1.0, Color32::from_rgb(0x24, 0x28, 0x2E)),
+            );
+        }
+        // Amplitude graticule, labelled in dBFS so the numbers mean something.
+        for i in 1..4 {
+            let y = plot.top() + plot.height() * i as f32 / 4.0;
+            p.line_segment(
+                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+                Stroke::new(1.0, Color32::from_rgb(0x22, 0x26, 0x2B)),
+            );
+            let db = self.ceil - (self.ceil - self.floor) * i as f32 / 4.0;
+            p.text(
+                Pos2::new(plot.right() - 4.0, y - 1.0),
+                Align2::RIGHT_BOTTOM,
+                format!("{db:.0}"),
+                FontId::new(9.0, FontFamily::Name(theme::LEGEND_FONT.into())),
+                Color32::from_rgb(0x4A, 0x51, 0x5A),
+            );
+        }
+    }
+
+    fn trace(&self, p: &egui::Painter, plot: &Rect) {
+        if self.db.is_empty() {
+            return;
+        }
+        let span = (self.ceil - self.floor).max(1.0);
+        let n = self.db.len();
+        let cols = plot.width().max(1.0) as usize;
+        let mut pts = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let a = c * n / cols;
+            let b = ((c + 1) * n / cols).max(a + 1).min(n);
+            // Max, not mean: averaging hides the narrow carriers that matter.
+            let v = self.db[a..b].iter().copied().fold(f32::MIN, f32::max);
+            let t = ((v - self.floor) / span).clamp(0.0, 1.0);
+            pts.push(Pos2::new(plot.left() + c as f32, plot.bottom() - t * plot.height()));
+        }
+        // Fill under the trace so occupied spectrum reads as mass. Built as a
+        // quad strip: a spectrum outline is wildly concave, and asking for a
+        // convex polygon fill turns it into fan-shaped wedges.
+        let mut mesh = egui::Mesh::default();
+        let fill = Color32::from_rgba_unmultiplied(0x5C, 0xD0, 0xE8, 26);
+        for w in pts.windows(2) {
+            let i = mesh.vertices.len() as u32;
+            for v in [
+                w[0],
+                w[1],
+                Pos2::new(w[1].x, plot.bottom()),
+                Pos2::new(w[0].x, plot.bottom()),
+            ] {
+                mesh.colored_vertex(v, fill);
+            }
+            mesh.add_triangle(i, i + 1, i + 2);
+            mesh.add_triangle(i, i + 2, i + 3);
+        }
+        p.add(egui::Shape::mesh(mesh));
+        p.add(egui::Shape::line(pts, Stroke::new(1.2, theme::TRACE)));
+    }
+
+    fn ribbon(&self, p: &egui::Painter, r: &Rect) {
+        p.rect_filled(*r, 0.0, theme::CHASSIS);
+        let (lo, hi) = (self.center - self.rate / 2.0, self.center + self.rate / 2.0);
+        for b in bands::in_span(lo, hi) {
+            let x0 = self.x_of(r, b.lo.max(lo)).max(r.left());
+            let x1 = self.x_of(r, b.hi.min(hi)).min(r.right());
+            if x1 - x0 < 1.0 {
+                continue;
+            }
+            let cell = Rect::from_min_max(Pos2::new(x0, r.top() + 2.0), Pos2::new(x1, r.bottom() - 2.0));
+            p.rect_filled(cell, 1.0, b.color);
+            if x1 - x0 > 60.0 {
+                p.text(
+                    cell.center(),
+                    Align2::CENTER_CENTER,
+                    b.name,
+                    FontId::new(9.0, FontFamily::Name(theme::LEGEND_FONT.into())),
+                    Color32::from_rgb(0xE8, 0xEC, 0xF0),
+                );
+            }
+        }
+    }
+
+    fn markers(&self, p: &egui::Painter, full: &Rect) {
+        let (lo, hi) = (self.center - self.rate / 2.0, self.center + self.rate / 2.0);
+        for (i, ch) in self.channels.iter().enumerate() {
+            if ch.freq < lo || ch.freq > hi {
+                continue;
+            }
+            let x = self.x_of(full, ch.freq);
+            let active = self.listening == Some(i);
+            let col = if active { theme::READOUT } else { Color32::from_rgb(0x6E, 0x7A, 0x88) };
+            p.line_segment(
+                [Pos2::new(x, full.top()), Pos2::new(x, full.bottom())],
+                Stroke::new(if active { 1.5 } else { 1.0 }, col),
+            );
+            // Flag the label off the line so it never sits on the trace.
+            let t = p.layout_no_wrap(
+                ch.label.clone(),
+                FontId::new(10.0, FontFamily::Name(theme::LEGEND_FONT.into())),
+                Color32::BLACK,
+            );
+            let flag = Rect::from_min_size(
+                Pos2::new(x + 1.0, full.top() + 2.0),
+                Vec2::new(t.size().x + 8.0, t.size().y + 4.0),
+            );
+            p.rect_filled(flag, 1.0, col);
+            p.galley(Pos2::new(flag.left() + 4.0, flag.top() + 2.0), t, Color32::BLACK);
+        }
+    }
+
+    fn cursor(&self, p: &egui::Painter, full: &Rect, resp: &egui::Response) {
+        let Some(pos) = resp.hover_pos() else { return };
+        let hz = self.hz_at(full, pos.x);
+        p.line_segment(
+            [Pos2::new(pos.x, full.top()), Pos2::new(pos.x, full.bottom())],
+            Stroke::new(1.0, Color32::from_rgb(0x55, 0x5E, 0x69)),
+        );
+        let text = format!("{}   {}", fmt_hz(hz), bands::name_at(hz));
+        let g = p.layout_no_wrap(
+            text,
+            FontId::new(11.0, FontFamily::Name(theme::READOUT_FONT.into())),
+            theme::VALUE,
+        );
+        let left = (pos.x + 8.0).min(full.right() - g.size().x - 10.0);
+        let box_r = Rect::from_min_size(
+            Pos2::new(left - 5.0, full.top() + 5.0),
+            g.size() + Vec2::new(10.0, 6.0),
+        );
+        p.rect(box_r, 2.0, theme::WELL, Stroke::new(1.0, theme::ETCH), StrokeKind::Inside);
+        p.galley(Pos2::new(left, full.top() + 8.0), g, theme::VALUE);
+    }
+}
+
+fn lamp(ui: &mut egui::Ui, label: &str, lit: bool, col: Color32, text: &str) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
+        let c = if lit { col } else { Color32::from_rgb(0x2C, 0x31, 0x38) };
+        ui.painter().circle_filled(r.center(), 3.5, c);
+        if lit {
+            // A faint halo reads as a lit lamp rather than a painted dot.
+            ui.painter()
+                .circle_filled(r.center(), 6.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 30));
+        }
+        ui.label(legend(label));
+        ui.label(value(text).size(11.0).color(if lit { col } else { theme::LEGEND }));
+    });
 }
 
 #[cfg(test)]
@@ -512,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn the_left_edge_is_the_bottom_of_the_span() {
+    fn the_edges_are_the_ends_of_the_span() {
         let a = app();
         let r = rect();
         assert!((a.hz_at(&r, r.left()) - 99_000_000.0).abs() < 1.0);
@@ -528,23 +717,12 @@ mod tests {
     }
 
     #[test]
-    fn the_band_plan_picks_sensible_modes() {
-        assert_eq!(default_demod(95.8e6), Demod::Wfm);
-        assert_eq!(default_demod(124.0e6), Demod::Am);
-        assert_eq!(default_demod(446.0e6), Demod::Nfm);
-    }
-
-    #[test]
-    fn removing_a_channel_keeps_the_listener_on_the_same_one() {
+    fn new_channels_take_the_mode_of_their_band() {
         let mut a = app();
-        a.channels.push(Channel { freq: 1.0, demod: Demod::Nfm, label: "a".into() });
-        a.channels.push(Channel { freq: 2.0, demod: Demod::Nfm, label: "b".into() });
-        a.listening = Some(1);
-        // Removing the earlier entry must shift the index, not silently
-        // re-point the listener at a different channel.
-        a.channels.remove(0);
-        a.listening = Some(0);
-        assert_eq!(a.channels[a.listening.unwrap()].label, "b");
+        a.add_channel(95.8e6);
+        a.add_channel(124.0e6);
+        assert_eq!(a.channels[0].demod, Demod::Wfm);
+        assert_eq!(a.channels[1].demod, Demod::Am);
     }
 
     #[test]
@@ -559,6 +737,15 @@ mod tests {
         }
         assert!(a.floor < -95.0, "floor tracked the carrier: {}", a.floor);
         assert!(a.floor > -110.0, "floor ran away: {}", a.floor);
+    }
+
+    #[test]
+    fn retuning_stays_inside_what_the_tuner_can_reach() {
+        let mut a = app();
+        a.retune(1.0);
+        assert_eq!(a.center, 24e6);
+        a.retune(9e9);
+        assert_eq!(a.center, 1766e6);
     }
 
     #[test]

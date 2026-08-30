@@ -84,16 +84,23 @@ impl Waterfall {
     }
 }
 
-/// Black through blue, magenta, orange to white. Brightness rises
-/// monotonically so features read correctly in greyscale too.
+/// Cold cyan for noise, hot amber for signal, white at the top.
+///
+/// Built from the theme's two accents rather than a stock inferno ramp, so the
+/// waterfall says the same thing the rest of the panel does: cyan is what the
+/// radio hears, amber is where the energy is. Brightness rises monotonically
+/// so features stay readable in greyscale and for colour-deficient viewers.
 pub fn colormap(t: f32) -> Color32 {
     const STOPS: [(f32, [f32; 3]); 6] = [
-        (0.00, [0.0, 0.0, 0.10]),
-        (0.20, [0.10, 0.05, 0.45]),
-        (0.40, [0.45, 0.05, 0.55]),
-        (0.60, [0.85, 0.20, 0.35]),
-        (0.80, [1.0, 0.65, 0.10]),
-        (1.00, [1.0, 1.0, 0.90]),
+        // Most bins in any span are noise, so the ramp stays dark well past
+        // the midpoint. Brightening early spends the whole scale on the noise
+        // floor and leaves signals nowhere to go.
+        (0.00, [0.031, 0.039, 0.051]),
+        (0.35, [0.047, 0.125, 0.161]),
+        (0.60, [0.078, 0.376, 0.486]),
+        (0.78, [0.180, 0.612, 0.745]),
+        (0.90, [0.941, 0.627, 0.188]),
+        (1.00, [1.0, 0.965, 0.878]),
     ];
     let t = t.clamp(0.0, 1.0);
     let mut i = 0;
