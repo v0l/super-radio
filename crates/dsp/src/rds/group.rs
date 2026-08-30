@@ -57,8 +57,15 @@ pub struct Station {
 }
 
 impl Station {
+    /// Programme type, or `None` when the station declares none.
+    ///
+    /// Code zero means the station is not saying, which is not the same as the
+    /// string "None" and should not be shown as though it were an answer.
     pub fn pty_name(&self) -> Option<&'static str> {
-        self.pty.map(|p| PTY[(p & 31) as usize])
+        match self.pty {
+            Some(0) | None => None,
+            Some(p) => Some(PTY[(p & 31) as usize]),
+        }
     }
 }
 
@@ -246,6 +253,17 @@ mod tests {
         assert_eq!(d.station().pi, Some(0xC479));
         assert_eq!(d.station().pty, Some(9));
         assert_eq!(d.station().pty_name(), Some("Varied"));
+    }
+
+    #[test]
+    fn a_station_declaring_no_programme_type_reports_none() {
+        // Code zero means "not stated". Rendering it as the word "None" puts
+        // a value on screen where the station gave one.
+        let mut d = GroupDecoder::new();
+        let g = group(0xF212, 0 << 5, 0, 0);
+        d.push(&g);
+        assert_eq!(d.station().pty, Some(0));
+        assert_eq!(d.station().pty_name(), None);
     }
 
     #[test]
