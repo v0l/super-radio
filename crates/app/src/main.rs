@@ -13,12 +13,28 @@ mod waterfall;
 fn probe(mhz: f64, listen: bool) {
     use common::{Hz, Sps};
     let rate = 2_304_000.0;
-    let Some(entry) = devices::list().into_iter().next() else {
+    // Pick by name so the HackRF can be probed while an RTL-SDR is plugged in.
+    let want = std::env::args().position(|x| x == "--device").and_then(|i| {
+        std::env::args().nth(i + 1)
+    });
+    let all = devices::list();
+    let Some(entry) = want
+        .and_then(|w| {
+            all.iter()
+                .find(|d| d.label.to_lowercase().contains(&w.to_lowercase()))
+                .cloned()
+        })
+        .or_else(|| all.into_iter().next())
+    else {
         println!("no radio found");
         return;
     };
     println!("using {}", entry.label);
     let r = radio::Radio::start(entry, Hz((mhz * 1e6) as u64), Sps(rate as u64), 2048, || {});
+    // --no-dc leaves the centre spur in, for measuring what removing it does.
+    let dc_on = !std::env::args().any(|x| x == "--no-dc");
+    r.send(radio::Cmd::DcBlock(dc_on));
+    println!("dc block: {}", if dc_on { "on" } else { "off" });
     if listen {
         // Decode a channel off-centre, the case that was dropping samples.
         r.send(radio::Cmd::Demod(radio::Demod::Wfm));
@@ -47,11 +63,16 @@ fn probe(mhz: f64, listen: bool) {
         let mut s: Vec<f32> = f.db.iter().copied().filter(|x| x.is_finite()).collect();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = s[s.len() / 2];
+        // The centre bin is where a direct-conversion receiver puts its own
+        // leakage, so report it against the floor: that number is the spur.
+        let mid = f.db[f.db.len() / 2];
         let hz = f.center - f.rate / 2.0 + idx as f64 * f.rate / f.db.len() as f64;
         println!(
-            "frame {n:3}  peak {peak:6.1} dBFS at {:9.4} MHz  floor {median:6.1}  peak-floor {:5.1} dB",
+            "frame {n:3}  peak {peak:6.1} dBFS at {:9.4} MHz  floor {median:6.1}  \
+             peak-floor {:5.1} dB  centre-floor {:5.1} dB",
             hz / 1e6,
-            peak - median
+            peak - median,
+            mid - median
         );
     }
     if listen {

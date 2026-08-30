@@ -6,7 +6,7 @@ use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dsp::rds::{BlockSync, GroupDecoder, RdsDemod};
 use dsp::{
-    Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum,
+    DcBlock, Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum,
     StereoDecoder,
 };
 use std::sync::{
@@ -89,6 +89,8 @@ pub enum Cmd {
     Refresh(f32),
     /// Exponential averaging applied to the spectrum, 1.0 for none.
     Smoothing(f32),
+    /// Remove the centre spur a direct-conversion receiver produces.
+    DcBlock(bool),
     Stop,
 }
 
@@ -427,6 +429,8 @@ fn run(
     };
 
     let mut spec = Spectrum::new(fft);
+    let mut dc: Option<DcBlock> = None;
+    let mut dc_on = true;
     let mut stream = dev.start_rx()?;
     status.running.store(true, Ordering::Relaxed);
 
@@ -451,14 +455,23 @@ fn run(
                     dev.set_center(f)?;
                     cur_center = dev.center().as_f64();
                     spec.reset();
+                    // The offset differs from tuning to tuning, so re-measure
+                    // rather than dragging the old one to the new frequency.
+                    dc = None;
                 }
                 Cmd::Rate(r) => {
                     dev.set_rate(r)?;
                     cur_rate = dev.rate().as_f64();
                     spec.reset();
                     retune = true;
+                    // The notch width is set from the rate.
+                    dc = None;
                 }
-                Cmd::Gain(g) => dev.set_gain("tuner", g)?,
+                Cmd::Gain(g) => {
+                    dev.set_gain("tuner", g)?;
+                    // Gain changes move the offset with it.
+                    dc = None;
+                }
                 Cmd::Listen(o) => {
                     listen = o;
                     retune = true;
@@ -475,6 +488,10 @@ fn run(
                 }
                 Cmd::Refresh(hz) => refresh = hz.clamp(1.0, 120.0),
                 Cmd::Smoothing(v) => spec.smoothing = v.clamp(0.01, 1.0),
+                Cmd::DcBlock(on) => {
+                    dc_on = on;
+                    dc = None;
+                }
             }
         }
 
@@ -486,12 +503,26 @@ fn run(
         }
 
         let read_span = tracing::info_span!("rf_read").entered();
-        let buf = match stream.read() {
+        let mut buf = match stream.read() {
             Ok(b) => b,
             Err(_) => return Ok(()),
         };
         drop(read_span);
         status.dropped.store(stream.dropped(), Ordering::Relaxed);
+
+        // A direct-conversion front end puts local oscillator leakage and the
+        // ADC's offset at exactly the tuned frequency, which reads as a very
+        // strong carrier that is not there. Removed before anything else sees
+        // it, so the spectrum, the detectors and the audio all agree.
+        if dc_on {
+            let _d = tracing::info_span!("dc_block").entered();
+            let dcb = dc.get_or_insert_with(|| {
+                let mut d = DcBlock::new(cur_rate);
+                d.prime(&buf.samples);
+                d
+            });
+            dcb.process(&mut buf.samples);
+        }
 
         // Only run the FFT and wake the UI when a frame is actually due.
         // Waking on every USB buffer asks for ~260 repaints a second, which
