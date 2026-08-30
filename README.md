@@ -148,6 +148,12 @@ that decade, the way you pick a tuning step on a hardware receiver. The two
 accent colours carry meaning rather than decoration -- amber is what you set,
 cyan is what the radio hears -- and the waterfall ramps between them.
 
+Mouse wheel over the spectrum scrubs the centre frequency by a twentieth of the
+span per notch; over a digit of the readout it steps that decade. Panning
+slides the waterfall history sideways rather than discarding it. Each channel
+is drawn at the width its demodulator actually accepts, so an NFM and a WFM
+channel on the same frequency look as different as they are.
+
 To capture a PNG of the running interface:
 
 ```

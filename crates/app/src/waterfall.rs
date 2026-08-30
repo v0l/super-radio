@@ -58,6 +58,47 @@ impl Waterfall {
         self.dirty = true;
     }
 
+    /// Fraction of the history buffer that holds real rows. Starting up, the
+    /// rest is not black data, it is data that does not exist yet.
+    pub fn filled_fraction(&self) -> f32 {
+        if self.height == 0 {
+            0.0
+        } else {
+            self.filled as f32 / self.height as f32
+        }
+    }
+
+    /// Slide the history sideways when the radio is retuned.
+    ///
+    /// Panning is a shift of the frequency axis, not a new view, so the rows
+    /// already captured are still valid where they overlap. Clearing on every
+    /// retune wipes the display continuously while the pointer is dragging,
+    /// which looks like the waterfall has stopped.
+    pub fn shift(&mut self, d: i32) {
+        if d == 0 || self.width == 0 {
+            return;
+        }
+        let w = self.width;
+        if d.unsigned_abs() as usize >= w {
+            self.pixels.fill(Color32::BLACK);
+            self.dirty = true;
+            return;
+        }
+        let n = d.unsigned_abs() as usize;
+        for y in 0..self.height {
+            let row = &mut self.pixels[y * w..(y + 1) * w];
+            if d > 0 {
+                // Centre moved up, so content moves left.
+                row.copy_within(n.., 0);
+                row[w - n..].fill(Color32::BLACK);
+            } else {
+                row.copy_within(..w - n, n);
+                row[..n].fill(Color32::BLACK);
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Texture with the newest row at the top.
     pub fn texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         if self.width == 0 {
@@ -154,6 +195,61 @@ mod tests {
         }
         assert_eq!(w.pixels.len(), 8 * 4);
         assert_eq!(w.filled, 4);
+    }
+
+    #[test]
+    fn the_filled_fraction_grows_then_saturates() {
+        let mut w = Waterfall::new(4);
+        assert_eq!(w.filled_fraction(), 0.0);
+        w.push(&[-50.0; 8], -100.0, 0.0);
+        assert_eq!(w.filled_fraction(), 0.25);
+        for _ in 0..20 {
+            w.push(&[-50.0; 8], -100.0, 0.0);
+        }
+        assert_eq!(w.filled_fraction(), 1.0);
+    }
+
+    #[test]
+    fn shifting_moves_content_and_blanks_the_vacated_edge() {
+        let mut w = Waterfall::new(2);
+        let mut db = vec![-100.0f32; 8];
+        db[4] = 0.0;
+        w.push(&db, -100.0, 0.0);
+        let before = w.pixels[4];
+        w.shift(2);
+        assert_eq!(w.pixels[2], before, "content did not move left");
+        assert_eq!(w.pixels[7], Color32::BLACK, "vacated edge not blanked");
+    }
+
+    #[test]
+    fn shifting_the_other_way_moves_right() {
+        let mut w = Waterfall::new(2);
+        let mut db = vec![-100.0f32; 8];
+        db[2] = 0.0;
+        w.push(&db, -100.0, 0.0);
+        let before = w.pixels[2];
+        w.shift(-2);
+        assert_eq!(w.pixels[4], before);
+        assert_eq!(w.pixels[0], Color32::BLACK);
+    }
+
+    #[test]
+    fn shifting_further_than_the_width_clears_everything() {
+        let mut w = Waterfall::new(2);
+        w.push(&[0.0f32; 8], -100.0, 0.0);
+        w.shift(99);
+        assert!(w.pixels.iter().all(|p| *p == Color32::BLACK));
+    }
+
+    #[test]
+    fn a_zero_shift_is_a_no_op() {
+        let mut w = Waterfall::new(2);
+        let mut db = vec![-100.0f32; 8];
+        db[3] = 0.0;
+        w.push(&db, -100.0, 0.0);
+        let snapshot = w.pixels.clone();
+        w.shift(0);
+        assert_eq!(w.pixels, snapshot);
     }
 
     #[test]

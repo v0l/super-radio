@@ -1,3 +1,4 @@
+mod wheel;
 mod bands;
 mod dial;
 mod theme;

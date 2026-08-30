@@ -6,6 +6,7 @@
 //! wheel over a digit steps that decade.
 
 use crate::theme;
+use crate::wheel::Wheel;
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 /// Digits shown, from 1 GHz down to 1 Hz. Ten of them, because the tuner
@@ -17,6 +18,7 @@ const GROUP_AFTER: [i32; 2] = [6, 3];
 pub struct Dial {
     /// Decade currently under the pointer, if any.
     pub hot: Option<i32>,
+    wheel: Wheel,
 }
 
 /// Result of drawing the dial.
@@ -27,7 +29,7 @@ pub struct DialOut {
 
 impl Dial {
     pub fn new() -> Self {
-        Self { hot: None }
+        Self { hot: None, wheel: Wheel::default() }
     }
 
     /// Draw the readout and apply wheel input. Returns the possibly-updated
@@ -124,10 +126,9 @@ impl Dial {
         let mut out = hz;
         let mut changed = false;
         if let Some(dec) = hot {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let step = 10f64.powi(dec) * scroll.signum() as f64;
-                out = (hz + step).clamp(0.0, 3e9);
+            let n = self.wheel.notches(ui);
+            if n != 0 {
+                out = (hz + 10f64.powi(dec) * n as f64).clamp(0.0, 3e9);
                 changed = true;
             }
         }
