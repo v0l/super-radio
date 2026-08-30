@@ -1,0 +1,38 @@
+# Recorded IQ captures used by tests.
+#
+# These live on nostr.download rather than in git: IQ is close to incompressible
+# (this one only shrinks 20% under xz -9) and committing captures would bloat
+# history permanently for data that never changes.
+#
+# Fetch them with:  ./testdata/fetch.sh
+# Tests that need a fixture skip cleanly when it is absent, so a fresh clone
+# still builds and passes without network access.
+
+[[capture]]
+name = "fineoffset_wh1080_433.92M_250k.cu8"
+sha256 = "5d54aea229037bafe7f8aa1bffeb90fd938632cb5c289f2846b9491cc0ac3f19"
+url = "https://nostr.download/5d54aea229037bafe7f8aa1bffeb90fd938632cb5c289f2846b9491cc0ac3f19.xz"
+compression = "xz"
+center_hz = 433_920_000
+rate_sps = 250_000
+format = "cu8"
+description = """
+Fine Offset WH1080 weather station, OOK PWM at 433.92 MHz. Captured on an
+RTL-SDR with an R820T tuner at 49.6 dB gain. Contains one complete
+transmission. Independently decoded by rtl_433 25.02, which is what makes it
+useful: the expected values below come from a different implementation, so a
+decoder agreeing with them is real evidence rather than a restatement of our
+own assumptions.
+"""
+
+[capture.expect]
+model = "Fineoffset-WHx080"
+station_id = 196
+temperature_c = 16.2
+humidity_pct = 89
+wind_direction_deg = 180
+wind_avg_ms = 0.0
+wind_gust_ms = 0.0
+rain_total_mm = 84.3
+battery_ok = true
+crc_valid = true

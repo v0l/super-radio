@@ -1,0 +1,10 @@
+[package]
+name = "pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+num-complex.workspace = true
+serde.workspace = true

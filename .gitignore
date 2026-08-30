@@ -1,0 +1,9 @@
+/target
+
+# IQ captures are fetched from nostr.download via testdata/fetch.sh rather than
+# committed: they are near-incompressible and would bloat history permanently.
+testdata/*.cu8
+testdata/*.cs8
+testdata/*.cs16
+testdata/*.cf32
+testdata/*.xz

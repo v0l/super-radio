@@ -1,0 +1,10 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+thiserror.workspace = true
+serde.workspace = true
