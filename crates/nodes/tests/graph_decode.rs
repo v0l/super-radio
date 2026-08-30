@@ -39,7 +39,11 @@ macro_rules! need_fixture {
 /// The chain that decodes this capture. The recording is already at baseband
 /// and at 250 kS/s, so no shift and no decimation are needed.
 fn chain_specs() -> Vec<NodeSpec> {
+    // Decimate before the envelope: the signal is ~4 kHz wide in a 250 kHz
+    // capture, so detecting on the raw wideband envelope means competing with
+    // 60x more noise power than necessary.
     vec![
+        NodeSpec::new("decimate").i("factor", 8),
         NodeSpec::new("envelope"),
         NodeSpec::new("pulse_detect").f("reset_us", 10_000.0).i("min_pulses", 20),
         NodeSpec::new("protocol_decode"),
@@ -83,7 +87,7 @@ fn the_graph_negotiates_rates_and_kinds_correctly() {
     let g = build_chain(spec, &chain_specs(), &registry()).unwrap();
 
     let names: Vec<&str> = g.order().map(|(_, n)| n).collect();
-    assert_eq!(names, vec!["envelope", "pulse_detect", "protocol_decode"]);
+    assert_eq!(names, vec!["decimate", "envelope", "pulse_detect", "protocol_decode"]);
     assert_eq!(g.output_spec().kind, pipeline::PortKind::Bytes);
 }
 
@@ -119,6 +123,7 @@ fn retuning_a_parameter_at_runtime_changes_behaviour() {
     let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
 
     let bad = vec![
+        NodeSpec::new("decimate").i("factor", 8),
         NodeSpec::new("envelope"),
         NodeSpec::new("pulse_detect").f("reset_us", 600.0).i("min_pulses", 20),
         NodeSpec::new("protocol_decode"),
@@ -131,7 +136,7 @@ fn retuning_a_parameter_at_runtime_changes_behaviour() {
     );
 
     // Now fix it in place, without rebuilding the graph.
-    let id = pipeline::NodeId(1);
+    let id = pipeline::NodeId(2);
     g.node_mut(id)
         .unwrap()
         .set_param("reset_us", ParamValue::Float(10_000.0))
@@ -154,6 +159,7 @@ fn an_unrecognised_burst_is_reported_rather_than_silently_dropped() {
     let buf = need_fixture!(fixture());
     let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
     let specs = vec![
+        NodeSpec::new("decimate").i("factor", 8),
         NodeSpec::new("envelope"),
         // Decimating the envelope by 20 scales every pulse width by 20 and
         // makes the frame unmatchable.
@@ -218,6 +224,7 @@ fn a_mistuned_detector_says_what_it_discarded_and_which_knob_to_turn() {
     let buf = need_fixture!(fixture());
     let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
     let specs = vec![
+        NodeSpec::new("decimate").i("factor", 8),
         NodeSpec::new("envelope"),
         NodeSpec::new("pulse_detect").f("reset_us", 600.0).i("min_pulses", 20),
         NodeSpec::new("protocol_decode"),

@@ -9,9 +9,16 @@ common.workspace = true
 dsp.workspace = true
 pipeline.workspace = true
 decode.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 sources.workspace = true
 
 [[example]]
 name = "chain"
+
+[[example]]
+name = "bench"
+
+[[example]]
+name = "split"

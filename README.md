@@ -22,7 +22,7 @@ our own assumptions.
 | `dsp` | polyphase channelizer, FIR design, mixer, FM/AM demod, burst detector, OOK pulse extraction |
 | `pipeline` | the flow graph: typed DAG, rate negotiation, stream tags, events |
 | `decode` | bit buffers, pulse slicers, protocol registry, device decoders |
-| `nodes` | DSP and decoders as graph nodes, plus the registry that builds them by name |
+| `nodes` | DSP and decoders as graph nodes, the registry, and the wideband channel bank |
 | `sources` | file replay with rtl_433-style filename metadata |
 | `rtlsdr-sys` | bindgen FFI to librtlsdr |
 | `rtlsdr` | safe driver with an async streaming thread |
@@ -50,6 +50,27 @@ possible output for a tool meant to identify unknown signals.
 or two-level FSK, and both reduce to mark/gap timings. The DSP runs once per
 channel; each protocol is then a timing table and a payload parser working on
 integers. That is what makes supporting hundreds of protocols affordable.
+
+## Measured throughput
+
+512 channels, each running a full envelope / pulse-detect / protocol-decode
+chain, on a 48-core machine. `x real` above 1.0 means it keeps up with a live
+radio at that rate.
+
+| input rate | 64 ch | 256 ch | 512 ch |
+|---|---|---|---|
+| 2.4 MS/s (RTL-SDR) | 10.3x | 9.0x | 11.9x |
+| 20 MS/s (HackRF) | 1.22x | 1.20x | 1.20x |
+| 50 MS/s | 0.52x | 0.46x | 0.47x |
+
+Going from 8 to 512 channels costs under 45% more time, which is the polyphase
+bank behaving as advertised: channel count is nearly free, and the per-channel
+decode work parallelises cleanly.
+
+50 MS/s is not yet real time. The limit is the channelizer, which runs
+single-threaded at about 57 MS/s on its own; the per-channel graphs are not the
+problem. Fixing it means block-partitioning the channelizer across threads and
+SIMD in the polyphase inner loop, neither of which is done.
 
 ## Building
 

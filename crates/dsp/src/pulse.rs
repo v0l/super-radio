@@ -38,6 +38,25 @@ pub struct PulseConfig {
     /// Minimum ratio between signal and noise estimates before pulses are
     /// emitted at all, guarding against a package made entirely of noise.
     pub min_snr_db: f32,
+    /// Hard floor on the detection threshold, as a multiple of the tracked
+    /// noise mean.
+    ///
+    /// Without this the threshold is simply the midpoint between the noise and
+    /// signal estimates, which in silence collapses to about 1.5 times the
+    /// noise mean. The envelope of bandlimited Gaussian noise is Rayleigh
+    /// distributed and crosses 1.5 times its mean constantly, so the detector
+    /// spends idle time manufacturing pulses out of noise.
+    ///
+    /// The effect is much worse in a narrow channel, which is what makes this
+    /// a channelizer problem rather than a theoretical one: noise in a 31 kHz
+    /// channel decorrelates eight times more slowly than in a 250 kHz span, so
+    /// each excursion lasts eight times longer and comfortably survives
+    /// `min_mark_us`. A wideband detector can get away with the sloppy
+    /// threshold; a per-channel one cannot.
+    ///
+    /// A Rayleigh envelope exceeds 3.5 times its mean with probability about
+    /// 2e-6, so that is the default.
+    pub noise_threshold_ratio: f32,
 }
 
 impl Default for PulseConfig {
@@ -55,6 +74,7 @@ impl Default for PulseConfig {
             hysteresis: 0.2,
             tau_us: 500.0,
             min_snr_db: 6.0,
+            noise_threshold_ratio: 3.5,
         }
     }
 }
@@ -185,8 +205,11 @@ impl OokDetector {
                 self.seeded = true;
             }
 
-            let mid = 0.5 * (self.noise + self.signal);
-            let hyst = self.cfg.hysteresis * (self.signal - self.noise).max(0.0);
+            // Midpoint between the two estimates, but never closer to the
+            // noise than `noise_threshold_ratio` allows.
+            let mid = (0.5 * (self.noise + self.signal))
+                .max(self.noise * self.cfg.noise_threshold_ratio);
+            let hyst = self.cfg.hysteresis * (self.signal - mid).max(0.0);
             let thresh = if self.high { mid - hyst } else { mid + hyst };
             let now_high = v > thresh;
 

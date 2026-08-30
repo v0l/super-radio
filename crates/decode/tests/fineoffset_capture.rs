@@ -13,7 +13,7 @@
 use decode::{Protocol, Protocols};
 use decode::protocol::Value;
 use decode::protocols::FineOffsetWh1080;
-use dsp::{OokDetector, PulseConfig};
+use dsp::{FirDecim, OokDetector, PulseConfig};
 use sources::FileSource;
 
 const FIXTURE: &str = "fineoffset_wh1080_433.92M_250k.cu8";
@@ -29,12 +29,24 @@ fn packages() -> Option<Vec<dsp::Package>> {
     let path = fixture_path()?;
     let src = FileSource::open(&path).expect("open fixture");
     let buf = src.read_all().expect("read fixture");
-    let env: Vec<f32> = buf.samples.iter().map(|c| c.norm()).collect();
+
+    // Filter to roughly the signal's bandwidth before taking the envelope.
+    // The transmission occupies about 4 kHz, so in the full 250 kHz span 98%
+    // of the power in the envelope is noise and the signal sits only 12.5 dB
+    // above it. Decimating by 8 first cuts the noise by 9 dB and takes the
+    // detector from marginal to comfortable. Detecting on an unfiltered
+    // wideband envelope is always the wrong thing to do.
+    const DECIM: usize = 8;
+    let mut dec = FirDecim::design(DECIM, 0.9, 80.0);
+    let mut narrow = Vec::new();
+    dec.process(&buf.samples, &mut narrow);
+    let rate = buf.rate.as_f64() / DECIM as f64;
+    let env: Vec<f32> = narrow.iter().map(|c| c.norm()).collect();
 
     // Fine Offset's inter-symbol gaps run near 1 ms, so the reset must be well
     // clear of that or one transmission is split into many packages.
     let cfg = PulseConfig { reset_us: 10_000, min_pulses: 20, ..Default::default() };
-    let mut d = OokDetector::new(buf.rate.as_f64(), cfg);
+    let mut d = OokDetector::new(rate, cfg);
     let mut pkgs = Vec::new();
     d.process(&env, &mut pkgs);
     Some(pkgs)

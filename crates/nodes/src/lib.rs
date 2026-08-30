@@ -6,9 +6,11 @@
 //! discrimination instead of an envelope), and that should be a
 //! reconfiguration rather than a recompile.
 
+pub mod bank;
 pub mod decode_nodes;
 pub mod dsp_nodes;
 
+pub use bank::{ChannelBank, ChannelEvent, Gating};
 pub use decode_nodes::{ProtocolDecodeNode, PulseDetectNode};
 pub use dsp_nodes::{
     DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, MixerNode, RealDecimateNode,
@@ -105,6 +107,7 @@ pub fn registry() -> Registry {
                 min_pulses: s.i64_or("min_pulses", d.min_pulses as i64).max(1) as usize,
                 min_snr_db: s.f64_or("min_snr_db", d.min_snr_db as f64) as f32,
                 hysteresis: s.f64_or("hysteresis", d.hysteresis as f64) as f32,
+                noise_threshold_ratio: s.f64_or("noise_threshold_ratio", d.noise_threshold_ratio as f64) as f32,
                 tau_us: s.f64_or("tau_us", d.tau_us as f64) as f32,
             };
             Ok(Box::new(PulseDetectNode::new(cfg)) as Box<dyn Node>)
