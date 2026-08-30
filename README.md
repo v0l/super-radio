@@ -182,6 +182,12 @@ To check the signal path without a display:
 cargo run --release -p app -- --probe 95.8
 ```
 
+## Running in the browser
+
+Not implemented. [`docs/web.md`](docs/web.md) has the plan: what crosses
+unchanged, what has to be rewritten, and why the wideband bank does not make
+the trip.
+
 ## Reference implementations
 
 Decoders worth reading before writing our own, all MIT and all pure Rust:

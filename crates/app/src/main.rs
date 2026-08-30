@@ -82,6 +82,93 @@ fn probe(mhz: f64, listen: bool) {
     }
 }
 
+/// Report what is actually in the multiplex at a given station.
+///
+/// Guessing at why RDS will not decode is expensive: the pilot, the difference
+/// subcarrier and RDS are all at known frequencies, so measuring their levels
+/// says immediately whether the problem is the receiver or the transmitter.
+fn mpx_report(mhz: f64) {
+    use common::{Hz, Sps};
+    use dsp::rds::RdsDemod;
+    use dsp::{FirDecim, FmDemod, StereoDecoder};
+    use std::f64::consts::TAU;
+
+    let rate = 2_304_000.0;
+    let Some(entry) = devices::list().into_iter().next() else {
+        println!("no radio found");
+        return;
+    };
+    let mut dev = match devices::open(&entry) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("open failed: {e}");
+            return;
+        }
+    };
+    dev.set_rate(Sps(rate as u64)).ok();
+    dev.set_center(Hz((mhz * 1e6) as u64)).ok();
+    dev.set_gain("tuner", common::device::GainMode::Auto).ok();
+    let mut stream = match dev.start_rx() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("start failed: {e}");
+            return;
+        }
+    };
+
+    let dec = 7usize;
+    let if_rate = rate / dec as f64;
+    let mut iff = FirDecim::design_hz(rate, dec, 132_000.0, 70.0);
+    let mut fm = FmDemod::new(if_rate, 75_000.0);
+    let mut st = StereoDecoder::new(if_rate);
+    let mut rds = RdsDemod::new(if_rate);
+    let (mut iq, mut disc) = (Vec::new(), Vec::new());
+    let (mut l, mut r, mut bits) = (Vec::new(), Vec::new(), Vec::new());
+
+    let g = |x: &[f32], f: f64| {
+        let k = TAU * f / if_rate;
+        let c = 2.0 * k.cos();
+        let (mut a, mut b) = (0.0f64, 0.0f64);
+        for &v in x {
+            let t = v as f64 + c * a - b;
+            b = a;
+            a = t;
+        }
+        (a * a + b * b - c * a * b).sqrt() / x.len() as f64
+    };
+
+    let start = std::time::Instant::now();
+    let mut n = 0;
+    while start.elapsed().as_secs() < 12 {
+        let Ok(buf) = stream.read() else { break };
+        iq.clear();
+        iff.process(&buf.samples, &mut iq);
+        disc.clear();
+        fm.process(&iq, &mut disc);
+        st.process(&disc, &mut l, &mut r);
+        bits.clear();
+        rds.process(&disc, st.phases(), &mut bits);
+        n += 1;
+        if n % 12 != 0 {
+            continue;
+        }
+        let db = |v: f64, r: f64| 20.0 * (v / r.max(1e-15)).log10();
+        let a1 = g(&disc, 1_000.0);
+        println!(
+            "pilot19 {:6.1} dB   diff38 {:6.1} dB   rds57 {:6.1} dB   (ref audio 1 kHz)                lock {:.2} blend {:.2} | rds level {:.5} arm {} margin {:.2} locked {}",
+            db(g(&disc, 19_000.0), a1),
+            db(g(&disc, 38_000.0), a1),
+            db(g(&disc, 57_000.0), a1),
+            st.lock(),
+            st.blend(),
+            rds.level(),
+            rds.timing().0,
+            rds.timing().1,
+            rds.timing_locked(),
+        );
+    }
+}
+
 /// Time the per-channel audio chain against real time, which is the only
 /// number that decides whether the radio thread can keep draining USB.
 fn bench_audio() {
@@ -123,6 +210,10 @@ fn main() -> eframe::Result<()> {
     let a: Vec<String> = std::env::args().collect();
     if a.iter().any(|x| x == "--bench-audio") {
         bench_audio();
+        return Ok(());
+    }
+    if let Some(i) = a.iter().position(|x| x == "--mpx") {
+        mpx_report(a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8));
         return Ok(());
     }
     if let Some(i) = a.iter().position(|x| x == "--probe") {
