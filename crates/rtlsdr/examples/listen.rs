@@ -5,7 +5,7 @@
 use audio::AudioPlayer;
 use common::device::{Device, GainMode};
 use common::{Hz, Sps, C32};
-use dsp::{Deemphasis, FirDecim, FmDemod, Mixer};
+use dsp::{Deemphasis, FirDecim, FmDemod, HighBlend, Mixer, NoiseMeter};
 
 /// 2.304 MS/s / 8 / 6 = exactly 48 kHz, so no resampling is needed anywhere.
 const RF_RATE: u64 = 2_304_000;
@@ -44,6 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cutoff = if narrow { 3_500.0 } else { 15_000.0 };
     let mut audio_dec = FirDecim::design(AUDIO_DECIM, cutoff / (AUDIO_RATE / 2.0), 80.0);
     let mut deemph = Deemphasis::eu(AUDIO_RATE);
+    let mut noise = NoiseMeter::new(IF_RATE);
+    let mut blend = HighBlend::new(AUDIO_RATE);
+    let blend_on = !a.iter().any(|x| x == "--no-blend");
 
     println!(
         "\n{:.4} MHz {}  RF {} -> IF {IF_RATE} -> audio {AUDIO_RATE}\nCtrl-C to stop",
@@ -69,8 +72,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cx.extend(disc.iter().map(|v| C32::new(*v, 0.0)));
         au.clear();
         audio_dec.process(&cx, &mut au);
+        let n = noise.process(&disc);
         let mut pcm: Vec<f32> = au.iter().map(|c| c.re * 0.5).collect();
         deemph.process(&mut pcm);
+        if blend_on {
+            blend.process(n, &mut pcm);
+        }
         sink.write_adaptive(&pcm, AUDIO_RATE);
         if last.elapsed().as_secs() >= 2 {
             last = std::time::Instant::now();
@@ -84,8 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s.dropped.load(std::sync::atomic::Ordering::Relaxed),
                 s.underruns.load(std::sync::atomic::Ordering::Relaxed),
             );
-            println!("       backlog {} samples  drift correction {:+.1} ppm",
-                sink.backlog(), sink.drift_ppm());
+            println!("       backlog {} samples  drift {:+.1} ppm  noise {:.4}  treble cut {:.0} Hz",
+                sink.backlog(), sink.drift_ppm(), noise.level(), blend.cutoff());
         }
     }
 }

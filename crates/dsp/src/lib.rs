@@ -4,6 +4,7 @@
 //! sample. Parallelism is the caller's business, so these types are `Send` but
 //! not internally threaded.
 
+pub mod blend;
 pub mod channelizer;
 pub mod demod;
 pub mod detect;
@@ -12,6 +13,7 @@ pub mod mixer;
 pub mod pulse;
 pub mod window;
 
+pub use blend::{HighBlend, NoiseMeter, VariableLowpass};
 pub use channelizer::Channelizer;
 pub use demod::{AmDemod, Deemphasis, FmDemod};
 pub use detect::{Burst, Detector, DetectorConfig, NoiseFloor};
