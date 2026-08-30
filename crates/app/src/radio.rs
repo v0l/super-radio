@@ -4,9 +4,13 @@
 use audio::AudioPlayer;
 use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use dsp::{Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum};
+use dsp::rds::{BlockSync, GroupDecoder, RdsDemod};
+use dsp::{
+    Deemphasis, FirDecim, FirDecimReal, FmDemod, HighBlend, Mixer, NoiseMeter, Spectrum,
+    StereoDecoder,
+};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
@@ -95,6 +99,30 @@ pub struct Status {
     pub running: AtomicBool,
     pub audio_backlog: AtomicU64,
     pub error: parking_lot::Mutex<Option<String>>,
+    /// Stereo separation currently applied, as f32 bits.
+    blend: AtomicU32,
+    /// Station name, programme type and radiotext, when RDS is decoding.
+    station: parking_lot::Mutex<StationInfo>,
+}
+
+/// What the UI shows about the tuned station.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StationInfo {
+    pub pi: Option<u16>,
+    pub name: Option<String>,
+    pub pty: Option<&'static str>,
+    pub radiotext: Option<String>,
+    /// Groups accepted and blocks rejected. The ratio is the honest measure of
+    /// RDS reception: a station can be loud and still undecodable.
+    pub groups: u64,
+    pub block_errors: u64,
+    pub synced: bool,
+}
+
+impl StationInfo {
+    pub fn is_empty(&self) -> bool {
+        self.pi.is_none() && self.name.is_none() && self.radiotext.is_none()
+    }
 }
 
 impl Default for Status {
@@ -104,7 +132,46 @@ impl Default for Status {
             running: AtomicBool::new(false),
             audio_backlog: AtomicU64::new(0),
             error: parking_lot::Mutex::new(None),
+            blend: AtomicU32::new(0),
+            station: parking_lot::Mutex::new(StationInfo::default()),
         }
+    }
+}
+
+impl Status {
+    pub fn blend(&self) -> f32 {
+        f32::from_bits(self.blend.load(Ordering::Relaxed))
+    }
+
+    fn set_blend(&self, v: f32) {
+        self.blend.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn station(&self) -> StationInfo {
+        self.station.lock().clone()
+    }
+
+    fn set_station(&self, s: &dsp::rds::Station, groups: u64, errors: u64, synced: bool) {
+        let next = StationInfo {
+            pi: s.pi,
+            name: s.name.clone(),
+            pty: s.pty_name(),
+            radiotext: s.radiotext.clone(),
+            groups,
+            block_errors: errors,
+            synced,
+        };
+        let mut cur = self.station.lock();
+        // Only take the lock's write cost when something actually changed;
+        // this runs on every audio block.
+        if *cur != next {
+            *cur = next;
+        }
+    }
+
+    fn clear_station(&self) {
+        *self.station.lock() = StationInfo::default();
+        self.set_blend(0.0);
     }
 }
 
@@ -174,6 +241,22 @@ pub struct Audio {
     iq: Vec<C32>,
     disc: Vec<f32>,
     pcm: Vec<f32>,
+    /// Stereo and RDS, both driven by one pilot PLL. Only built for WFM: the
+    /// pilot exists nowhere else.
+    stereo: Option<StereoDecoder>,
+    rds: Option<RdsDemod>,
+    sync: BlockSync,
+    groups: GroupDecoder,
+    au_dec_r: FirDecimReal,
+    deemph_r: Deemphasis,
+    /// Per-channel filter state. Sharing one instance across both channels
+    /// runs each block through the other channel's history.
+    blend_r: HighBlend,
+    inter: Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    pcm_r: Vec<f32>,
+    bits: Vec<u8>,
 }
 
 impl Audio {
@@ -197,7 +280,40 @@ impl Audio {
             iq: Vec::new(),
             disc: Vec::new(),
             pcm: Vec::new(),
+            // RDS sits at 57 kHz, so it needs an IF that actually reaches it.
+            stereo: (mode == Demod::Wfm).then(|| StereoDecoder::new(if_rate)),
+            rds: (mode == Demod::Wfm && if_rate > 130_000.0)
+                .then(|| RdsDemod::new(if_rate)),
+            sync: BlockSync::new(),
+            groups: GroupDecoder::new(),
+            au_dec_r: FirDecimReal::design_hz(if_rate, au_dec, mode.audio_bw(), 70.0),
+            deemph_r: Deemphasis::eu(audio_rate),
+            blend_r: HighBlend::new(audio_rate),
+            inter: Vec::new(),
+            left: Vec::new(),
+            right: Vec::new(),
+            pcm_r: Vec::new(),
+            bits: Vec::new(),
         }
+    }
+
+    /// Whether `process` returns interleaved stereo.
+    pub fn is_stereo(&self) -> bool {
+        self.stereo.is_some()
+    }
+
+    /// Applied separation, 0 mono to 1 full.
+    pub fn stereo_blend(&self) -> f32 {
+        self.stereo.as_ref().map(|s| s.blend()).unwrap_or(0.0)
+    }
+
+    pub fn station(&self) -> &dsp::rds::Station {
+        self.groups.station()
+    }
+
+    /// Groups decoded, blocks rejected, and whether framing is currently held.
+    pub fn rds_stats(&self) -> (u64, u64, bool) {
+        (self.sync.groups, self.sync.errors, self.sync.is_synced())
     }
 
     pub fn cost(&self) -> String {
@@ -223,6 +339,10 @@ impl Audio {
         }
         let n = self.noise.process(&self.disc);
 
+        if self.stereo.is_some() {
+            return self.process_stereo(n, gain);
+        }
+
         self.pcm.clear();
         self.au_dec.process(&self.disc, &mut self.pcm);
         for v in self.pcm.iter_mut() {
@@ -233,6 +353,43 @@ impl Audio {
         }
         self.blend.process(n, &mut self.pcm);
         &self.pcm
+    }
+
+    /// Interleaved stereo, plus RDS off the same PLL.
+    fn process_stereo(&mut self, noise: f32, gain: f32) -> &[f32] {
+        let st = self.stereo.as_mut().unwrap();
+        st.process(&self.disc, &mut self.left, &mut self.right);
+
+        if let Some(rds) = &mut self.rds {
+            self.bits.clear();
+            rds.process(&self.disc, st.phases(), &mut self.bits);
+            for b in &self.bits {
+                if let Some(g) = self.sync.push(*b) {
+                    self.groups.push(&g);
+                }
+            }
+        }
+
+        self.pcm.clear();
+        self.pcm_r.clear();
+        self.au_dec.process(&self.left, &mut self.pcm);
+        self.au_dec_r.process(&self.right, &mut self.pcm_r);
+        for v in self.pcm.iter_mut().chain(self.pcm_r.iter_mut()) {
+            *v *= gain;
+        }
+        self.deemph.process(&mut self.pcm);
+        self.deemph_r.process(&mut self.pcm_r);
+        self.blend.process(noise, &mut self.pcm);
+        self.blend_r.process(noise, &mut self.pcm_r);
+
+        let n = self.pcm.len().min(self.pcm_r.len());
+        self.inter.clear();
+        self.inter.reserve(n * 2);
+        for i in 0..n {
+            self.inter.push(self.pcm[i]);
+            self.inter.push(self.pcm_r[i]);
+        }
+        &self.inter
     }
 }
 
@@ -318,6 +475,8 @@ fn run(
 
         if retune {
             audio = listen.map(|off| Audio::new(off, cur_rate, mode, 48_000.0));
+            // The old station's name must not linger over the new one.
+            status.clear_station();
             retune = false;
         }
 
@@ -352,9 +511,17 @@ fn run(
         let _a = tracing::info_span!("audio").entered();
         if let (Some(a), Some(s)) = (audio.as_mut(), sink.as_mut()) {
             let rate = a.audio_rate;
+            let stereo = a.is_stereo();
             let pcm = a.process(&buf.samples, volume);
-            s.write_adaptive(pcm, rate);
+            if stereo {
+                s.write_adaptive_stereo(pcm, rate);
+            } else {
+                s.write_adaptive(pcm, rate);
+            }
             status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
+            status.set_blend(a.stereo_blend());
+            let (g, e, sy) = a.rds_stats();
+            status.set_station(a.station(), g, e, sy);
         }
     }
 }
