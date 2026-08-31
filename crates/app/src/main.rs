@@ -464,6 +464,9 @@ fn main() -> eframe::Result<()> {
             if let Some(dir) = record.clone() {
                 app.record_to(dir, record_mb);
             }
+            if a.iter().any(|x| x == "--gain") {
+                app.show_radio_settings();
+            }
             if a.iter().any(|x| x == "--chain") {
                 app.show_chain();
             }

@@ -77,6 +77,17 @@ pub trait Node: Send + 'static {
         None
     }
 
+    /// The mutable counterpart, for changing a running node's own settings.
+    ///
+    /// Parameters can also be set by name, and that is the right route for
+    /// anything generic like a chain editor. This is for the cases where the
+    /// caller already knows the type and wants its own API, such as a squelch
+    /// control that has to ask what the threshold is measured against before
+    /// it can label itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     fn num_inputs(&self) -> usize {
         1
     }
@@ -183,6 +194,9 @@ impl<T: Simple + 'static> Node for T {
     /// occasionally and wrong for something a display wants on every frame,
     /// like the gain an AGC is currently applying.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
 }

@@ -565,6 +565,7 @@ pub struct AgcNode {
     release_ms: f64,
     hang_ms: f64,
     max_gain_db: f32,
+    enabled: bool,
     agc: Agc,
 }
 
@@ -575,6 +576,7 @@ impl AgcNode {
             release_ms,
             hang_ms,
             max_gain_db: 60.0,
+            enabled: true,
             agc: Agc::new(48_000.0, attack_ms, release_ms, hang_ms),
         }
     }
@@ -589,8 +591,22 @@ impl AgcNode {
 }
 
 impl AgcNode {
+    /// Gain currently applied, or 0 dB when switched off.
     pub fn gain_db(&self) -> f32 {
-        self.agc.gain_db()
+        if self.enabled { self.agc.gain_db() } else { 0.0 }
+    }
+
+    pub fn set_enabled(&mut self, on: bool) {
+        // Reset on the way back in, so switching it on does not apply a gain
+        // worked out from a signal that was there a minute ago.
+        if on && !self.enabled {
+            self.agc.reset();
+        }
+        self.enabled = on;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 }
 
@@ -611,6 +627,9 @@ impl Simple for AgcNode {
     fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
         let out = o.real_mut();
         out.extend_from_slice(i.as_real().unwrap());
+        if !self.enabled {
+            return Ok(());
+        }
         self.agc.process(out);
         // Reported rather than hidden: on a weak signal the gain is the
         // difference between "the band is dead" and "the receiver is deaf",
@@ -634,6 +653,7 @@ impl Simple for AgcNode {
             Param::float("max_gain_db", self.max_gain_db as f64, 0.0..=90.0)
                 .unit("dB")
                 .label("Maximum gain"),
+            Param::bool("enabled", self.enabled).label("Enabled"),
         ]
     }
 
@@ -645,6 +665,10 @@ impl Simple for AgcNode {
             "max_gain_db" => {
                 self.max_gain_db = v.as_f64().unwrap_or(60.0) as f32;
                 self.agc.set_max_gain_db(self.max_gain_db);
+                return Ok(());
+            }
+            "enabled" => {
+                self.set_enabled(v.as_bool().unwrap_or(true));
                 return Ok(());
             }
             _ => return Err(common::Error::other(format!("agc: unknown parameter {name:?}"))),
@@ -701,6 +725,21 @@ impl SquelchNode {
     /// What the squelch measured on the last block, in dB.
     pub fn measured_db(&self) -> f32 {
         self.measured
+    }
+
+    /// Where the squelch opens, in dB on whatever it is measuring.
+    pub fn threshold_db(&self) -> f32 {
+        self.threshold_db
+    }
+
+    pub fn set_threshold_db(&mut self, db: f32) {
+        self.threshold_db = db;
+        self.squelch.set_thresholds(db, db - self.hysteresis_db);
+    }
+
+    /// What the threshold means for this squelch, for a control to label.
+    pub fn kind(&self) -> SquelchKind {
+        self.kind
     }
 }
 

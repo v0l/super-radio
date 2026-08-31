@@ -11,7 +11,9 @@ pub mod pulse;
 pub mod value;
 pub mod units;
 
-pub use device::{Device, DeviceInfo, DriverKind, GainMode, RxStream, TunerRange};
+pub use device::{
+    Device, DeviceInfo, DriverKind, GainMode, GainStage, RxStream, Toggle, TunerRange,
+};
 pub use error::{Error, Result};
 pub use iq::{IqBuf, SampleFormat, C32};
 pub use pulse::{Package, Pulse};

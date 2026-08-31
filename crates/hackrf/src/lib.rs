@@ -45,7 +45,7 @@ pub struct HackRfDevice {
     info: DeviceInfo,
     center: Hz,
     rate: Sps,
-    gain_db: f32,
+    stages: gain::Stages,
     /// Set while streaming so tuning still works without stopping RX.
     ctrl: Option<AsyncReadControlHandle>,
 }
@@ -74,10 +74,35 @@ impl HackRfDevice {
             }],
             rates: Vec::new(),
             rate_range: Sps(RATE_MIN)..=Sps(RATE_MAX),
-            // One control, distributed across the three stages. Exposing all
-            // three separately is more honest but makes every caller implement
-            // the same policy.
-            gain_stages: vec![("tuner".into(), 0.0..=gain::MAX_DB)],
+            // The three real stages, in signal path order. A caller that
+            // wants one number still has "tuner", which distributes across
+            // them, but a control panel should show what the hardware has.
+            gain_stages: vec![
+                common::GainStage {
+                    name: "amp".into(),
+                    label: "Front end amp".into(),
+                    range: 0.0..=gain::AMP_DB,
+                    values: vec![0.0, gain::AMP_DB],
+                    step: gain::AMP_DB,
+                    auto: false,
+                },
+                common::GainStage {
+                    name: "lna".into(),
+                    label: "LNA (sets noise figure)".into(),
+                    range: 0.0..=40.0,
+                    values: Vec::new(),
+                    step: 8.0,
+                    auto: false,
+                },
+                common::GainStage {
+                    name: "vga".into(),
+                    label: "Baseband VGA (drives the ADC)".into(),
+                    range: 0.0..=62.0,
+                    values: Vec::new(),
+                    step: 2.0,
+                    auto: false,
+                },
+            ],
             native_format: SampleFormat::Cs8,
             usable_bandwidth_ratio: USABLE_RATIO,
         };
@@ -87,7 +112,7 @@ impl HackRfDevice {
             info,
             center: Hz(100_000_000),
             rate: Sps(8_000_000),
-            gain_db: 32.0,
+            stages: gain::Stages::from_total(32.0),
             ctrl: None,
         };
         d.set_rate(Sps(8_000_000))?;
@@ -105,7 +130,7 @@ impl HackRfDevice {
     }
 
     fn apply_gain(&self) -> Result<()> {
-        let (amp, lna, vga) = gain::distribute(self.gain_db);
+        let gain::Stages { amp, lna, vga } = self.stages;
         if let Some(c) = &self.ctrl {
             c.set_amp_enable(amp).map_err(map_err)?;
             c.set_lna_gain(lna).map_err(map_err)?;
@@ -171,35 +196,25 @@ impl Device for HackRfDevice {
     fn set_gain(&mut self, stage: &str, mode: GainMode) -> Result<()> {
         // No AGC in this hardware, so "auto" is a sensible fixed operating
         // point rather than a silent no-op.
-        self.gain_db = match mode {
+        let db = match mode {
             GainMode::Auto => 32.0,
             GainMode::Manual(db) => db,
         };
-        match stage {
-            "tuner" | "" => self.apply_gain(),
-            "lna" => {
-                let v = gain::quantise_lna(self.gain_db);
-                match &self.ctrl {
-                    Some(c) => c.set_lna_gain(v).map_err(map_err),
-                    None => self.hw()?.set_lna_gain(v).map_err(map_err),
-                }
-            }
-            "vga" => {
-                let v = gain::quantise_vga(self.gain_db);
-                match &self.ctrl {
-                    Some(c) => c.set_vga_gain(v).map_err(map_err),
-                    None => self.hw()?.set_vga_gain(v).map_err(map_err),
-                }
-            }
-            "amp" => {
-                let on = self.gain_db > 0.0;
-                match &self.ctrl {
-                    Some(c) => c.set_amp_enable(on).map_err(map_err),
-                    None => self.hw()?.set_amp_enable(on).map_err(map_err),
-                }
-            }
-            other => Err(Error::other(format!("no gain stage named {other}"))),
+        if !self.stages.set(stage, db) {
+            return Err(Error::other(format!("no gain stage named {stage}")));
         }
+        self.apply_gain()
+    }
+
+    fn gains(&self) -> Vec<(String, GainMode)> {
+        vec![
+            (
+                "amp".into(),
+                GainMode::Manual(if self.stages.amp { gain::AMP_DB } else { 0.0 }),
+            ),
+            ("lna".into(), GainMode::Manual(self.stages.lna as f32)),
+            ("vga".into(), GainMode::Manual(self.stages.vga as f32)),
+        ]
     }
 
     fn start_rx(&mut self) -> Result<Box<dyn RxStream>> {

@@ -18,6 +18,44 @@ pub const AMP_DB: f32 = 14.0;
 /// Total gain available across all three stages.
 pub const MAX_DB: f32 = AMP_DB + 40.0 + 62.0;
 
+/// What each of the three stages is set to.
+///
+/// One field per stage because they are separate controls on the hardware.
+/// They used to share a single number, so setting the VGA dragged the LNA to
+/// the same value and back through the quantiser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stages {
+    pub amp: bool,
+    pub lna: u32,
+    pub vga: u32,
+}
+
+impl Stages {
+    pub fn from_total(db: f32) -> Self {
+        let (amp, lna, vga) = distribute(db);
+        Self { amp, lna, vga }
+    }
+
+    /// Set one stage by name, leaving the others alone. Returns false for a
+    /// name this hardware does not have.
+    pub fn set(&mut self, stage: &str, db: f32) -> bool {
+        match stage {
+            "tuner" | "" => *self = Self::from_total(db),
+            // Half the amp's contribution, so that either end of a slider
+            // does the obvious thing and the midpoint switches it in.
+            "amp" => self.amp = db >= AMP_DB / 2.0,
+            "lna" => self.lna = quantise_lna(db),
+            "vga" => self.vga = quantise_vga(db),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn total_db(&self) -> f32 {
+        (if self.amp { AMP_DB } else { 0.0 }) + self.lna as f32 + self.vga as f32
+    }
+}
+
 /// Distribute a requested total across (amp, lna, vga).
 ///
 /// Split roughly evenly rather than filling the LNA first. The two stages do
@@ -49,6 +87,18 @@ mod tests {
     fn achieved(db: f32) -> u32 {
         let (a, l, v) = distribute(db);
         (if a { AMP_DB as u32 } else { 0 }) + l + v
+    }
+
+    #[test]
+    fn each_stage_keeps_its_own_value() {
+        let mut st = Stages::from_total(32.0);
+        st.set("lna", 24.0);
+        st.set("vga", 10.0);
+        assert_eq!((st.lna, st.vga), (24, 10));
+        st.set("vga", 40.0);
+        assert_eq!(st.lna, 24, "setting the VGA moved the LNA");
+        assert!(st.set("amp", 14.0) && st.amp);
+        assert!(!st.set("nonexistent", 0.0));
     }
 
     #[test]

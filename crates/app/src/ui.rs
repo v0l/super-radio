@@ -114,6 +114,9 @@ pub struct App {
 pub enum Settings {
     Spectrum,
     Waterfall,
+    /// The radio's own controls: gain stages, its switches, and the
+    /// corrections applied to what comes off it.
+    Radio,
 }
 
 /// A decode, plus where the waterfall was when it arrived.
@@ -131,6 +134,10 @@ pub struct Channel {
     freq: f64,
     demod: Demod,
     label: String,
+    /// Where the squelch opens. None means the mode's own default, which is
+    /// what an operator who has never touched the control should get.
+    squelch_db: Option<f32>,
+    agc: bool,
 }
 
 const FFTS: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
@@ -282,6 +289,8 @@ impl App {
             freq,
             demod,
             label: format!("{mhz:.1}"),
+            squelch_db: None,
+            agc: true,
         });
         self.listen(self.channels.len() - 1);
     }
@@ -543,17 +552,26 @@ impl App {
             freq,
             demod: bands::demod_at(freq),
             label: format!("CH{id}"),
+            squelch_db: None,
+            agc: true,
         });
         self.listen(self.channels.len() - 1);
     }
 
     fn listen(&mut self, idx: usize) {
         let Some(ch) = self.channels.get(idx) else { return };
-        let (freq, demod) = (ch.freq, ch.demod);
+        let (freq, demod, squelch, agc) = (ch.freq, ch.demod, ch.squelch_db, ch.agc);
         self.listening = Some(idx);
         self.send(Cmd::Demod(demod));
         self.send(Cmd::Listen(Some(freq - self.center)));
         self.send(Cmd::Volume(self.volume));
+        // After the mode, because changing mode rebuilds the chain and a
+        // setting sent before it would be applied to a chain about to be
+        // thrown away.
+        self.send(Cmd::Agc(agc));
+        if let Some(db) = squelch {
+            self.send(Cmd::Squelch(db));
+        }
     }
 
     fn retune_listener(&mut self) {
@@ -565,6 +583,58 @@ impl App {
             }
         }
     }
+}
+
+/// A line of explanation under a control.
+///
+/// Added through `Label` with wrapping asked for explicitly: inside a modal
+/// the surrounding layout justifies text, which spreads a wrapped sentence
+/// across the full width and leaves holes in the middle of it.
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(text).small().color(theme::LEGEND)).wrap());
+}
+
+/// A squelch control that shows what it is deciding against.
+///
+/// A threshold with no meter beside it is a number to guess at: the operator
+/// cannot tell whether 9 dB is one above the noise or ten below the station.
+/// The bar is what the squelch is measuring right now, the marker is where it
+/// opens, and dragging moves the marker.
+fn squelch_meter(
+    ui: &mut egui::Ui,
+    lo: f32,
+    hi: f32,
+    measured: f32,
+    threshold: &mut f32,
+    open: bool,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(120.0, 12.0), egui::Sense::click_and_drag());
+    let at = |v: f32| {
+        let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+        rect.left() + t * rect.width()
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, theme::PANEL);
+    let fill = egui::Rect::from_min_max(rect.min, egui::pos2(at(measured), rect.max.y));
+    // Coloured by the decision rather than by the level, so a glance says
+    // whether audio is getting through without reading the numbers.
+    p.rect_filled(fill, 2.0, if open { theme::TRACE } else { theme::LEGEND });
+    let x = at(*threshold);
+    p.line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        egui::Stroke::new(1.5, theme::VALUE),
+    );
+
+    let mut changed = false;
+    if let Some(pos) = resp.interact_pointer_pos() {
+        if resp.dragged() || resp.clicked() {
+            let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            *threshold = lo + t * (hi - lo);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// A labelled settings row: legend on the left, control on the right, so the
@@ -804,6 +874,9 @@ impl App {
                             if ui.add_enabled(on, egui::Button::new("STOP")).clicked() {
                                 self.stop();
                             }
+                            if ui.add_enabled(on, egui::Button::new("GAIN")).clicked() {
+                                self.open = Some(Settings::Radio);
+                            }
                         });
                     });
 
@@ -930,16 +1003,18 @@ impl App {
         let title = match which {
             Settings::Spectrum => "Spectrum",
             Settings::Waterfall => "Waterfall",
+            Settings::Radio => "Radio",
         };
         let r = egui::containers::Modal::new(egui::Id::new(title))
             .backdrop_color(Color32::from_black_alpha(150))
             .show(ctx, |ui| {
-                ui.set_width(320.0);
+                ui.set_width(if which == Settings::Radio { 420.0 } else { 320.0 });
                 ui.label(legend(title));
                 ui.add_space(10.0);
                 match which {
                     Settings::Spectrum => self.spectrum_settings(ui),
                     Settings::Waterfall => self.waterfall_settings(ui),
+                    Settings::Radio => self.radio_settings(ui),
                 }
                 ui.add_space(12.0);
                 ui.separator();
@@ -955,6 +1030,110 @@ impl App {
         if r.should_close() {
             self.open = None;
         }
+    }
+
+    /// Everything the radio itself can be set to.
+    ///
+    /// Separate from the spectrum and waterfall settings because it is a
+    /// different kind of thing: those change what you see, these change what
+    /// the receiver does, and getting them wrong costs sensitivity or
+    /// intermodulation rather than a prettier display.
+    fn radio_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(radio) = self.radio.as_ref() else {
+            ui.label(legend("no radio running"));
+            return;
+        };
+        let controls = radio.status.radio();
+        if controls.stages.is_empty() && controls.toggles.is_empty() {
+            ui.label(legend("this device has no adjustable stages"));
+            return;
+        }
+
+        for (stage, mode) in &controls.stages {
+            let auto = *mode == GainMode::Auto;
+            let mut db = match mode {
+                GainMode::Auto => *stage.range.start(),
+                GainMode::Manual(v) => *v,
+            };
+            ui.horizontal(|ui| {
+                ui.label(legend(&stage.label));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if stage.auto && ui.selectable_label(auto, "AUTO").clicked() {
+                        self.send(Cmd::GainStage(
+                            stage.name.clone(),
+                            if auto { GainMode::Manual(db) } else { GainMode::Auto },
+                        ));
+                    }
+                    // Under AUTO the number is the hardware's business and
+                    // showing a stale one invites the operator to believe it.
+                    let text =
+                        if auto { "auto".to_string() } else { format!("{db:.1} dB") };
+                    ui.label(value(&text).size(11.0));
+                });
+            });
+            let lo = *stage.range.start();
+            let hi = *stage.range.end();
+            // Snapped as it is dragged, because the hardware does it anyway:
+            // a slider that glides between values the tuner cannot reach shows
+            // a number the receiver is not using.
+            let slider = egui::Slider::new(&mut db, lo..=hi).show_value(false);
+            if ui.add_enabled(!auto, slider).changed() {
+                let want = stage.quantise(db);
+                self.send(Cmd::GainStage(stage.name.clone(), GainMode::Manual(want)));
+            }
+            if !stage.values.is_empty() {
+                hint(ui, &format!("{} steps, {lo:.0} to {hi:.0} dB", stage.values.len()));
+            } else if stage.step > 0.0 {
+                hint(ui, &format!("{:.0} dB steps, {lo:.0} to {hi:.0} dB", stage.step));
+            }
+            ui.add_space(10.0);
+        }
+
+        if !controls.toggles.is_empty() {
+            ui.separator();
+            ui.add_space(6.0);
+            for t in &controls.toggles {
+                if ui.selectable_label(t.on, &t.label).clicked() {
+                    self.send(Cmd::Toggle(t.name.clone(), !t.on));
+                }
+                hint(ui, &t.help);
+                ui.add_space(8.0);
+            }
+        }
+
+        ui.separator();
+        ui.add_space(6.0);
+        row(ui, "Correction", |ui| {
+            let mut ppm = controls.ppm;
+            if ui
+                .add(egui::DragValue::new(&mut ppm).speed(0.5).range(-200.0..=200.0).suffix(" ppm"))
+                .changed()
+            {
+                self.send(Cmd::Ppm(ppm));
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "The reference oscillator is a few tens of parts per million out on a cheap dongle, which is a kilohertz or two at 145 MHz and rather more higher up. Tune a known carrier and correct until it sits on its nominal frequency.",
+            )
+            .small()
+            .color(theme::LEGEND),
+        );
+        ui.add_space(10.0);
+
+        let mut dc = self.dc_block;
+        if ui.selectable_label(dc, "Remove the DC spur").clicked() {
+            dc = !dc;
+            self.dc_block = dc;
+            self.send(Cmd::DcBlock(dc));
+        }
+        ui.label(
+            egui::RichText::new(
+                "A direct conversion receiver leaks its own local oscillator into the middle of the span, where it looks exactly like a carrier on the frequency you are tuned to. This measures the offset and subtracts it.",
+            )
+            .small()
+            .color(theme::LEGEND),
+        );
     }
 
     fn spectrum_settings(&mut self, ui: &mut egui::Ui) {
@@ -1126,20 +1305,48 @@ impl App {
     /// Worth a line of its own because on a weak signal these two are the
     /// difference between a band that is dead and a receiver that is muted,
     /// and without them both look and sound identical.
-    fn channel_audio(ui: &mut egui::Ui, demod: Demod, gain_db: f32, open: bool) {
-        if demod == Demod::Wfm {
-            return;
-        }
+    fn channel_audio(
+        ui: &mut egui::Ui,
+        ch: &mut Channel,
+        gain_db: f32,
+        open: bool,
+        measured: f32,
+    ) -> bool {
+        let mut changed = false;
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(legend("agc"));
-            ui.label(value(&format!("{gain_db:+.0} dB")).size(10.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !open {
-                    ui.label(value("MUTED").size(10.0).color(theme::LEGEND));
+        if ch.demod != Demod::Wfm {
+            ui.horizontal(|ui| {
+                ui.label(legend("agc"));
+                if ui.selectable_label(ch.agc, if ch.agc { "ON" } else { "OFF" }).clicked() {
+                    ch.agc = !ch.agc;
+                    changed = true;
                 }
+                if ch.agc {
+                    ui.label(value(&format!("{gain_db:+.0} dB")).size(10.0));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !open {
+                        ui.label(value("MUTED").size(10.0).color(theme::LEGEND));
+                    }
+                });
             });
-        });
+        }
+        if let Some(default) = ch.demod.default_squelch_db() {
+            let (lo, hi, ratio) = ch.demod.squelch_range();
+            let mut db = ch.squelch_db.unwrap_or(default);
+            ui.horizontal(|ui| {
+                ui.label(legend("sql"));
+                if squelch_meter(ui, lo, hi, measured, &mut db, open) {
+                    ch.squelch_db = Some(db);
+                    changed = true;
+                }
+                ui.label(
+                    value(&format!("{db:.0}{}", if ratio { "" } else { " dBFS" }))
+                        .size(10.0),
+                );
+            });
+        }
+        changed
     }
 
     /// What the radio is hearing on the channel being listened to.
@@ -1225,7 +1432,7 @@ impl App {
                     .radio
                     .as_ref()
                     .map(|r| (r.status.station(), r.status.blend()));
-                let audio = self.radio.as_ref().map(|r| r.status.audio_gain());
+                let audio = self.radio.as_ref().map(|r| r.status.audio_state());
                 let mut remove = None;
                 let mut tune = None;
                 for (i, ch) in self.channels.iter_mut().enumerate() {
@@ -1296,8 +1503,10 @@ impl App {
                                 if let Some((st, blend)) = &live {
                                     Self::channel_rds(ui, st, *blend);
                                 }
-                                if let Some((gain, open)) = audio {
-                                    Self::channel_audio(ui, ch.demod, gain, open);
+                                if let Some((gain, open, measured)) = audio {
+                                    if Self::channel_audio(ui, ch, gain, open, measured) {
+                                        tune = Some(i);
+                                    }
                                 }
                             }
                         });
@@ -1322,6 +1531,11 @@ impl App {
 
     /// Open on the chain view, for screenshots and for starting where the
     /// operator left off.
+    /// Open the radio's own controls, for a screenshot or a quick check.
+    pub fn show_radio_settings(&mut self) {
+        self.open = Some(Settings::Radio);
+    }
+
     pub fn show_chain(&mut self) {
         self.view = View::Chain;
     }
@@ -1978,13 +2192,13 @@ impl App {
         }
         let text = match (shift, raster) {
             (true, Some(r)) => {
-                format!("{}   {}   snap {}", fmt_hz(hz), bands::name_at(hz), fmt_hz(r.step))
+                format!("{} {} snap {}", fmt_hz(hz), bands::name_at(hz), fmt_hz(r.step))
             }
-            (true, None) => format!("{}   {}   no channel plan", fmt_hz(hz), bands::name_at(hz)),
+            (true, None) => format!("{} {} no channel plan", fmt_hz(hz), bands::name_at(hz)),
             _ => match raster {
                 // Advertise the gesture only where it would do something.
-                Some(_) => format!("{}   {}   shift to snap", fmt_hz(hz), bands::name_at(hz)),
-                None => format!("{}   {}", fmt_hz(hz), bands::name_at(hz)),
+                Some(_) => format!("{} {} shift to snap", fmt_hz(hz), bands::name_at(hz)),
+                None => format!("{} {}", fmt_hz(hz), bands::name_at(hz)),
             },
         };
         let g = p.layout_no_wrap(
@@ -2026,7 +2240,7 @@ fn fmt_db(v: f32) -> String {
     if v.is_finite() {
         format!("{v:6.1}")
     } else {
-        "     -".into()
+        " -".into()
     }
 }
 
@@ -2400,6 +2614,8 @@ mod tests {
                 freq: *f,
                 demod: Demod::Wfm,
                 label: "t".into(),
+                squelch_db: None,
+                agc: true,
             });
         }
         a
