@@ -21,6 +21,14 @@
 
 pub use common::pulse::{Package, Pulse};
 
+/// Amplitude to dB relative to a full scale sample.
+///
+/// Amplitude, not power, so the reference is 1.0 rather than 0.5, and a signal
+/// filling the ADC reads as 0 dBFS.
+pub(crate) fn dbfs(amplitude: f32) -> f32 {
+    20.0 * amplitude.max(1e-9).log10()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PulseConfig {
     /// Gap longer than this ends the package, in microseconds.
@@ -59,6 +67,111 @@ pub struct PulseConfig {
     pub noise_threshold_ratio: f32,
 }
 
+/// Tracks the noise and signal levels of an envelope and says, per sample,
+/// whether a carrier is present.
+///
+/// Shared by the OOK detector, where the answer *is* the data, and the FSK
+/// detector, where it only gates which samples are worth measuring the
+/// frequency of. Both need the same adaptive threshold, and an ISM receiver
+/// that gets it wrong either hears nothing or hears noise all day.
+#[derive(Clone, Debug)]
+pub struct LevelGate {
+    alpha: f32,
+    hysteresis: f32,
+    min_ratio: f32,
+    noise_threshold_ratio: f32,
+    noise: f32,
+    signal: f32,
+    high: bool,
+    seeded: bool,
+}
+
+impl LevelGate {
+    pub fn new(rate: f64, tau_us: f32, hysteresis: f32, min_snr_db: f32, noise_ratio: f32) -> Self {
+        let tau_samples = (tau_us * (rate as f32) / 1e6).max(1.0);
+        Self {
+            alpha: 1.0 / tau_samples,
+            hysteresis,
+            min_ratio: 10f32.powf(min_snr_db / 20.0),
+            noise_threshold_ratio: noise_ratio,
+            noise: 0.0,
+            signal: 0.0,
+            high: false,
+            seeded: false,
+        }
+    }
+
+    pub fn noise_level(&self) -> f32 {
+        self.noise
+    }
+
+    pub fn signal_level(&self) -> f32 {
+        self.signal
+    }
+
+    pub fn snr_db(&self) -> f32 {
+        20.0 * (self.signal.max(1e-20) / self.noise.max(1e-20)).log10()
+    }
+
+    pub fn is_high(&self) -> bool {
+        self.high
+    }
+
+    pub fn reset(&mut self) {
+        self.high = false;
+        self.seeded = false;
+    }
+
+    /// Feed one envelope sample and return whether it is above threshold.
+    pub fn update(&mut self, v: f32) -> bool {
+        self.update_learning(v, true)
+    }
+
+    /// As [`Self::update`], but `learn_noise` can hold the noise estimate
+    /// still.
+    ///
+    /// A detector that keys on amplitude must freeze it for the duration of a
+    /// burst. The low level of a shallow ASK signal is below threshold, so an
+    /// unfrozen estimate learns *it* as the noise floor, the floor under the
+    /// threshold then rises above the high level, and the gate declares the
+    /// whole packet absent.
+    pub fn update_learning(&mut self, v: f32, learn_noise: bool) -> bool {
+        if !self.seeded {
+            self.noise = v;
+            self.signal = v * 4.0;
+            self.seeded = true;
+        }
+
+        // Midpoint between the two estimates, but never closer to the noise
+        // than `noise_threshold_ratio` allows.
+        let mid = (0.5 * (self.noise + self.signal)).max(self.noise * self.noise_threshold_ratio);
+        let hyst = self.hysteresis * (self.signal - mid).max(0.0);
+        let thresh = if self.high { mid - hyst } else { mid + hyst };
+        let now_high = v > thresh;
+
+        // Track each level only while in that state, so a long transmission
+        // cannot pull the noise estimate up after itself.
+        if now_high {
+            self.signal += self.alpha * (v - self.signal);
+            // Without this clamp the detector destroys itself. A single noise
+            // spike crosses the threshold, the signal estimate then adapts
+            // *down* towards that noise, which lowers the threshold, which
+            // admits more noise. The estimator converges on the noise floor
+            // and emits hundreds of spurious micro-pulses. Holding the signal
+            // estimate at least `min_snr_db` above the noise breaks the loop.
+            let floor = self.noise * self.min_ratio;
+            if self.signal < floor {
+                self.signal = floor;
+            }
+        } else if learn_noise {
+            self.noise += self.alpha * (v - self.noise);
+        }
+
+        self.high = now_high;
+        now_high
+    }
+}
+
 impl Default for PulseConfig {
     fn default() -> Self {
         Self {
@@ -88,9 +201,7 @@ pub struct OokDetector {
     rate: f64,
     /// Microseconds per sample.
     us_per_sample: f64,
-    alpha: f32,
-    noise: f32,
-    signal: f32,
+    gate: LevelGate,
     /// Currently above threshold.
     high: bool,
     run: u64,
@@ -102,7 +213,6 @@ pub struct OokDetector {
     /// crossings folded into it.
     gap_accum: u32,
     sample: u64,
-    seeded: bool,
     stats: PulseStats,
 }
 
@@ -119,13 +229,17 @@ pub struct PulseStats {
     pub rejected_low_snr: u64,
     /// Marks discarded for being shorter than `min_mark_us`.
     pub rejected_short_marks: u64,
+    /// FSK only: bursts whose two frequency levels were too close together to
+    /// be a keyed signal, which is what a plain carrier or an OOK burst looks
+    /// like to a discriminator.
+    pub rejected_no_separation: u64,
     /// Bursts emitted.
     pub accepted: u64,
 }
 
 impl PulseStats {
     pub fn rejected_total(&self) -> u64 {
-        self.rejected_too_few_pulses + self.rejected_low_snr
+        self.rejected_too_few_pulses + self.rejected_low_snr + self.rejected_no_separation
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,21 +250,23 @@ impl PulseStats {
 impl OokDetector {
     pub fn new(rate: f64, cfg: PulseConfig) -> Self {
         let us_per_sample = 1e6 / rate;
-        let tau_samples = (cfg.tau_us / us_per_sample as f32).max(1.0);
         Self {
             cfg,
             rate,
             us_per_sample,
-            alpha: 1.0 / tau_samples,
-            noise: 0.0,
-            signal: 0.0,
+            gate: LevelGate::new(
+                rate,
+                cfg.tau_us,
+                cfg.hysteresis,
+                cfg.min_snr_db,
+                cfg.noise_threshold_ratio,
+            ),
             high: false,
             run: 0,
             current: Package::default(),
             pending_mark: 0,
             gap_accum: 0,
             sample: 0,
-            seeded: false,
             stats: PulseStats::default(),
         }
     }
@@ -169,15 +285,15 @@ impl OokDetector {
     }
 
     pub fn noise_level(&self) -> f32 {
-        self.noise
+        self.gate.noise_level()
     }
 
     pub fn signal_level(&self) -> f32 {
-        self.signal
+        self.gate.signal_level()
     }
 
     pub fn snr_db(&self) -> f32 {
-        20.0 * (self.signal.max(1e-20) / self.noise.max(1e-20)).log10()
+        self.gate.snr_db()
     }
 
     pub fn reset(&mut self) {
@@ -186,7 +302,7 @@ impl OokDetector {
         self.current = Package::default();
         self.pending_mark = 0;
         self.gap_accum = 0;
-        self.seeded = false;
+        self.gate.reset();
     }
 
     fn us(&self, samples: u64) -> u32 {
@@ -196,41 +312,9 @@ impl OokDetector {
     /// Feed an envelope block, appending any completed packages to `out`.
     pub fn process(&mut self, env: &[f32], out: &mut Vec<Package>) {
         let reset_samples = (self.cfg.reset_us as f64 / self.us_per_sample) as u64;
-        let min_ratio = 10f32.powf(self.cfg.min_snr_db / 20.0);
 
         for &v in env {
-            if !self.seeded {
-                self.noise = v;
-                self.signal = v * 4.0;
-                self.seeded = true;
-            }
-
-            // Midpoint between the two estimates, but never closer to the
-            // noise than `noise_threshold_ratio` allows.
-            let mid = (0.5 * (self.noise + self.signal))
-                .max(self.noise * self.cfg.noise_threshold_ratio);
-            let hyst = self.cfg.hysteresis * (self.signal - mid).max(0.0);
-            let thresh = if self.high { mid - hyst } else { mid + hyst };
-            let now_high = v > thresh;
-
-            // Track each level only while in that state, so a long
-            // transmission cannot pull the noise estimate up after itself.
-            if now_high {
-                self.signal += self.alpha * (v - self.signal);
-                // Without this clamp the detector destroys itself. A single
-                // noise spike crosses the threshold, the signal estimate then
-                // adapts *down* towards that noise, which lowers the
-                // threshold, which admits more noise. The estimator converges
-                // on the noise floor and emits hundreds of spurious
-                // micro-pulses. Holding the signal estimate at least
-                // `min_snr_db` above the noise breaks the feedback loop.
-                let floor = self.noise * min_ratio;
-                if self.signal < floor {
-                    self.signal = floor;
-                }
-            } else {
-                self.noise += self.alpha * (v - self.noise);
-            }
+            let now_high = self.gate.update(v);
 
             if now_high != self.high {
                 let dur = self.us(self.run);
@@ -282,6 +366,7 @@ impl OokDetector {
                     if snr >= self.cfg.min_snr_db {
                         let mut p = std::mem::take(&mut self.current);
                         p.snr_db = snr;
+                        p.rssi_dbfs = dbfs(self.gate.signal_level());
                         out.push(p);
                         self.stats.accepted += 1;
                     } else {

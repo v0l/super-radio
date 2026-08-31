@@ -213,6 +213,8 @@ struct ChannelState {
     since_active: u64,
     /// Peak power held since the last read, for display.
     peak_hold: f32,
+    /// Whether the burst was open at any point in the current block.
+    seen_open: bool,
 }
 
 /// Watches every channel of a channelizer and reports bursts.
@@ -241,6 +243,7 @@ impl Detector {
             n_snr: 0,
             since_active: u64::MAX,
             peak_hold: 0.0,
+            seen_open: false,
         };
         Self {
             cfg,
@@ -289,6 +292,9 @@ impl Detector {
         let cfg = self.cfg;
         let alpha = self.alpha;
         let start = self.frame;
+        for st in &mut self.ch {
+            st.seen_open = false;
+        }
 
         let finished: Vec<Vec<Burst>> = self
             .ch
@@ -340,6 +346,7 @@ impl ChannelState {
         // Peak hold stays on the instantaneous value: it exists for display,
         // where seeing the true peak of a short burst is the whole point.
         st.peak_hold = st.peak_hold.max(power);
+        st.seen_open |= st.open;
 
         // Seed on the first frame rather than from zero. Starting at zero
         // makes the integrator ramp up from silence, and the floor tracker
@@ -421,6 +428,17 @@ impl Detector {
         self.ch.get(ch).map(|s| s.open).unwrap_or(false)
     }
 
+    /// Whether a burst was open at any point during the last block, rather
+    /// than at the instant the block ended.
+    ///
+    /// This is the question a caller gating work per block actually has. Most
+    /// ISM transmissions are shorter than one block, so asking [`Self::is_open`]
+    /// after the fact reports a channel as idle precisely because its burst
+    /// began and ended inside the block that was being judged.
+    pub fn was_open(&self, ch: usize) -> bool {
+        self.ch.get(ch).map(|s| s.seen_open || s.open).unwrap_or(false)
+    }
+
     pub fn floor_db(&self, ch: usize) -> f32 {
         self.ch
             .get(ch)
@@ -463,6 +481,7 @@ impl Detector {
             s.seen = 0;
             s.open = false;
             s.peak_hold = 0.0;
+            s.seen_open = false;
             s.since_active = u64::MAX;
         }
         self.frame = 0;
@@ -591,6 +610,26 @@ mod tests {
             d.push_frame(&[rng.noise(0.01)]);
         }
         assert!(d.take_bursts().is_empty(), "impulse was reported as a burst");
+    }
+
+    #[test]
+    fn a_burst_inside_one_block_is_still_reported_as_open() {
+        // The question a caller gating per block has to ask. Most ISM
+        // transmissions are shorter than a block, so `is_open` after the fact
+        // says idle and the work gets skipped precisely when it was needed.
+        let mut d = Detector::new(1, DetectorConfig::default());
+        let mut lane: Vec<common::C32> = vec![common::C32::new(0.01, 0.0); 4_000];
+        for s in lane.iter_mut().skip(2_000).take(400) {
+            *s = common::C32::new(1.0, 0.0);
+        }
+        d.process_lanes(&[lane]);
+
+        assert!(!d.is_open(0), "the burst ended well before the block did");
+        assert!(d.was_open(0), "a burst inside the block went unreported");
+
+        // And the flag is per block, not sticky.
+        d.process_lanes(&[vec![common::C32::new(0.01, 0.0); 4_000]]);
+        assert!(!d.was_open(0), "the flag outlived the block it described");
     }
 
     #[test]

@@ -21,6 +21,20 @@ pub struct Package {
     pub pulses: Vec<Pulse>,
     /// Estimated SNR of the burst, in dB.
     pub snr_db: f32,
+    /// Received level in dB, referenced to a full scale sample *at the
+    /// detector's input*.
+    ///
+    /// Worth having next to the SNR rather than instead of it: a strong packet
+    /// in a noisy channel and a weak one in a quiet channel can share an SNR,
+    /// and only the level tells them apart or says the front end is clipping.
+    ///
+    /// Not calibrated to the antenna, and not quite calibrated to the ADC
+    /// either: every filter between the two has gain, so a very strong signal
+    /// reads a little above zero rather than pinning at it. Measured on the
+    /// Fine Offset capture through a channelizer it comes out at +1 dB. It is
+    /// a comparable number between packets on one receiver, which is what it
+    /// is for, and not a field strength.
+    pub rssi_dbfs: f32,
     /// Sample index where the burst started, for correlating with a waterfall.
     pub start_sample: u64,
 }
