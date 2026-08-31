@@ -166,6 +166,40 @@ impl Demod {
     }
 }
 
+/// Add one channel's audio to the mix, and report how many frames it covered.
+///
+/// Everything is mixed in stereo. A mono channel goes to both sides, which is
+/// what any receiver does with a mono station, and it means an FM broadcast in
+/// stereo can share the output with a narrowband channel that has no such
+/// thing without either of them needing to know.
+fn mix_into(mix: &mut Vec<f32>, pcm: &[f32], stereo: bool) -> usize {
+    let n = if stereo { pcm.len() / 2 } else { pcm.len() };
+    if mix.len() < n * 2 {
+        mix.resize(n * 2, 0.0);
+    }
+    for i in 0..n {
+        if stereo {
+            mix[i * 2] += pcm[i * 2];
+            mix[i * 2 + 1] += pcm[i * 2 + 1];
+        } else {
+            mix[i * 2] += pcm[i];
+            mix[i * 2 + 1] += pcm[i];
+        }
+    }
+    n
+}
+
+/// Hold the mix inside full scale.
+///
+/// Clipped rather than scaled to fit. Several channels at once can sum past
+/// full scale, and quietly turning everything down would make the level of
+/// the channel you are listening to depend on how busy its neighbours are.
+fn clip(mix: &mut [f32]) {
+    for v in mix.iter_mut() {
+        *v = v.clamp(-1.0, 1.0);
+    }
+}
+
 /// Reopen a radio at a new rate and start it streaming again.
 ///
 /// The gain is passed back in because opening a device resets it, and a span
@@ -214,9 +248,9 @@ pub enum Cmd {
     Center(Hz),
     Rate(Sps),
     Gain(GainMode),
-    /// Tune audio to an offset from centre, or mute.
-    Listen(Option<f64>),
-    Demod(Demod),
+    /// The complete set of channels to demodulate and mix.
+    Channels(Vec<ChannelSpec>),
+    /// Master volume, applied to the mix.
     Volume(f32),
     Fft(usize),
     /// Spectrum frames per second delivered to the UI.
@@ -237,16 +271,48 @@ pub enum Cmd {
     /// fraction of a pixel wide on any sensible display. This trades span for
     /// resolution without the radio being involved.
     Zoom(usize),
-    /// Where the squelch opens, in dB on whatever the mode measures.
-    Squelch(f32),
-    /// Gain control on or off.
-    Agc(bool),
     /// Decode every channel in the span, or stop doing so.
     Decode(bool),
     /// Write every burst that decodes to this directory, with an optional
     /// budget in megabytes, or stop recording.
     Record(Option<(std::path::PathBuf, Option<u64>)>),
     Stop,
+}
+
+/// One channel the receiver should be demodulating.
+///
+/// The whole set is sent whenever any of it changes, and the radio thread
+/// works out what that means: a different frequency or mode rebuilds that
+/// channel's chain, a different volume does not.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelSpec {
+    /// Stable across edits, so a channel keeps its chain when its neighbour
+    /// is removed. An index would not survive that.
+    pub id: u64,
+    /// From the receiver's centre frequency.
+    pub offset_hz: f64,
+    pub demod: Demod,
+    pub volume: f32,
+    pub muted: bool,
+    /// None leaves the mode's own default.
+    pub squelch_db: Option<f32>,
+    pub agc: bool,
+}
+
+/// What one running channel is doing, for its controls to show.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChannelState {
+    pub id: u64,
+    pub agc_gain_db: f32,
+    pub squelch_open: bool,
+    pub squelch_db: f32,
+    pub stereo_blend: f32,
+}
+
+/// A channel being demodulated, and the chain doing it.
+struct Live {
+    spec: ChannelSpec,
+    audio: Audio,
 }
 
 /// One spectrum update.
@@ -598,15 +664,11 @@ pub struct Status {
     pub error: parking_lot::Mutex<Option<String>>,
     /// Stereo separation currently applied, as f32 bits.
     blend: AtomicU32,
-    /// Gain the audio AGC is applying, as f32 bits, and whether the squelch is
-    /// passing anything. Both are what a listener needs to tell a dead band
-    /// from a deaf receiver.
-    agc_gain: AtomicU32,
-    squelch_open: AtomicBool,
-    /// What the squelch measured on the last block, as f32 bits.
-    squelch_level: AtomicU32,
+
     /// The radio's own controls, republished whenever one of them moves.
     radio: parking_lot::Mutex<RadioControls>,
+    /// What each running channel is doing, one entry per channel.
+    channels: parking_lot::Mutex<Vec<ChannelState>>,
     /// Station name, programme type and radiotext, when RDS is decoding.
     station: parking_lot::Mutex<StationInfo>,
     /// Shape of the chain currently demodulating, republished on every rebuild.
@@ -684,10 +746,9 @@ impl Default for Status {
             audio_backlog: AtomicU64::new(0),
             error: parking_lot::Mutex::new(None),
             blend: AtomicU32::new(0),
-            agc_gain: AtomicU32::new(0),
-            squelch_open: AtomicBool::new(true),
-            squelch_level: AtomicU32::new(0),
+
             radio: parking_lot::Mutex::new(RadioControls::default()),
+            channels: parking_lot::Mutex::new(Vec::new()),
             station: parking_lot::Mutex::new(StationInfo::default()),
             chain: parking_lot::Mutex::new(None),
             chain_latency: AtomicU32::new(0),
@@ -713,20 +774,18 @@ impl Status {
         *self.radio.lock() = c;
     }
 
-    /// Gain the AGC is applying in dB, whether audio is getting through, and
-    /// what the squelch measured.
-    pub fn audio_state(&self) -> (f32, bool, f32) {
-        (
-            f32::from_bits(self.agc_gain.load(Ordering::Relaxed)),
-            self.squelch_open.load(Ordering::Relaxed),
-            f32::from_bits(self.squelch_level.load(Ordering::Relaxed)),
-        )
+    /// What every running channel is doing.
+    pub fn channel_states(&self) -> Vec<ChannelState> {
+        self.channels.lock().clone()
     }
 
-    fn set_audio_state(&self, db: f32, open: bool, measured: f32) {
-        self.agc_gain.store(db.to_bits(), Ordering::Relaxed);
-        self.squelch_open.store(open, Ordering::Relaxed);
-        self.squelch_level.store(measured.to_bits(), Ordering::Relaxed);
+    /// One channel's state by id, for the controls that belong to it.
+    pub fn channel_state(&self, id: u64) -> Option<ChannelState> {
+        self.channels.lock().iter().find(|c| c.id == id).copied()
+    }
+
+    fn set_channel_states(&self, states: Vec<ChannelState>) {
+        *self.channels.lock() = states;
     }
 
     fn set_blend(&self, v: f32) {
@@ -1167,12 +1226,11 @@ fn run(
     status.running.store(true, Ordering::Relaxed);
     status.set_radio(RadioControls::read(dev.as_ref()));
 
-    let mut audio: Option<Audio> = None;
-    // Held here rather than only inside the chain, because the chain is
-    // rebuilt on every retune and mode change and the operator's settings
-    // must survive that.
-    let mut squelch_db: f32 = f32::NAN;
-    let mut agc_on = true;
+    // Every channel being listened to, each with its own chain. They all see
+    // the same samples and their audio is summed.
+    let mut live: Vec<Live> = Vec::new();
+    let mut wanted: Vec<ChannelSpec> = Vec::new();
+    let mut mix: Vec<f32> = Vec::new();
     // Software zoom: the radio keeps sampling at its own rate and everything
     // downstream sees a decimated copy.
     let mut zoom: usize = 1;
@@ -1185,14 +1243,15 @@ fn run(
     let mut scan_on = true;
     let mut rec: Option<crate::record::Recorder> = None;
     let mut records: Vec<DecodeRecord> = Vec::new();
-    let mut listen: Option<f64> = None;
-    let mut mode = Demod::Wfm;
     let mut volume = 0.5f32;
     let mut refresh = 30.0f32;
     let mut next_frame = std::time::Instant::now();
     let mut cur_rate = dev.rate().as_f64();
     let mut cur_center = dev.center().as_f64();
     let mut retune = false;
+    // A rate or span change invalidates every chain, where an edit to the
+    // channel list does not.
+    let mut rebuild = false;
     let mut want_center: Option<Hz> = None;
     let gap = tune_gap();
     let mut last_tune = std::time::Instant::now() - gap;
@@ -1236,6 +1295,7 @@ fn run(
                     cur_rate = dev.rate().as_f64();
                     spec.reset();
                     retune = true;
+                    rebuild = true;
                     // The notch width is set from the rate.
                     dc = None;
                     // A different span is a different set of channels, so the
@@ -1255,12 +1315,8 @@ fn run(
                     // Gain changes move the offset with it.
                     dc = None;
                 }
-                Cmd::Listen(o) => {
-                    listen = o;
-                    retune = true;
-                }
-                Cmd::Demod(d) => {
-                    mode = d;
+                Cmd::Channels(specs) => {
+                    wanted = specs;
                     retune = true;
                 }
                 Cmd::Volume(v) => volume = v,
@@ -1301,18 +1357,6 @@ fn run(
                     status.set_radio(RadioControls::read(dev.as_ref()));
                     retune = true;
                 }
-                Cmd::Squelch(db) => {
-                    squelch_db = db;
-                    if let Some(a) = audio.as_mut() {
-                        a.set_squelch_threshold(db);
-                    }
-                }
-                Cmd::Agc(on) => {
-                    agc_on = on;
-                    if let Some(a) = audio.as_mut() {
-                        a.set_agc_enabled(on);
-                    }
-                }
                 Cmd::Record(dir) => {
                     rec = match dir {
                         Some((d, mb)) => match crate::record::Recorder::new(
@@ -1339,6 +1383,7 @@ fn run(
                         narrow = None;
                         spec.reset();
                         retune = true;
+                        rebuild = true;
                         // Every downstream stage is built for a sample rate,
                         // so all of them are rebuilt rather than adjusted.
                         scan = scan_on.then(|| Scanner::new(eff_rate(cur_rate, zoom), dev.center()));
@@ -1357,37 +1402,65 @@ fn run(
 
         if retune {
             let rate = eff_rate(cur_rate, zoom);
-            // A span narrower than the demodulator's own IF cannot be
-            // demodulated: there is nothing to filter down to. Better to say
-            // so than to build a chain whose decimators all collapse to one
-            // and hand back noise.
-            if listen.is_some() && rate < mode.if_rate() {
-                *status.error.lock() = Some(format!(
-                    "{} needs a span of at least {:.0} kHz; this one is {:.0} kHz",
-                    mode.label(),
-                    mode.if_rate() / 1e3,
-                    rate / 1e3,
-                ));
-            }
-            audio = listen
-                .filter(|_| rate >= mode.if_rate())
-                .map(|off| {
-                let mut a = Audio::new(off, rate, mode, 48_000.0);
-                // A rebuilt chain starts at the mode's defaults, so anything
-                // the operator set has to be put back on top of it.
-                if squelch_db.is_finite() {
-                    a.set_squelch_threshold(squelch_db);
+            // Chains are kept across edits and rebuilt only when what they
+            // are demodulating changes. Rebuilding all of them on every
+            // volume nudge would restart each AGC and drop the RDS decoder's
+            // state along with the station name it had recovered.
+            live.retain(|l| wanted.iter().any(|w| w.id == l.spec.id));
+            let mut refused: Option<String> = None;
+            for want in &wanted {
+                let same = |a: &ChannelSpec, b: &ChannelSpec| {
+                    a.demod == b.demod && (a.offset_hz - b.offset_hz).abs() < 1.0
+                };
+                match live.iter_mut().find(|l| l.spec.id == want.id) {
+                    Some(l) if same(&l.spec, want) && !rebuild => {
+                        if l.spec.agc != want.agc {
+                            l.audio.set_agc_enabled(want.agc);
+                        }
+                        if l.spec.squelch_db != want.squelch_db {
+                            if let Some(db) = want.squelch_db {
+                                l.audio.set_squelch_threshold(db);
+                            }
+                        }
+                        l.spec = want.clone();
+                    }
+                    _ => {
+                        if rate < want.demod.if_rate() {
+                            refused = Some(format!(
+                                "{} needs a span of at least {:.0} kHz; this one is {:.0} kHz",
+                                want.demod.label(),
+                                want.demod.if_rate() / 1e3,
+                                rate / 1e3,
+                            ));
+                            live.retain(|l| l.spec.id != want.id);
+                            continue;
+                        }
+                        let mut audio = Audio::new(want.offset_hz, rate, want.demod, 48_000.0);
+                        if let Some(db) = want.squelch_db {
+                            audio.set_squelch_threshold(db);
+                        }
+                        audio.set_agc_enabled(want.agc);
+                        let l = Live { spec: want.clone(), audio };
+                        match live.iter_mut().find(|x| x.spec.id == want.id) {
+                            Some(slot) => *slot = l,
+                            None => live.push(l),
+                        }
+                    }
                 }
-                a.set_agc_enabled(agc_on);
-                a
-            });
+            }
+            *status.error.lock() = refused;
+            // The chain view shows one chain, and the first channel is the
+            // one it shows.
             status.set_chain(
-                audio.as_ref().map(|a| a.graph().topology()),
-                audio.as_ref().map(|a| a.latency_ms()).unwrap_or(0.0),
+                live.first().map(|l| l.audio.graph().topology()),
+                live.first().map(|l| l.audio.latency_ms()).unwrap_or(0.0),
             );
-            // The old station's name must not linger over the new one.
-            status.clear_station();
+            if !live.iter().any(|l| l.spec.demod == Demod::Wfm) {
+                // The old station's name must not linger over the new one.
+                status.clear_station();
+            }
             retune = false;
+            rebuild = false;
         }
 
         // Retuning costs about 25 ms on the RTL-SDR, more than a frame at
@@ -1518,20 +1591,42 @@ fn run(
         }
 
         let _a = tracing::info_span!("audio").entered();
-        if let (Some(a), Some(s)) = (audio.as_mut(), sink.as_mut()) {
-            let rate = a.audio_rate;
-            let stereo = a.is_stereo();
-            let pcm = a.process(&buf.samples, volume);
-            if stereo {
-                s.write_adaptive_stereo(pcm, rate);
-            } else {
-                s.write_adaptive(pcm, rate);
+        if let Some(s) = sink.as_mut() {
+            // Every channel demodulates the same samples and their audio is
+            // summed. Mixing in stereo throughout keeps one path: a mono
+            // channel is written to both sides, which is what a receiver does
+            // with a mono station anyway, and it means an FM broadcast in
+            // stereo can share the output with a narrowband channel that has
+            // no such thing.
+            let mut frames = 0usize;
+            let mut rate = 48_000.0;
+            mix.clear();
+            let mut states = Vec::with_capacity(live.len());
+            for l in live.iter_mut() {
+                let stereo = l.audio.is_stereo();
+                rate = l.audio.audio_rate;
+                let gain = if l.spec.muted { 0.0 } else { l.spec.volume * volume };
+                let pcm = l.audio.process(&buf.samples, gain);
+                frames = frames.max(mix_into(&mut mix, pcm, stereo));
+                states.push(ChannelState {
+                    id: l.spec.id,
+                    agc_gain_db: l.audio.agc_gain_db(),
+                    squelch_open: l.audio.squelch_open(),
+                    squelch_db: l.audio.squelch_db(),
+                    stereo_blend: l.audio.stereo_blend(),
+                });
             }
-            status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
-            status.set_blend(a.stereo_blend());
-            status.set_audio_state(a.agc_gain_db(), a.squelch_open(), a.squelch_db());
-            let (g, e, sy) = a.rds_stats();
-            status.set_station(a.station(), g, e, sy);
+            status.set_channel_states(states);
+            if frames > 0 {
+                clip(&mut mix[..frames * 2]);
+                s.write_adaptive_stereo(&mix[..frames * 2], rate);
+                status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
+            }
+            if let Some(w) = live.iter_mut().find(|l| l.spec.demod == Demod::Wfm) {
+                status.set_blend(w.audio.stereo_blend());
+                let (g, e, sy) = w.audio.rds_stats();
+                status.set_station(w.audio.station(), g, e, sy);
+            }
         }
     }
 }
@@ -2222,5 +2317,52 @@ mod zoom_tests {
         let leaked = tail.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
         let db = 20.0 * leaked.max(1e-12).log10();
         assert!(db < -60.0, "a signal outside the span folded in at {db:.1} dBFS");
+    }
+}
+
+#[cfg(test)]
+mod mixer_tests {
+    use super::*;
+
+    #[test]
+    fn a_mono_channel_is_heard_on_both_sides() {
+        let mut mix = Vec::new();
+        let n = mix_into(&mut mix, &[0.5, -0.5], false);
+        assert_eq!(n, 2);
+        assert_eq!(mix, vec![0.5, 0.5, -0.5, -0.5]);
+    }
+
+    #[test]
+    fn channels_sum_rather_than_replace_each_other() {
+        // The whole point of a mixer: two stations at once, not the last one
+        // to be processed.
+        let mut mix = Vec::new();
+        mix_into(&mut mix, &[0.25; 4], false);
+        mix_into(&mut mix, &[0.25; 4], false);
+        assert!(mix.iter().all(|v| (*v - 0.5).abs() < 1e-6), "{mix:?}");
+    }
+
+    #[test]
+    fn a_stereo_channel_keeps_its_sides_apart() {
+        let mut mix = Vec::new();
+        mix_into(&mut mix, &[1.0, -1.0, 1.0, -1.0], true);
+        assert_eq!(mix, vec![1.0, -1.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn a_longer_channel_does_not_truncate_a_shorter_one() {
+        let mut mix = Vec::new();
+        mix_into(&mut mix, &[1.0; 2], false);
+        let n = mix_into(&mut mix, &[1.0; 6], false);
+        assert_eq!(n, 6);
+        assert_eq!(&mix[..4], &[2.0, 2.0, 2.0, 2.0], "the short channel was lost");
+        assert_eq!(&mix[4..], &[1.0; 8]);
+    }
+
+    #[test]
+    fn a_loud_mix_clips_rather_than_wrapping() {
+        let mut mix = vec![1.6, -1.6, 0.2];
+        clip(&mut mix);
+        assert_eq!(mix, vec![1.0, -1.0, 0.2]);
     }
 }

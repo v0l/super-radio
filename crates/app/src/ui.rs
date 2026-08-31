@@ -2,7 +2,9 @@
 
 use crate::bands;
 use crate::dial::Dial;
-use crate::radio::{Cmd, DecodeRecord, Demod, Frame, Radio, StationInfo};
+use crate::radio::{
+    ChannelSpec, ChannelState, Cmd, DecodeRecord, Demod, Frame, Radio, StationInfo,
+};
 use crate::theme::{self, legend, value};
 use crate::waterfall::Waterfall;
 use crate::wheel::Wheel;
@@ -42,6 +44,7 @@ pub struct App {
     wf_top_offset: f32,
     wf_rows: usize,
     channels: Vec<Channel>,
+    /// The channel whose chain the signal chain view shows.
     listening: Option<usize>,
     volume: f32,
     next_id: u32,
@@ -133,9 +136,17 @@ pub struct Logged {
 }
 
 pub struct Channel {
+    /// Stable for the life of the channel, so the radio thread can keep its
+    /// chain when a different channel is removed.
+    id: u64,
     freq: f64,
     demod: Demod,
     label: String,
+    /// Whether this channel is being demodulated into the mix.
+    on: bool,
+    /// Its own level in the mix, before the master volume.
+    volume: f32,
+    muted: bool,
     /// Where the squelch opens. None means the mode's own default, which is
     /// what an operator who has never touched the control should get.
     squelch_db: Option<f32>,
@@ -305,15 +316,25 @@ impl App {
     /// without a dozen clicks first.
     pub fn tune_to(&mut self, mhz: f64, demod: Demod) {
         let freq = mhz * 1e6;
-        self.center = freq;
-        self.send(Cmd::Center(common::Hz(freq as u64)));
+        // The first channel sets where the receiver points; later ones are
+        // added around it, since a second call moving the centre would drag
+        // the first channel to the edge of the span or out of it.
+        if self.channels.is_empty() {
+            self.center = freq;
+            self.send(Cmd::Center(common::Hz(freq as u64)));
+        }
         self.channels.push(Channel {
+            id: self.next_id as u64,
             freq,
             demod,
             label: format!("{mhz:.1}"),
+            on: true,
+            volume: 0.8,
+            muted: false,
             squelch_db: None,
             agc: true,
         });
+        self.next_id += 1;
         self.listen(self.channels.len() - 1);
     }
 
@@ -572,39 +593,61 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         self.channels.push(Channel {
+            id: id as u64,
             freq,
             demod: bands::demod_at(freq),
             label: format!("CH{id}"),
+            on: true,
+            volume: 0.8,
+            muted: false,
             squelch_db: None,
             agc: true,
         });
-        self.listen(self.channels.len() - 1);
+        self.listening = Some(self.channels.len() - 1);
+        self.send_channels();
+    }
+
+    /// Hand the radio the whole channel list.
+    ///
+    /// The whole list rather than an edit, because the radio thread is the
+    /// one that knows which chains it already has: sending it the state it
+    /// should be in leaves no way for the two to disagree, and it keeps the
+    /// chains of channels that did not change.
+    fn send_channels(&mut self) {
+        let specs = self.channel_specs();
+        self.send(Cmd::Channels(specs));
+    }
+
+    fn channel_specs(&self) -> Vec<ChannelSpec> {
+        let center = self.center;
+        self.channels
+            .iter()
+            .filter(|c| c.on)
+            .map(|c| ChannelSpec {
+                id: c.id,
+                offset_hz: c.freq - center,
+                demod: c.demod,
+                volume: c.volume,
+                muted: c.muted,
+                squelch_db: c.squelch_db,
+                agc: c.agc,
+            })
+            .collect()
     }
 
     fn listen(&mut self, idx: usize) {
-        let Some(ch) = self.channels.get(idx) else { return };
-        let (freq, demod, squelch, agc) = (ch.freq, ch.demod, ch.squelch_db, ch.agc);
-        self.listening = Some(idx);
-        self.send(Cmd::Demod(demod));
-        self.send(Cmd::Listen(Some(freq - self.center)));
-        self.send(Cmd::Volume(self.volume));
-        // After the mode, because changing mode rebuilds the chain and a
-        // setting sent before it would be applied to a chain about to be
-        // thrown away.
-        self.send(Cmd::Agc(agc));
-        if let Some(db) = squelch {
-            self.send(Cmd::Squelch(db));
+        if let Some(ch) = self.channels.get_mut(idx) {
+            ch.on = true;
         }
+        self.listening = Some(idx);
+        self.send_channels();
     }
 
     fn retune_listener(&mut self) {
-        match self.listening {
-            Some(i) if i < self.channels.len() => self.listen(i),
-            _ => {
-                self.listening = None;
-                self.send(Cmd::Listen(None));
-            }
+        if self.listening.is_some_and(|i| i >= self.channels.len()) {
+            self.listening = None;
         }
+        self.send_channels();
     }
 }
 
@@ -1342,13 +1385,8 @@ impl App {
     /// Worth a line of its own because on a weak signal these two are the
     /// difference between a band that is dead and a receiver that is muted,
     /// and without them both look and sound identical.
-    fn channel_audio(
-        ui: &mut egui::Ui,
-        ch: &mut Channel,
-        gain_db: f32,
-        open: bool,
-        measured: f32,
-    ) -> bool {
+    fn channel_audio(ui: &mut egui::Ui, ch: &mut Channel, st: ChannelState) -> bool {
+        let (gain_db, open, measured) = (st.agc_gain_db, st.squelch_open, st.squelch_db);
         let mut changed = false;
         ui.add_space(4.0);
         if ch.demod != Demod::Wfm {
@@ -1452,17 +1490,22 @@ impl App {
                 ui.label(legend("channels"));
                 ui.add_space(6.0);
 
+                // The master, which every channel's own level runs into.
                 ui.horizontal(|ui| {
-                    ui.label(legend("vol"));
+                    ui.label(legend("master"));
                     if ui
                         .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
                         .changed()
                     {
                         self.send(Cmd::Volume(self.volume));
                     }
-                    if ui.button("MUTE").clicked() {
-                        self.listening = None;
-                        self.send(Cmd::Listen(None));
+                    let all_muted = !self.channels.is_empty()
+                        && self.channels.iter().all(|c| c.muted || !c.on);
+                    if ui.selectable_label(all_muted, "MUTE").clicked() {
+                        for c in &mut self.channels {
+                            c.muted = !all_muted;
+                        }
+                        self.send_channels();
                     }
                 });
 
@@ -1481,7 +1524,8 @@ impl App {
                     .radio
                     .as_ref()
                     .map(|r| (r.status.station(), r.status.blend()));
-                let audio = self.radio.as_ref().map(|r| r.status.audio_state());
+                let states: Vec<ChannelState> =
+                    self.radio.as_ref().map(|r| r.status.channel_states()).unwrap_or_default();
                 let mut remove = None;
                 let mut tune = None;
                 for (i, ch) in self.channels.iter_mut().enumerate() {
@@ -1534,9 +1578,18 @@ impl App {
                                         tune = Some(i);
                                     }
                                 }
-                                if !active && ui.small_button("LISTEN").clicked() {
-                                    tune = Some(i);
-                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // Every channel can be on at once and
+                                        // they mix, so this is a per channel
+                                        // switch rather than a choice of one.
+                                        if ui.selectable_label(ch.on, "ON").clicked() {
+                                            ch.on = !ch.on;
+                                            tune = Some(i);
+                                        }
+                                    },
+                                );
                             });
                             ui.horizontal(|ui| {
                                 for m in [Demod::Usb, Demod::Lsb, Demod::Cw] {
@@ -1546,14 +1599,34 @@ impl App {
                                     }
                                 }
                             });
-                            // Only the channel being listened to has a decoder
-                            // running, so only it has anything to show.
-                            if active {
-                                if let Some((st, blend)) = &live {
-                                    Self::channel_rds(ui, st, *blend);
+                            if ch.on {
+                                // Its own level, which runs into the master.
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(legend("vol"));
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut ch.volume, 0.0..=1.0)
+                                                .show_value(false),
+                                        )
+                                        .changed()
+                                    {
+                                        tune = Some(i);
+                                    }
+                                    if ui.selectable_label(ch.muted, "M").clicked() {
+                                        ch.muted = !ch.muted;
+                                        tune = Some(i);
+                                    }
+                                });
+                                let st = states.iter().find(|s| s.id == ch.id).copied();
+                                if ch.demod == Demod::Wfm {
+                                    if let Some((station, _)) = &live {
+                                        let blend = st.map(|s| s.stereo_blend).unwrap_or(0.0);
+                                        Self::channel_rds(ui, station, blend);
+                                    }
                                 }
-                                if let Some((gain, open, measured)) = audio {
-                                    if Self::channel_audio(ui, ch, gain, open, measured) {
+                                if let Some(st) = st {
+                                    if Self::channel_audio(ui, ch, st) {
                                         tune = Some(i);
                                     }
                                 }
@@ -1571,8 +1644,11 @@ impl App {
                     }
                     self.retune_listener();
                 }
-                if let Some(i) = tune {
-                    self.listen(i);
+                if tune.is_some() {
+                    if let Some(i) = tune {
+                        self.listening = Some(i);
+                    }
+                    self.send_channels();
                 }
 
             });
@@ -2415,6 +2491,66 @@ mod tests {
         }
     }
 
+    fn channel(app: &mut App, offset: f64, on: bool, volume: f32) {
+        let freq = app.center + offset;
+        let id = app.next_id as u64;
+        app.next_id += 1;
+        app.channels.push(Channel {
+            id,
+            freq,
+            demod: Demod::Nfm,
+            label: format!("CH{id}"),
+            on,
+            volume,
+            muted: false,
+            squelch_db: None,
+            agc: true,
+        });
+    }
+
+    #[test]
+    fn every_channel_that_is_on_goes_to_the_mixer() {
+        // The point of the mixer: several channels at once, each with its own
+        // level, not one at a time.
+        let mut a = app();
+        channel(&mut a, 100_000.0, true, 0.8);
+        channel(&mut a, -250_000.0, true, 0.3);
+        channel(&mut a, 400_000.0, false, 1.0);
+
+        let specs = a.channel_specs();
+        assert_eq!(specs.len(), 2, "a channel that is off should not be demodulated");
+        assert_eq!(specs[0].offset_hz, 100_000.0);
+        assert_eq!(specs[1].offset_hz, -250_000.0);
+        assert_eq!(specs[1].volume, 0.3, "each channel keeps its own level");
+    }
+
+    #[test]
+    fn a_channel_keeps_its_identity_when_a_neighbour_is_removed() {
+        // Chains are matched by id on the radio thread. If these were
+        // positions, removing the first channel would silently hand its
+        // running chain to the second.
+        let mut a = app();
+        channel(&mut a, 100_000.0, true, 1.0);
+        channel(&mut a, 200_000.0, true, 1.0);
+        let second = a.channel_specs()[1].id;
+        a.channels.remove(0);
+        assert_eq!(a.channel_specs()[0].id, second);
+    }
+
+    #[test]
+    fn muting_everything_leaves_the_channels_running() {
+        // Mute is a level, not a teardown: unmuting should not have to wait
+        // for chains to be rebuilt and AGCs to settle again.
+        let mut a = app();
+        channel(&mut a, 100_000.0, true, 1.0);
+        for c in &mut a.channels {
+            c.muted = true;
+        }
+        let specs = a.channel_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].muted);
+    }
+
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 400.0))
     }
@@ -2660,9 +2796,13 @@ mod tests {
         a.rate = 2_400_000.0;
         for f in freqs {
             a.channels.push(Channel {
+                id: 1,
                 freq: *f,
                 demod: Demod::Wfm,
                 label: "t".into(),
+                on: true,
+                volume: 0.8,
+                muted: false,
                 squelch_db: None,
                 agc: true,
             });

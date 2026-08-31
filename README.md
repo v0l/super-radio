@@ -224,6 +224,23 @@ in the FM broadcast band, 25 kHz in the airband and marine VHF, 12.5 kHz on
 2 m and 70 cm. Bands with no even raster declare none and do not snap, because
 moving a channel off the signal it was aimed at is worse than not helping.
 
+Every channel is demodulated at once and mixed together. Each has its own
+level and mute, running into a master volume, so a busy amateur calling
+frequency and a local repeater can be listened to side by side without
+switching between them. A channel that is switched off costs nothing: its
+chain is torn down rather than muted.
+
+Measured at 2.304 MS/s, one WFM channel takes about 17% of the radio thread
+and two take 31%, so the thread runs out somewhere around six broadcast
+channels and rather more narrowband ones. Chains are kept across edits and
+rebuilt only when what they demodulate changes, because rebuilding on every
+volume nudge would restart each AGC and throw away the RDS decoder's state
+along with the station name it had recovered.
+
+The mix clips rather than being scaled to fit. Several channels at once can
+sum past full scale, and quietly turning everything down would make the level
+of the channel you are listening to depend on how busy its neighbours are.
+
 Mode defaults from the band plan (WFM in the broadcast band, AM in the airband,
 otherwise NFM) and can be overridden per channel: WFM, NFM and AM for
 broadcast and utility listening, USB, LSB and CW for the amateur bands.
@@ -427,7 +444,7 @@ with this on.
 `--help` lists everything with its defaults; the ones worth knowing:
 
 ```
---tune <mhz>        start tuned and listening
+--tune <mhz>        start tuned and listening; repeat it for several channels
 --mode <mode>       wfm, nfm, am, usb, lsb or cw
 --span <khz>        start at the nearest span, narrowing in software if needed
 --gain              open the radio's own controls on start

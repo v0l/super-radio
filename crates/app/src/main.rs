@@ -28,17 +28,25 @@ fn squelch_probe(mhz: f64, mode: radio::Demod) {
         return;
     };
     let r = radio::Radio::start(entry, Hz((mhz * 1e6) as u64), Sps(2_304_000), 2048, || {});
-    r.send(radio::Cmd::Demod(mode));
-    r.send(radio::Cmd::Listen(Some(0.0)));
-    r.send(radio::Cmd::Volume(0.0));
+    r.send(radio::Cmd::Channels(vec![radio::ChannelSpec {
+        id: 1,
+        offset_hz: 0.0,
+        demod: mode,
+        volume: 1.0,
+        // Measuring, not listening: the numbers are the same either way and
+        // this can be run over ssh.
+        muted: true,
+        squelch_db: None,
+        agc: true,
+    }]));
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let mut readings = Vec::new();
     let start = std::time::Instant::now();
     while start.elapsed().as_secs_f32() < 6.0 {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let (gain, open, measured) = r.status.audio_state();
-        readings.push((measured, gain, open));
+        let Some(st) = r.status.channel_state(1) else { continue };
+        readings.push((st.squelch_db, st.agc_gain_db, st.squelch_open));
     }
     r.send(radio::Cmd::Stop);
     if readings.is_empty() {
@@ -82,9 +90,15 @@ fn probe(mhz: f64, listen: bool, want: Option<String>, dc_on: bool) {
     println!("dc block: {}", if dc_on { "on" } else { "off" });
     if listen {
         // Decode a channel off-centre, the case that was dropping samples.
-        r.send(radio::Cmd::Demod(radio::Demod::Wfm));
-        r.send(radio::Cmd::Listen(Some(0.0)));
-        r.send(radio::Cmd::Volume(0.0));
+        r.send(radio::Cmd::Channels(vec![radio::ChannelSpec {
+            id: 1,
+            offset_hz: 0.0,
+            demod: radio::Demod::Wfm,
+            volume: 1.0,
+            muted: true,
+            squelch_db: None,
+            agc: true,
+        }]));
         println!("decoding a WFM channel while measuring");
     }
     let start = std::time::Instant::now();
@@ -420,9 +434,10 @@ fn replay(path: &str) -> anyhow::Result<()> {
 #[derive(Parser, Debug)]
 #[command(name = "super-radio", about = "Software defined radio receiver", version)]
 struct Args {
-    /// Start tuned to this frequency, in MHz, and listening to it
+    /// Start tuned to this frequency, in MHz, and listening to it. Repeat it
+    /// to open several channels at once, which are mixed together
     #[arg(long, value_name = "MHZ")]
-    tune: Option<f64>,
+    tune: Vec<f64>,
 
     /// Demodulator to start in
     #[arg(long, value_enum, default_value_t = Mode::Wfm)]
@@ -577,8 +592,8 @@ fn main() -> eframe::Result<()> {
             if let Some(khz) = args.span {
                 app.set_span(khz * 1e3);
             }
-            if let Some(mhz) = args.tune {
-                app.tune_to(mhz, args.mode.into());
+            for mhz in &args.tune {
+                app.tune_to(*mhz, args.mode.into());
             }
             app.shot = args.shot.clone();
             if let Some(dir) = args.record.clone() {
