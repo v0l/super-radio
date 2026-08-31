@@ -6,8 +6,9 @@ use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dsp::{DcBlock, Spectrum};
 use nodes::{
-    ChannelBank, DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, Gating, HighBlendNode,
-    MixerNode, RealDecimateNode, WfmDemodNode,
+    AgcNode, ChannelBank, DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, Gating,
+    HighBlendNode, MixerNode, RealDecimateNode, SquelchKind, SquelchNode, SsbDemodNode,
+    WfmDemodNode,
 };
 use pipeline::graph::{Graph, NodeId};
 use pipeline::port::StreamSpec;
@@ -21,6 +22,12 @@ pub enum Demod {
     Wfm,
     Nfm,
     Am,
+    /// Upper sideband, the amateur convention above 10 MHz.
+    Usb,
+    /// Lower sideband, the convention on 160, 80 and 40 metres.
+    Lsb,
+    /// Morse, which is upper sideband through a narrow filter.
+    Cw,
 }
 
 impl Demod {
@@ -29,6 +36,34 @@ impl Demod {
             Demod::Wfm => "WFM",
             Demod::Nfm => "NFM",
             Demod::Am => "AM",
+            Demod::Usb => "USB",
+            Demod::Lsb => "LSB",
+            Demod::Cw => "CW",
+        }
+    }
+
+    /// Whether this mode listens to one sideband of the dial frequency.
+    pub fn is_ssb(self) -> bool {
+        matches!(self, Demod::Usb | Demod::Lsb | Demod::Cw)
+    }
+
+    fn sideband(self) -> dsp::ssb::Sideband {
+        match self {
+            Demod::Lsb => dsp::ssb::Sideband::Lower,
+            _ => dsp::ssb::Sideband::Upper,
+        }
+    }
+
+    /// The pitch a CW signal is heard at.
+    ///
+    /// The receiver is tuned this far below the carrier so that the dial
+    /// reads the transmitted frequency rather than the note in the operator's
+    /// ears, which is the convention every other radio follows and the one
+    /// that makes two stations agree about where they are.
+    pub fn cw_pitch(self) -> f64 {
+        match self {
+            Demod::Cw => 700.0,
+            _ => 0.0,
         }
     }
 
@@ -42,6 +77,12 @@ impl Demod {
             Demod::Wfm => 264_000.0,
             Demod::Nfm => 12_500.0,
             Demod::Am => 10_000.0,
+            // Twice the audio bandwidth, because only one sideband is there
+            // but the IF filter around it is symmetric: half of this has to
+            // reach the far edge of the sideband or the top of the voice is
+            // filtered off before the demodulator sees it.
+            Demod::Usb | Demod::Lsb => 6_000.0,
+            Demod::Cw => 4_000.0,
         }
     }
 
@@ -56,7 +97,10 @@ impl Demod {
             // Must clear the 264 kHz occupied bandwidth with room for a
             // transition band.
             Demod::Wfm => 330_000.0,
-            Demod::Nfm | Demod::Am => 48_000.0,
+            // The sideband filter runs here rather than after a further
+            // decimation, because it is the thing that defines the channel
+            // and 363 taps at this rate is a few percent of one core.
+            Demod::Nfm | Demod::Am | Demod::Usb | Demod::Lsb | Demod::Cw => 48_000.0,
         }
     }
 
@@ -66,6 +110,8 @@ impl Demod {
             Demod::Wfm => 15_000.0,
             Demod::Nfm => 4_000.0,
             Demod::Am => 5_000.0,
+            Demod::Usb | Demod::Lsb => 3_000.0,
+            Demod::Cw => 1_200.0,
         }
     }
 
@@ -73,7 +119,7 @@ impl Demod {
         match self {
             Demod::Wfm => 75_000.0,
             Demod::Nfm => 5_000.0,
-            Demod::Am => 0.0,
+            Demod::Am | Demod::Usb | Demod::Lsb | Demod::Cw => 0.0,
         }
     }
 }
@@ -467,6 +513,11 @@ pub struct Status {
     pub error: parking_lot::Mutex<Option<String>>,
     /// Stereo separation currently applied, as f32 bits.
     blend: AtomicU32,
+    /// Gain the audio AGC is applying, as f32 bits, and whether the squelch is
+    /// passing anything. Both are what a listener needs to tell a dead band
+    /// from a deaf receiver.
+    agc_gain: AtomicU32,
+    squelch_open: AtomicBool,
     /// Station name, programme type and radiotext, when RDS is decoding.
     station: parking_lot::Mutex<StationInfo>,
     /// Shape of the chain currently demodulating, republished on every rebuild.
@@ -509,6 +560,8 @@ impl Default for Status {
             audio_backlog: AtomicU64::new(0),
             error: parking_lot::Mutex::new(None),
             blend: AtomicU32::new(0),
+            agc_gain: AtomicU32::new(0),
+            squelch_open: AtomicBool::new(true),
             station: parking_lot::Mutex::new(StationInfo::default()),
             chain: parking_lot::Mutex::new(None),
             chain_latency: AtomicU32::new(0),
@@ -522,6 +575,19 @@ impl Default for Status {
 impl Status {
     pub fn blend(&self) -> f32 {
         f32::from_bits(self.blend.load(Ordering::Relaxed))
+    }
+
+    /// Gain the AGC is applying, in dB, and whether audio is getting through.
+    pub fn audio_gain(&self) -> (f32, bool) {
+        (
+            f32::from_bits(self.agc_gain.load(Ordering::Relaxed)),
+            self.squelch_open.load(Ordering::Relaxed),
+        )
+    }
+
+    fn set_audio_gain(&self, db: f32, open: bool) {
+        self.agc_gain.store(db.to_bits(), Ordering::Relaxed);
+        self.squelch_open.store(open, Ordering::Relaxed);
     }
 
     fn set_blend(&self, v: f32) {
@@ -628,6 +694,45 @@ impl Drop for Radio {
     }
 }
 
+/// How wide a CW filter is.
+///
+/// 500 Hz is the common contest setting: narrow enough to silence a station a
+/// few hundred hertz away, wide enough that being slightly off the dial still
+/// lets the tone through.
+const CW_FILTER_HZ: f64 = 500.0;
+
+/// The squelch a mode wants, if any.
+///
+/// Broadcast FM is never squelched: the signal is either there or the
+/// listener has tuned to the wrong place, and muting a station during a quiet
+/// passage would be a fault. AM aircraft and SSB get a level squelch because
+/// neither has a capture effect to measure noise against, and both are
+/// routinely listened to with the squelch off, which is why the threshold
+/// starts low enough to pass almost anything.
+fn squelch_for(mode: Demod) -> Option<SquelchNode> {
+    match mode {
+        Demod::Nfm => Some(SquelchNode::fm()),
+        Demod::Am | Demod::Usb | Demod::Lsb | Demod::Cw => {
+            Some(SquelchNode::new(SquelchKind::Level, -55.0))
+        }
+        Demod::Wfm => None,
+    }
+}
+
+/// The gain control a mode wants.
+///
+/// Broadcast FM arrives already levelled by the station and its own limiter,
+/// so an AGC on top of that only compresses what the broadcaster spent money
+/// deciding. The rest of the modes have no level control at the far end at
+/// all: that is what makes an AGC the difference between usable and not.
+fn agc_for(mode: Demod) -> Option<AgcNode> {
+    match mode {
+        Demod::Cw => Some(AgcNode::cw()),
+        Demod::Nfm | Demod::Am | Demod::Usb | Demod::Lsb => Some(AgcNode::voice()),
+        Demod::Wfm => None,
+    }
+}
+
 /// Audio chain for one channel, rebuilt whenever the tuning or mode changes.
 ///
 /// Built as a `pipeline::Graph` from the same nodes the rest of the app uses.
@@ -637,6 +742,11 @@ impl Drop for Radio {
 pub struct Audio {
     graph: Graph,
     wfm: Option<NodeId>,
+    agc: Option<NodeId>,
+    squelch: Option<NodeId>,
+    agc_gain_db: f32,
+    squelch_open: bool,
+    squelch_db: f32,
     audio_rate: f64,
     channels: usize,
     iq: Vec<C32>,
@@ -654,7 +764,9 @@ impl Audio {
         let au_dec = ((if_rate / target).round() as usize).max(1);
 
         let mut b = Graph::builder(StreamSpec::iq(rate, Hz(0)));
-        let mix = b.add_labeled("Mixer", Box::new(MixerNode::new(-offset)));
+        // CW is tuned low by the pitch so the dial reads the carrier rather
+        // than the note; every other mode is tuned to what it listens to.
+        let mix = b.add_labeled("Mixer", Box::new(MixerNode::new(-(offset - mode.cw_pitch()))));
         // Sized from the signal's bandwidth, not from the decimation factor:
         // the stopband has to land where the first alias folds down.
         let mut dec = DecimateNode::new(if_dec);
@@ -671,24 +783,61 @@ impl Audio {
             id
         } else if mode == Demod::Am {
             b.add_labeled("AM envelope", Box::new(EnvelopeNode))
+        } else if mode.is_ssb() {
+            let node = if mode == Demod::Cw {
+                SsbDemodNode::cw(mode.sideband(), mode.cw_pitch(), CW_FILTER_HZ)
+            } else {
+                SsbDemodNode::voice(mode.sideband())
+            };
+            b.add_labeled(if mode == Demod::Cw { "CW filter" } else { "Sideband filter" }, Box::new(node))
         } else {
             b.add_labeled("FM discriminator", Box::new(FmDemodNode::new(mode.deviation())))
         };
         b.connect(ifd.o(), demod.i());
 
+        // The squelch goes here, on the demodulator's raw output, and not
+        // later where the audio is. An FM noise squelch works by measuring
+        // the hiss above the speech band, and the audio filter's whole job is
+        // to remove that: measured on an empty 2 m channel, a squelch after
+        // the filter saw a clean signal and held itself open on pure noise.
+        let mut demod_tail = demod;
+        let mut squelch = None;
+        if let Some(sq) = squelch_for(mode) {
+            let id = b.add_labeled("Squelch", Box::new(sq));
+            b.connect(demod_tail.o(), id.i());
+            squelch = Some(id);
+            demod_tail = id;
+        }
+
         let mut ad = RealDecimateNode::new(au_dec);
         ad.set_passband_hz(if_rate, mode.audio_bw());
         let aud = b.add_labeled("Audio decimator", Box::new(ad));
-        b.connect(demod.o(), aud.i());
-        let last = if mode == Demod::Am {
+        b.connect(demod_tail.o(), aud.i());
+        let last = if mode == Demod::Am || mode.is_ssb() {
+            // De-emphasis is an FM thing: it undoes the pre-emphasis the
+            // transmitter applied. Applying it to AM or SSB would just be a
+            // treble cut nobody asked for.
             aud
         } else {
             let de = b.add_labeled("De-emphasis", Box::new(DeemphasisNode::new(50.0)));
             b.connect(aud.o(), de.i());
             de
         };
+
+        // The gain control comes after the squelch, so what it sees is either
+        // a signal or silence. The other order lets the AGC lift the noise on
+        // a dead channel up to the threshold and hold the squelch open.
+        let mut tail = last;
+        let mut agc = None;
+        if let Some(node) = agc_for(mode) {
+            let id = b.add_labeled("AGC", Box::new(node));
+            b.connect(tail.o(), id.i());
+            agc = Some(id);
+            tail = id;
+        }
+
         let hb = b.add_labeled("High blend", Box::new(HighBlendNode::new()));
-        b.connect(last.o(), hb.i());
+        b.connect(tail.o(), hb.i());
         b.output(hb.o());
 
         let graph = b.build().expect("audio chain");
@@ -702,6 +851,11 @@ impl Audio {
         Self {
             graph,
             wfm,
+            agc,
+            squelch,
+            agc_gain_db: 0.0,
+            squelch_open: true,
+            squelch_db: 0.0,
             audio_rate: spec.frame_rate(),
             channels: spec.channels,
             iq: Vec::new(),
@@ -743,6 +897,24 @@ impl Audio {
         self.graph.output_latency() as f64 / self.audio_rate.max(1.0) * 1e3
     }
 
+    /// How much gain the AGC is applying, or zero in a mode without one.
+    ///
+    /// Worth showing: on a weak signal this is the difference between a dead
+    /// band and a deaf receiver, and the two look identical without it.
+    pub fn agc_gain_db(&self) -> f32 {
+        self.agc_gain_db
+    }
+
+    /// What the squelch measured on the last block, in dB.
+    pub fn squelch_db(&self) -> f32 {
+        self.squelch_db
+    }
+
+    /// Whether the squelch is passing audio. True in a mode with no squelch.
+    pub fn squelch_open(&self) -> bool {
+        self.squelch_open
+    }
+
     /// The running chain, for the graph view.
     pub fn graph(&self) -> &Graph {
         &self.graph
@@ -766,6 +938,21 @@ impl Audio {
         // information but only when it changes, and the status panel wants a
         // current value on every frame rather than the last one it happened to
         // catch.
+        if let Some(id) = self.agc {
+            if let Some(n) = self.graph.node(id).and_then(|n| n.as_any()) {
+                if let Some(a) = n.downcast_ref::<AgcNode>() {
+                    self.agc_gain_db = a.gain_db();
+                }
+            }
+        }
+        if let Some(id) = self.squelch {
+            if let Some(n) = self.graph.node(id).and_then(|n| n.as_any()) {
+                if let Some(sq) = n.downcast_ref::<SquelchNode>() {
+                    self.squelch_open = sq.is_open();
+                    self.squelch_db = sq.measured_db();
+                }
+            }
+        }
         if let Some(id) = self.wfm {
             if let Some(n) = self.graph.node(id).and_then(|n| n.as_any()) {
                 if let Some(w) = n.downcast_ref::<WfmDemodNode>() {
@@ -1040,6 +1227,7 @@ fn run(
             }
             status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
             status.set_blend(a.stereo_blend());
+            status.set_audio_gain(a.agc_gain_db(), a.squelch_open());
             let (g, e, sy) = a.rds_stats();
             status.set_station(a.station(), g, e, sy);
         }
@@ -1047,7 +1235,7 @@ fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn block(n: usize) -> Vec<C32> {
@@ -1059,6 +1247,131 @@ mod tests {
             .collect()
     }
 
+
+    /// A carrier `offset_hz` from the centre, modulated by an audio tone.
+    ///
+    /// Enough to tell a demodulator that works from one that does not: an SSB
+    /// receiver tuned to the carrier should hear the tone at its own pitch.
+    ///
+    /// `start` is the sample index the block begins at, because a receiver
+    /// hears one continuous signal and not the same block over and over: a
+    /// buffer replayed back to back has a phase step at every seam, and that
+    /// step is a click with energy on both sidebands. It measured as 58 dB of
+    /// apparent leakage into a sideband the filter actually rejects by 93 dB.
+    pub(crate) fn ssb_signal(
+        rate: f64,
+        carrier_hz: f64,
+        tone_hz: f64,
+        start: usize,
+        n: usize,
+    ) -> Vec<C32> {
+        (start..start + n)
+            .map(|i| {
+                let t = i as f64 / rate;
+                // One sideband only: a single complex exponential at the
+                // carrier plus the tone is exactly what an SSB transmitter
+                // puts on the air for a single audio tone.
+                let p = std::f64::consts::TAU * (carrier_hz + tone_hz) * t;
+                C32::new(0.3 * p.cos() as f32, 0.3 * p.sin() as f32)
+            })
+            .collect()
+    }
+
+    fn audio_rms(pcm: &[f32]) -> f32 {
+        if pcm.is_empty() {
+            return 0.0;
+        }
+        (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt()
+    }
+
+    /// How far down a station on the wrong sideband is, through the whole
+    /// chain.
+    ///
+    /// Measured through the AGC's gain rather than the audio level, because
+    /// the AGC drives everything to the same level by design: a rejected
+    /// signal comes out as loud as a wanted one and 60 dB more amplified, so
+    /// the audio level says nothing about rejection and the gain says
+    /// everything.
+    fn sideband_rejection_db(mode: Demod, wanted_hz: f64, image_hz: f64) -> f32 {
+        let rate = 2_304_000.0;
+        let offset = 120_000.0;
+        let mut gains = [0.0f32; 2];
+        for (i, tone) in [wanted_hz, image_hz].iter().enumerate() {
+            let mut a = Audio::new(offset, rate, mode, 48_000.0);
+            // Four seconds of audio. A rejected signal takes the AGC's whole
+            // release to climb to where it settles, and the gain is held flat
+            // during the hang, so anything that watches for the gain to stop
+            // moving stops early and measures the hang instead of the filter.
+            const N: usize = 262_144;
+            for k in 0..36 {
+                a.process(&ssb_signal(rate, offset, *tone, k * N, N), 1.0);
+            }
+            gains[i] = a.agc_gain_db();
+        }
+        gains[1] - gains[0]
+    }
+
+    #[test]
+    fn upper_sideband_hears_a_station_above_the_dial_and_not_below() {
+        let sep = sideband_rejection_db(Demod::Usb, 1_000.0, -1_000.0);
+        assert!(sep > 30.0, "the wrong sideband was only {sep:.1} dB down");
+    }
+
+    #[test]
+    fn lower_sideband_is_the_other_way_round() {
+        let sep = sideband_rejection_db(Demod::Lsb, -1_000.0, 1_000.0);
+        assert!(sep > 30.0, "the wrong sideband was only {sep:.1} dB down");
+    }
+
+    #[test]
+    fn a_weak_ssb_signal_comes_out_at_the_same_level_as_a_strong_one() {
+        // What the AGC is for: two stations 40 dB apart should not need the
+        // volume control moved between them.
+        let rate = 2_304_000.0;
+        let offset = 120_000.0;
+        let mut loud = Audio::new(offset, rate, Demod::Usb, 48_000.0);
+        let mut quiet = Audio::new(offset, rate, Demod::Usb, 48_000.0);
+
+        const N: usize = 262_144;
+        let block = |k: usize| ssb_signal(rate, offset, 1_000.0, k * N, N);
+        let quieter = |b: &[C32]| b.iter().map(|s| s * 0.01).collect::<Vec<_>>();
+        // A few blocks each, because the gain needs a moment to settle and
+        // the first block is where it is still moving.
+        for k in 0..3 {
+            loud.process(&block(k), 1.0);
+            quiet.process(&quieter(&block(k)), 1.0);
+        }
+        let a = 20.0 * audio_rms(loud.process(&block(3), 1.0)).max(1e-9).log10();
+        let b = 20.0 * audio_rms(quiet.process(&quieter(&block(3)), 1.0)).max(1e-9).log10();
+        assert!(
+            (a - b).abs() < 6.0,
+            "a 40 dB difference at the antenna came out as {:.1} dB of audio",
+            a - b
+        );
+    }
+
+    #[test]
+    fn cw_is_tuned_so_the_dial_reads_the_carrier() {
+        // Tuned exactly to a Morse carrier, the operator should hear the
+        // pitch, not silence and not some arbitrary beat note.
+        let rate = 2_304_000.0;
+        let offset = 120_000.0;
+        const N: usize = 262_144;
+        let mut cw = Audio::new(offset, rate, Demod::Cw, 48_000.0);
+        for k in 0..3 {
+            cw.process(&ssb_signal(rate, offset, 0.0, k * N, N), 1.0);
+        }
+        let on = audio_rms(cw.process(&ssb_signal(rate, offset, 0.0, 3 * N, N), 1.0));
+        assert!(on > 0.02, "a carrier on the dial frequency produced {on:.4} of audio");
+
+        // And a station 2 kHz away is outside a 500 Hz filter.
+        let mut cw2 = Audio::new(offset, rate, Demod::Cw, 48_000.0);
+        for k in 0..3 {
+            cw2.process(&ssb_signal(rate, offset, 2_000.0, k * N, N), 1.0);
+        }
+        let off = audio_rms(cw2.process(&ssb_signal(rate, offset, 2_000.0, 3 * N, N), 1.0));
+        assert!(off < on / 10.0, "a station 2 kHz away was audible at {off:.4} against {on:.4}");
+    }
 
     fn fixture() -> Option<common::IqBuf> {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1423,7 +1736,7 @@ mod tests {
         // performance target. Real numbers come from --bench-audio.
         let rate = 2_304_000.0;
         let b = block(131_072);
-        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am, Demod::Usb, Demod::Cw] {
             let mut a = Audio::new(120_000.0, rate, mode, 48_000.0);
             a.process(&b, 0.5);
             let t = std::time::Instant::now();
@@ -1442,7 +1755,7 @@ mod tests {
         // delay. The graph adds up each filter's group delay, so this catches
         // it wherever in the chain it happens rather than at one filter that
         // was remembered to be checked.
-        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am, Demod::Usb, Demod::Cw] {
             let a = Audio::new(0.0, 2_304_000.0, mode, 48_000.0);
             let ms = a.latency_ms();
             assert!(ms < 40.0, "{} delays audio by {ms:.1} ms", mode.label());
@@ -1471,10 +1784,12 @@ mod tests {
 
     #[test]
     fn the_audio_rate_is_close_to_what_was_asked_for() {
-        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am] {
+        for mode in [Demod::Wfm, Demod::Nfm, Demod::Am, Demod::Usb, Demod::Cw] {
             let a = Audio::new(0.0, 2_304_000.0, mode, 48_000.0);
             let r = a.audio_rate;
             assert!((r - 48_000.0).abs() < 12_000.0, "{} gave {r} Hz", mode.label());
         }
     }
 }
+
+

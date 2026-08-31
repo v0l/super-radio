@@ -1121,6 +1121,27 @@ impl App {
         });
     }
 
+    /// Gain and squelch, for the modes that have them.
+    ///
+    /// Worth a line of its own because on a weak signal these two are the
+    /// difference between a band that is dead and a receiver that is muted,
+    /// and without them both look and sound identical.
+    fn channel_audio(ui: &mut egui::Ui, demod: Demod, gain_db: f32, open: bool) {
+        if demod == Demod::Wfm {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(legend("agc"));
+            ui.label(value(&format!("{gain_db:+.0} dB")).size(10.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !open {
+                    ui.label(value("MUTED").size(10.0).color(theme::LEGEND));
+                }
+            });
+        });
+    }
+
     /// What the radio is hearing on the channel being listened to.
     ///
     /// This belongs inside the channel rather than beside the list: a station
@@ -1204,6 +1225,7 @@ impl App {
                     .radio
                     .as_ref()
                     .map(|r| (r.status.station(), r.status.blend()));
+                let audio = self.radio.as_ref().map(|r| r.status.audio_gain());
                 let mut remove = None;
                 let mut tune = None;
                 for (i, ch) in self.channels.iter_mut().enumerate() {
@@ -1246,6 +1268,9 @@ impl App {
                             }
                             ui.label(legend(bands::name_at(ch.freq)));
                             ui.add_space(4.0);
+                            // Two rows: broadcast modes, then the ones an
+                            // amateur band needs. Six across is narrower than
+                            // the panel gets on a laptop.
                             ui.horizontal(|ui| {
                                 for m in [Demod::Wfm, Demod::Nfm, Demod::Am] {
                                     if ui.selectable_label(ch.demod == m, m.label()).clicked() {
@@ -1253,10 +1278,16 @@ impl App {
                                         tune = Some(i);
                                     }
                                 }
-                                if !active
-                                    && ui.small_button("LISTEN").clicked()
-                                {
+                                if !active && ui.small_button("LISTEN").clicked() {
                                     tune = Some(i);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                for m in [Demod::Usb, Demod::Lsb, Demod::Cw] {
+                                    if ui.selectable_label(ch.demod == m, m.label()).clicked() {
+                                        ch.demod = m;
+                                        tune = Some(i);
+                                    }
                                 }
                             });
                             // Only the channel being listened to has a decoder
@@ -1264,6 +1295,9 @@ impl App {
                             if active {
                                 if let Some((st, blend)) = &live {
                                     Self::channel_rds(ui, st, *blend);
+                                }
+                                if let Some((gain, open)) = audio {
+                                    Self::channel_audio(ui, ch.demod, gain, open);
                                 }
                             }
                         });

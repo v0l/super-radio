@@ -225,7 +225,32 @@ in the FM broadcast band, 25 kHz in the airband and marine VHF, 12.5 kHz on
 moving a channel off the signal it was aimed at is worse than not helping.
 
 Mode defaults from the band plan (WFM in the broadcast band, AM in the airband,
-otherwise NFM) and can be overridden per channel.
+otherwise NFM) and can be overridden per channel: WFM, NFM and AM for
+broadcast and utility listening, USB, LSB and CW for the amateur bands.
+
+The three amateur modes share a sideband filter with complex taps, which is
+the direct way to keep one sideband and reject the other: an ordinary lowpass
+modulated up to the sideband's centre. A 2.4 kHz voice filter at 48 kHz takes
+363 taps, puts its stated edges on -6 dB, and rejects the wrong sideband by
+more than 50 dB. CW is the same filter at 500 Hz around the pitch, and the
+receiver is tuned low by that pitch so the dial reads the transmitted carrier
+rather than the note in your ears.
+
+Both are unusable without gain control, because an SSB signal arrives with no
+level control of any kind at the far end. The AGC is the conventional shape,
+fast attack and slow release with a hang in between, and it freezes while the
+squelch is shut: releasing through a muted channel winds the gain to maximum
+and then blasts the first syllable after the squelch opens.
+
+FM squelches on noise rather than level. An FM discriminator with no signal on
+it produces mostly high frequency hiss, and any signal at all pushes that down
+because FM captures, so measuring the energy above the speech band finds a
+station at the point where it becomes intelligible instead of at some level
+picked in advance. That measurement has to happen on the discriminator's raw
+output: with the squelch after the audio filter, the filter had already removed
+the noise the meter looks for and the squelch sat open on an empty channel.
+AM, USB, LSB and CW have no capture effect to measure, so they squelch on
+level, set low because those modes are usually listened to wide open.
 
 The display auto-scales against the 10th and 99.9th percentiles rather than the
 extremes, so one strong carrier does not flatten everything else.
@@ -350,6 +375,7 @@ with this on.
 
 ```
 --tune <mhz>        start tuned and listening
+--mode <mode>       wfm, nfm, am, usb, lsb or cw (default wfm)
 --chain             open on the signal chain view
 --device <name>     pick a radio by name, for when several are plugged in
 --shot <path>       write a PNG of the interface and exit
