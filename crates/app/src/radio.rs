@@ -995,20 +995,6 @@ impl Audio {
         }
     }
 
-    /// The threshold the running chain is using, if it has a squelch.
-    pub fn squelch_threshold(&self) -> Option<f32> {
-        let id = self.squelch?;
-        let n = self.graph.node(id)?.as_any()?;
-        n.downcast_ref::<SquelchNode>().map(|sq| sq.threshold_db())
-    }
-
-    /// What that threshold is measured against.
-    pub fn squelch_kind(&self) -> Option<SquelchKind> {
-        let id = self.squelch?;
-        let n = self.graph.node(id)?.as_any()?;
-        n.downcast_ref::<SquelchNode>().map(|sq| sq.kind())
-    }
-
     pub fn set_agc_enabled(&mut self, on: bool) {
         let Some(id) = self.agc else { return };
         if let Some(n) = self.graph.node_mut(id).and_then(|n| n.as_any_mut()) {
