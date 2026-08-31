@@ -21,9 +21,9 @@ our own assumptions.
 | crate | what it does |
 |---|---|
 | `common` | sample buffers, `Device`/`RxStream` traits, `Hz`/`Sps` units |
-| `dsp` | polyphase channelizer, FIR design, mixer, FM/AM demod, FM stereo, RDS, DC blocker, burst detector, OOK pulse extraction |
+| `dsp` | polyphase channelizer, FIR design, mixer, FM/AM demod, FM stereo, RDS, DC blocker, burst detector, OOK/ASK/FSK pulse extraction |
 | `pipeline` | the flow graph: typed DAG, rate negotiation, stream tags, events |
-| `decode` | bit buffers, pulse slicers, protocol registry, device decoders |
+| `decode` | bit buffers, pulse slicers, unknown-burst analyser, protocol registry, device decoders |
 | `nodes` | DSP and decoders as graph nodes, the registry, and the wideband channel bank |
 | `sources` | file replay with rtl_433-style filename metadata |
 | `audio` | cpal playback with a drift-tracking resampler |
@@ -34,6 +34,16 @@ our own assumptions.
 
 Named `common` rather than `core` because a workspace crate called `core`
 shadows the Rust sysroot crate.
+
+[`docs/views.md`](docs/views.md) describes the packet stream as a bus: the
+list and the waterfall marks are views over it, and a map, an image pane or a
+chart attach the same way, by reading a packet's structured fields and its
+media type rather than the demodulator that produced it.
+
+[`docs/protocols.md`](docs/protocols.md) is the protocol roadmap: everything
+rtl_433, a Flipper, a PortaPack and SDRangel can do, with what each one costs
+here, which direction is realistic for it, and what the transmit path needs
+before any of it can transmit.
 
 ## Design decisions worth knowing
 
@@ -50,7 +60,10 @@ it discarded and which parameter to change, because silence is the worst
 possible output for a tool meant to identify unknown signals.
 
 **A shared pulse front end, following rtl_433.** Almost every ISM device is OOK
-or two-level FSK, and both reduce to mark/gap timings. The DSP runs once per
+or two-level FSK, and both reduce to mark/gap timings: `pulse_detect` thresholds
+an envelope, `fsk_detect` thresholds a discriminator, `ask_detect` covers keying
+too shallow for the first to see, and the slicers and protocols below them
+cannot tell which one they were fed. The DSP runs once per
 channel; each protocol is then a timing table and a payload parser working on
 integers. That is what makes supporting hundreds of protocols affordable.
 
@@ -125,6 +138,34 @@ would bloat history permanently.
 
 Tests that need a fixture skip cleanly when it is missing, so a fresh clone
 builds and passes without network access.
+
+### Making your own
+
+`--record <dir>` writes every burst the scanner reports, whether it decoded or
+not, as an ordinary rtl_433 style capture:
+
+```sh
+super-radio --tune 868.3 --record captures
+super-radio --replay captures
+```
+
+The recorder keeps the last three quarters of a second of signal in memory and
+writes it out when a decode arrives, because a packet is reported long after it
+was transmitted: the transmission itself takes tens of milliseconds, the pulse
+detector waits for the silence after it, and the filters add their own latency.
+Measured on the Fine Offset capture, a quarter of a second of history loses the
+packet entirely and three tenths catches it.
+
+Each burst is mixed down to its own frequency, decimated to 250 kS/s and
+written as `g0001_<protocol>_<mod>_<freq>M_<rate>k.cu8`, about 380 kB, so the
+filename alone tells `sources::FileSource` and rtl_433 everything they need. An
+`index.jsonl` alongside records what was made of each one. Recording stops
+after 256 MB rather than filling the disk overnight.
+
+This is the short loop for protocol work: capture the band once, then run
+`--replay` after every change and see immediately whether the same burst now
+decodes, with no radio and the same answer every time. A capture that decodes
+is also a test fixture.
 
 ## Try it
 
@@ -208,6 +249,82 @@ issued once per frame.
 Each channel is drawn at the width its demodulator actually accepts, so an NFM
 and a WFM channel on the same frequency look as different as they are.
 
+The spectrum and the waterfall are split by a handle under the band ribbon:
+drag it to give either one more room, double click it to go back to the
+default. The packet log resizes the same way, by its top edge. Which pane
+matters depends on what is being looked for, so none of the three is fixed.
+
+### Decoding the whole span
+
+Data decoding is not something you tune to. The receiver splits whatever span
+it is on into channels and runs a decoder on every one of them at once, all
+the time, so a sensor that transmits once a minute is caught whether or not you
+were looking at its frequency. Both an OOK and an FSK front end run over the
+whole span, because which modulation a device uses is not visible in a
+waterfall.
+
+It splits the span twice, because the two front ends want opposite things from
+a channel. Measured by adding noise to the Fine Offset capture until decoding
+stops, a 1.5 kbit/s OOK sensor survives down to 12.3 dB peak-to-noise in a
+31 kHz channel and needs 22.9 dB in a 125 kHz one: a wide channel integrates
+noise across its whole width while the signal occupies a sliver of it, so it
+costs 10.6 dB for nothing. FSK needs the opposite, because its two tones are
+tens of kHz apart and a narrow channel cuts one of them off: the same
+synthetic packet reads as 46 bits at 110 us a symbol in a 125 kHz channel and
+as eight bits of nonsense in a 31 kHz one. So there are two channelizers, a
+31.25 kHz bank feeding the OOK path and a 125 kHz bank feeding the FSK path.
+
+Neither front end needs the signal centred, which is what makes any of it
+work: the OOK path is an envelope detector and does not care where in the
+channel the carrier sits, and the FSK path measures both tones from the burst
+itself, so a SAW transmitter tens of kHz off nominal reads the same as one on
+frequency. Channel width therefore costs sensitivity and nothing else.
+
+Channels overlap by design, so one burst is seen by several of them and by
+both banks at once, each reading a different mangled copy. The strongest
+report of a burst wins and a real decode beats a louder guess, so a
+transmission appears once. A device that repeats its packet still gets a row
+per repeat, because those are separate bursts on the same channel through the
+same front end.
+
+Bursts that match no protocol are reported too, and that is the point of
+scanning a band rather than a frequency: an unknown device is exactly what
+should be surfaced. The coding is inferred from the burst's own histograms
+(two mark widths and one gap width is PWM, one mark and two gaps is PPM,
+widths at T and 2T in both is Manchester), the symbol timings are measured
+from the burst, and the bits are sliced out under that reading. It is a guess,
+labelled as one, and it is enough to recognise the same device ID across
+several receptions, which is where reverse engineering starts.
+
+The packet list is the bottom pane:
+
+```
+ no     time   frequency   mod   rssi   snr  protocol           len  info
+ 27    4.267  433.9200MHz  OOK  -18.0  21.5  Fineoffset-WHx080   11  station_id=196 temperature_c=16.2
+ 28    4.284  868.3500MHz  FSK  -26.0  13.0  unknown              6  PWM 488/1464 us, 46 pulses, 46 bits
+```
+
+RSSI and SNR are both there because either alone misleads: a strong packet in
+a noisy channel and a weak one in a quiet channel share an SNR, and only the
+level says the front end is clipping. It is referenced to full scale at the
+detector, not to the antenna, so it compares packets on one receiver and is
+not a field strength. Clicking a packet opens an offset/hex/ASCII dump of its
+bytes. `UNKNOWN` hides unclaimed bursts when a noisy band buries the decodes.
+
+Each packet is also marked on the waterfall, written into the history itself
+rather than painted over it, so it scrolls, pans and ages with the row it
+arrived on and cannot drift away from the trace that produced it. The bracket
+frames the signal instead of covering it, coloured green for a verified
+packet, amber for one with no check to verify, red for a failed one and grey
+for an unknown. Beside it is the packet's number from the list, which is all
+the text worth putting over a waterfall: a protocol name is unreadable at the
+sizes that matter, and the number leads to a row that has room to say more.
+
+Idle channels cost only the burst detector, which is why the whole band can be
+covered continuously even with two banks running: measured at 2.4 MS/s over 78
+narrow and 20 wide channels, the scanner runs at about 17x real time.
+`DECODE ALL` in the top bar turns it off, `LOG` hides the list.
+
 ### Signal chain
 
 The other view draws the graph the listening channel is running, with the type
@@ -236,6 +353,9 @@ with this on.
 --chain             open on the signal chain view
 --device <name>     pick a radio by name, for when several are plugged in
 --shot <path>       write a PNG of the interface and exit
+--record <dir>      write every burst that decodes to a directory of captures
+--record-mb <n>     how much to write before recording stops (default 256)
+--replay <path>     decode a capture, or a directory of them, and print it
 --soak <secs>       run for N seconds, then report CPU and span timings
 --probe <mhz>       check the signal path with no display
 --mpx <mhz>         report FM multiplex levels
