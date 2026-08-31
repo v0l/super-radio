@@ -249,8 +249,21 @@ station at the point where it becomes intelligible instead of at some level
 picked in advance. That measurement has to happen on the discriminator's raw
 output: with the squelch after the audio filter, the filter had already removed
 the noise the meter looks for and the squelch sat open on an empty channel.
+The threshold is measured rather than picked. Through this chain an empty
+channel reads about 6.4 dB and an FM signal reads 24 dB and barely moves with
+signal strength, because FM captures, so the default sits at 14 dB in the
+middle of that gap. It was 9 dB, which is inside the noise's own variation:
+live, an empty 2 m channel wanders between 5.6 and 8.4 dB, so any excursion
+opened the squelch and the hysteresis then held it open on hiss indefinitely.
+`--squelch-probe` reports those numbers for a frequency, which is how the
+threshold was set and how to set your own.
+
 AM, USB, LSB and CW have no capture effect to measure, so they squelch on
-level, set low because those modes are usually listened to wide open.
+level, and they start with it off. There is no sensible fixed setting: on an
+empty 2 m channel the audio sits at -26 dBFS in AM, -36 in USB and -59 in CW,
+all of which move with the RF gain, so a number chosen here would do nothing
+in one mode and mute a station in another. The meter under each channel shows
+what it is reading now, which is what makes setting one by hand possible.
 
 GAIN opens the radio's own controls, separately from anything the software
 does to the samples afterwards. Each gain stage the device reports gets a
@@ -396,6 +409,7 @@ with this on.
 --tune <mhz>        start tuned and listening
 --mode <mode>       wfm, nfm, am, usb, lsb or cw (default wfm)
 --gain              open the radio's own controls on start
+--squelch-probe <mhz>  report what the squelch reads on a frequency
 --chain             open on the signal chain view
 --device <name>     pick a radio by name, for when several are plugged in
 --shot <path>       write a PNG of the interface and exit

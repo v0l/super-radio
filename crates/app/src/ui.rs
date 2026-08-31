@@ -1343,9 +1343,22 @@ impl App {
                     ch.squelch_db = Some(db);
                     changed = true;
                 }
-                ui.label(
-                    value(format!("{db:.0}{}", if ratio { "" } else { " dBFS" })).size(10.0),
-                );
+                // At the bottom of its range the squelch passes everything,
+                // and saying so is more use than printing the number that
+                // happens to be there.
+                let text = if db <= lo + 0.5 {
+                    "off".to_string()
+                } else {
+                    format!("{db:.0}{}", if ratio { "" } else { " dBFS" })
+                };
+                ui.label(value(text).size(10.0));
+            });
+            // The reading the threshold is being set against. Without it the
+            // control is a number to guess at, and the right number differs
+            // by mode and moves with the RF gain.
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                hint(ui, &format!("now {measured:.0} dB"));
             });
         }
         changed
