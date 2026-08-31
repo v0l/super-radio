@@ -48,7 +48,9 @@ pub struct App {
     fft: usize,
     devices: Vec<crate::devices::Entry>,
     device: Option<crate::devices::Entry>,
-    spans: Vec<(String, f64)>,
+    spans: Vec<crate::devices::Span>,
+    /// Software decimation currently applied, 1 for none.
+    zoom: usize,
     /// Run for this many seconds, report CPU used, then quit.
     pub soak: Option<f32>,
     /// Save a PNG to this path once the radio has settled, then quit.
@@ -233,6 +235,7 @@ impl Default for App {
             devices: Vec::new(),
             device: None,
             spans: Vec::new(),
+            zoom: 1,
             soak: None,
             shot: None,
             decodes: Vec::new(),
@@ -277,6 +280,25 @@ impl App {
         self.send(Cmd::Record(Some((dir, budget_mb))));
     }
 
+    /// Pick the span closest to `hz`, narrowing in software if the radio
+    /// cannot sample that slowly.
+    pub fn set_span(&mut self, hz: f64) {
+        let Some(sp) = self
+            .spans
+            .iter()
+            .min_by(|a, b| (a.effective() - hz).abs().total_cmp(&(b.effective() - hz).abs()))
+            .cloned()
+        else {
+            return;
+        };
+        self.send(Cmd::Rate(common::Sps(sp.rate as u64)));
+        self.send(Cmd::Zoom(sp.zoom));
+        self.rate = sp.effective();
+        self.zoom = sp.zoom;
+        self.reset_waterfall();
+        self.retune_listener();
+    }
+
     /// Start tuned to a station and listening to it.
     ///
     /// Useful for screenshots and for checking a change against real RF
@@ -304,9 +326,10 @@ impl App {
             self.err = Some("no radio found. plug one in, then press RESCAN.".into());
             return;
         };
-        self.spans = crate::devices::spans_for(&device_rates(&entry));
-        if !self.spans.iter().any(|(_, r)| (*r - self.rate).abs() < 1.0) {
-            self.rate = self.spans.last().map(|(_, r)| *r).unwrap_or(self.rate);
+        self.spans = crate::devices::spans_with_zoom(&device_rates(&entry));
+        if !self.spans.iter().any(|s| (s.effective() - self.rate).abs() < 1.0) {
+            self.rate = self.spans.last().map(|s| s.effective()).unwrap_or(self.rate);
+            self.zoom = 1;
         }
         let c = ctx.clone();
         self.radio = Some(Radio::start(
@@ -889,24 +912,35 @@ impl App {
                         let cur = self
                             .spans
                             .iter()
-                            .find(|(_, r)| (self.rate - r).abs() < 1.0)
-                            .map(|(n, _)| n.clone())
+                            .find(|s| (self.rate - s.effective()).abs() < 1.0)
+                            .map(|s| s.label.clone())
                             .unwrap_or_else(|| "custom".into());
                         let mut pick = None;
                         egui::ComboBox::from_id_salt("span")
                             .selected_text(cur)
                             .width(96.0)
                             .show_ui(ui, |ui| {
-                                for (name, r) in &self.spans {
-                                    let on = (self.rate - r).abs() < 1.0;
-                                    if ui.selectable_label(on, name).clicked() && !on {
-                                        pick = Some(*r);
+                                for sp in &self.spans {
+                                    let on = (self.rate - sp.effective()).abs() < 1.0
+                                        && self.zoom == sp.zoom;
+                                    let text = if sp.zoom > 1 {
+                                        format!("{}  /{}", sp.label, sp.zoom)
+                                    } else {
+                                        sp.label.clone()
+                                    };
+                                    if ui.selectable_label(on, text).clicked() && !on {
+                                        pick = Some(sp.clone());
                                     }
                                 }
                             });
-                        if let Some(r) = pick {
-                            self.rate = r;
-                            self.send(Cmd::Rate(Sps(r as u64)));
+                        if let Some(sp) = pick {
+                            // Rate first: the radio rebuilds everything on a
+                            // rate change, and a zoom sent before it would be
+                            // applied to a chain about to be replaced.
+                            self.send(Cmd::Rate(Sps(sp.rate as u64)));
+                            self.send(Cmd::Zoom(sp.zoom));
+                            self.rate = sp.effective();
+                            self.zoom = sp.zoom;
                             self.reset_waterfall();
                             self.retune_listener();
                         }

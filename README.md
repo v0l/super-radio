@@ -265,6 +265,25 @@ all of which move with the RF gain, so a number chosen here would do nothing
 in one mode and mute a station in another. The meter under each channel shows
 what it is reading now, which is what makes setting one by hand possible.
 
+The bandwidth list goes below what the radio can sample. A HackRF will not
+sample slower than 2 MS/s, and on a 2 MHz span a 12.5 kHz PMR446 channel is
+half a pixel wide, which is not something a cursor can be placed on. Spans
+below the hardware's minimum are the lowest rate it does have, decimated in
+software: the list marks them `/8`, `/32` and so on. At 125 kHz that same
+channel is 120 pixels across.
+
+Everything downstream sees the narrowed stream at its new rate, so the
+spectrum, the channel decoder and the audio all agree about what a frequency
+is. The decimator filters before it drops samples, at 70 dB, because anything
+folded in from outside the span cannot afterwards be told from a signal that
+was really there. Measured at 2.4 MS/s it runs at 25 to 30 times real time
+from /2 to /32, on a thread that also has the spectrum, the scanner and the
+audio to get through.
+
+Spans narrower than 48 kHz are not offered: that is the rate the narrowband
+audio chain runs at, and a span narrower than the demodulator's own IF cannot
+be listened to. Asking for one anyway reports which mode needs what.
+
 GAIN opens the radio's own controls, separately from anything the software
 does to the samples afterwards. Each gain stage the device reports gets a
 slider that snaps to the steps the hardware actually has: an R820T takes 29
@@ -408,6 +427,7 @@ with this on.
 ```
 --tune <mhz>        start tuned and listening
 --mode <mode>       wfm, nfm, am, usb, lsb or cw (default wfm)
+--span <khz>        start at the nearest span to this, narrowing if needed
 --gain              open the radio's own controls on start
 --squelch-probe <mhz>  report what the squelch reads on a frequency
 --chain             open on the signal chain view

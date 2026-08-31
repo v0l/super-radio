@@ -53,6 +53,47 @@ pub fn open(e: &Entry) -> Result<Box<dyn Device>> {
 ///
 /// The two radios barely overlap: an RTL-SDR tops out around 2.4 MS/s while a
 /// HackRF starts at 2, so a single hard-coded list is wrong for both.
+/// One entry in the bandwidth list.
+///
+/// A span is not always a sample rate: below what the hardware will do, it is
+/// a rate plus a decimation factor. A HackRF cannot sample below 2 MS/s, and
+/// on a 2 MHz span a 12.5 kHz PMR channel is half a pixel wide, so the only
+/// way to see one is to narrow the span in software.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    pub label: String,
+    /// What to ask the radio for.
+    pub rate: f64,
+    /// How much to decimate afterwards, 1 for not at all.
+    pub zoom: usize,
+}
+
+impl Span {
+    /// The span actually seen, which is what the label says.
+    pub fn effective(&self) -> f64 {
+        self.rate / self.zoom as f64
+    }
+}
+
+/// The bandwidth list for a device: its own rates, then decimated ones.
+///
+/// Stops at 48 kHz because that is the rate the narrowband audio chain runs
+/// at, and a span narrower than the demodulator's own IF cannot be listened
+/// to.
+pub fn spans_with_zoom(range: &std::ops::RangeInclusive<Sps>) -> Vec<Span> {
+    let mut out: Vec<Span> = spans_for(range)
+        .into_iter()
+        .map(|(label, rate)| Span { label, rate, zoom: 1 })
+        .collect();
+    let Some(base) = out.first().map(|s| s.rate) else { return out };
+    let mut zoom = 2;
+    while base / zoom as f64 >= 48_000.0 && zoom <= 64 {
+        out.insert(0, Span { label: label(base / zoom as f64), rate: base, zoom });
+        zoom *= 2;
+    }
+    out
+}
+
 pub fn spans_for(range: &std::ops::RangeInclusive<Sps>) -> Vec<(String, f64)> {
     const CANDIDATES: [f64; 11] = [
         250_000.0,
@@ -103,6 +144,46 @@ mod tests {
         assert!(hrf.iter().all(|(_, r)| *r >= 2_000_000.0));
         assert!(hrf.iter().any(|(_, r)| (*r - 20_000_000.0).abs() < 1.0));
         assert!(!hrf.iter().any(|(_, r)| (*r - 250_000.0).abs() < 1.0));
+    }
+
+    #[test]
+    fn a_hackrf_can_be_narrowed_to_a_pmr_channel() {
+        // 12.5 kHz channels on a 2 MHz span are half a pixel wide. The
+        // narrowest span offered has to make one of them readable, which
+        // means tens of pixels across a 1000 pixel window.
+        let hrf = spans_with_zoom(&(Sps(2_000_000)..=Sps(20_000_000)));
+        let narrowest = hrf.iter().map(|s| s.effective()).fold(f64::MAX, f64::min);
+        assert!(
+            narrowest <= 70_000.0,
+            "the narrowest span a HackRF can be given is {narrowest:.0} Hz"
+        );
+        let px = 12_500.0 / narrowest * 1000.0;
+        assert!(px > 100.0, "a PMR channel would be {px:.0} pixels wide");
+    }
+
+    #[test]
+    fn narrowed_spans_still_ask_the_radio_for_a_rate_it_has() {
+        let range = Sps(2_000_000)..=Sps(20_000_000);
+        for sp in spans_with_zoom(&range) {
+            assert!(
+                sp.rate >= range.start().0 as f64 && sp.rate <= range.end().0 as f64,
+                "{} asks for {} S/s, which this radio does not do",
+                sp.label,
+                sp.rate
+            );
+            assert!(sp.zoom >= 1);
+        }
+    }
+
+    #[test]
+    fn nothing_narrower_than_the_narrowband_audio_chain_is_offered() {
+        // A span narrower than the demodulator's IF cannot be listened to,
+        // and a bandwidth in the list that silences the receiver is a trap.
+        for range in [Sps(225_000)..=Sps(2_400_000), Sps(2_000_000)..=Sps(20_000_000)] {
+            for sp in spans_with_zoom(&range) {
+                assert!(sp.effective() >= 48_000.0, "{} is below the audio IF", sp.label);
+            }
+        }
     }
 
     #[test]
