@@ -215,6 +215,16 @@ pub trait Device: Send {
         0.0
     }
 
+    /// Whether changing the sample rate needs the stream stopped first.
+    ///
+    /// A HackRF's streaming reader takes ownership of the device, and its
+    /// control channel carries tuning and gain but not the sample rate, so
+    /// asking for a new rate while it runs fails. Saying so lets a caller
+    /// restart around the change instead of finding out by breaking.
+    fn rate_needs_restart(&self) -> bool {
+        false
+    }
+
     /// Begin streaming. Consumes control of sampling until the stream drops.
     fn start_rx(&mut self) -> Result<Box<dyn RxStream>>;
 }

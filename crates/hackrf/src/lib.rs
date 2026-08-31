@@ -217,6 +217,10 @@ impl Device for HackRfDevice {
         ]
     }
 
+    fn rate_needs_restart(&self) -> bool {
+        true
+    }
+
     fn start_rx(&mut self) -> Result<Box<dyn RxStream>> {
         let dev = self.dev.take().ok_or(Error::Disconnected)?;
         let handle = dev.into_streaming_reader(0, 0).map_err(map_err)?;

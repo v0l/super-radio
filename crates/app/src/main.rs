@@ -1,3 +1,6 @@
+use clap::{Parser, ValueEnum};
+use std::path::PathBuf;
+
 mod prof;
 mod wheel;
 mod bands;
@@ -57,13 +60,10 @@ fn squelch_probe(mhz: f64, mode: radio::Demod) {
     );
 }
 
-fn probe(mhz: f64, listen: bool) {
+fn probe(mhz: f64, listen: bool, want: Option<String>, dc_on: bool) {
     use common::{Hz, Sps};
     let rate = 2_304_000.0;
-    // Pick by name so the HackRF can be probed while an RTL-SDR is plugged in.
-    let want = std::env::args().position(|x| x == "--device").and_then(|i| {
-        std::env::args().nth(i + 1)
-    });
+    // Picked by name so a HackRF can be probed while an RTL-SDR is plugged in.
     let all = devices::list();
     let Some(entry) = want
         .and_then(|w| {
@@ -78,8 +78,6 @@ fn probe(mhz: f64, listen: bool) {
     };
     println!("using {}", entry.label);
     let r = radio::Radio::start(entry, Hz((mhz * 1e6) as u64), Sps(rate as u64), 2048, || {});
-    // --no-dc leaves the centre spur in, for measuring what removing it does.
-    let dc_on = !std::env::args().any(|x| x == "--no-dc");
     r.send(radio::Cmd::DcBlock(dc_on));
     println!("dc block: {}", if dc_on { "on" } else { "off" });
     if listen {
@@ -413,99 +411,160 @@ fn replay(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn soak_enabled(a: &[String]) -> bool {
-    a.iter().any(|x| x == "--soak")
+/// Command line surface.
+///
+/// The interactive receiver is what running this with no arguments gives you.
+/// Everything else is either a diagnostic that prints numbers and exits, or a
+/// switch that sets the receiver up so a session can be reproduced without a
+/// dozen clicks first.
+#[derive(Parser, Debug)]
+#[command(name = "super-radio", about = "Software defined radio receiver", version)]
+struct Args {
+    /// Start tuned to this frequency, in MHz, and listening to it
+    #[arg(long, value_name = "MHZ")]
+    tune: Option<f64>,
+
+    /// Demodulator to start in
+    #[arg(long, value_enum, default_value_t = Mode::Wfm)]
+    mode: Mode,
+
+    /// Start at the nearest span to this, in kHz, narrowing in software when
+    /// the radio cannot sample that slowly
+    #[arg(long, value_name = "KHZ")]
+    span: Option<f64>,
+
+    /// Pick a radio by name, for when several are plugged in
+    #[arg(long, value_name = "NAME")]
+    device: Option<String>,
+
+    /// Write a PNG of the interface and exit
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/tmp/shot.png")]
+    shot: Option<String>,
+
+    /// Open on the signal chain view
+    #[arg(long)]
+    chain: bool,
+
+    /// Open the radio's own controls
+    #[arg(long)]
+    gain: bool,
+
+    /// Write every burst that decodes into this directory
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "captures")]
+    record: Option<PathBuf>,
+
+    /// How much may be written before recording stops
+    #[arg(long, value_name = "MB")]
+    record_mb: Option<u64>,
+
+    /// Decode a capture, or a directory of them, and print what came out
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "captures")]
+    replay: Option<String>,
+
+    /// Run for this many seconds, then report CPU and span timings
+    #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "12")]
+    soak: Option<f32>,
+
+    /// Check the signal path with no display
+    #[arg(long, value_name = "MHZ", num_args = 0..=1, default_missing_value = "95.8")]
+    probe: Option<f64>,
+
+    /// Decode a channel while probing, the case that used to drop samples
+    #[arg(long)]
+    listen: bool,
+
+    /// Report what the squelch reads on a frequency
+    #[arg(long, value_name = "MHZ", num_args = 0..=1, default_missing_value = "145.5")]
+    squelch_probe: Option<f64>,
+
+    /// Report FM multiplex levels
+    #[arg(long, value_name = "MHZ", num_args = 0..=1, default_missing_value = "95.8")]
+    mpx: Option<f64>,
+
+    /// Leave the centre spur in, for measuring what removing it does
+    #[arg(long)]
+    no_dc: bool,
+
+    /// Time a retune
+    #[arg(long)]
+    bench_tune: bool,
+
+    /// Frames delivered while the centre is dragged
+    #[arg(long)]
+    bench_pan: bool,
+
+    /// Audio chain throughput
+    #[arg(long)]
+    bench_audio: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    Wfm,
+    Nfm,
+    Am,
+    Usb,
+    Lsb,
+    Cw,
+}
+
+impl From<Mode> for radio::Demod {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Wfm => radio::Demod::Wfm,
+            Mode::Nfm => radio::Demod::Nfm,
+            Mode::Am => radio::Demod::Am,
+            Mode::Usb => radio::Demod::Usb,
+            Mode::Lsb => radio::Demod::Lsb,
+            Mode::Cw => radio::Demod::Cw,
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
-    let a: Vec<String> = std::env::args().collect();
-    if a.iter().any(|x| x == "--bench-pan") {
+    let args = Args::parse();
+
+    if args.bench_pan {
         bench_pan();
         return Ok(());
     }
-    if a.iter().any(|x| x == "--bench-tune") {
+    if args.bench_tune {
         bench_tune();
         return Ok(());
     }
-    if a.iter().any(|x| x == "--bench-audio") {
+    if args.bench_audio {
         bench_audio();
         return Ok(());
     }
-    if let Some(i) = a.iter().position(|x| x == "--mpx") {
-        mpx_report(a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8));
+    if let Some(mhz) = args.mpx {
+        mpx_report(mhz);
         return Ok(());
     }
-    let mode = a
-        .iter()
-        .position(|x| x == "--mode")
-        .and_then(|i| a.get(i + 1))
-        .map(|v| match v.to_ascii_lowercase().as_str() {
-            "nfm" | "fm" => radio::Demod::Nfm,
-            "am" => radio::Demod::Am,
-            "usb" => radio::Demod::Usb,
-            "lsb" => radio::Demod::Lsb,
-            "cw" => radio::Demod::Cw,
-            _ => radio::Demod::Wfm,
-        })
-        .unwrap_or(radio::Demod::Wfm);
-
-    if let Some(i) = a.iter().position(|x| x == "--squelch-probe") {
-        let mhz = a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(145.5);
-        squelch_probe(mhz, mode);
+    if let Some(mhz) = args.squelch_probe {
+        squelch_probe(mhz, args.mode.into());
         return Ok(());
     }
-    if let Some(i) = a.iter().position(|x| x == "--probe") {
-        probe(
-            a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8),
-            a.iter().any(|x| x == "--listen"),
-        );
+    if let Some(mhz) = args.probe {
+        probe(mhz, args.listen, args.device.clone(), !args.no_dc);
         return Ok(());
     }
-    if let Some(i) = a.iter().position(|x| x == "--replay") {
-        if let Err(e) = replay(a.get(i + 1).map(String::as_str).unwrap_or("captures")) {
+    if let Some(path) = &args.replay {
+        if let Err(e) = replay(path) {
             eprintln!("replay failed: {e}");
             std::process::exit(1);
         }
         return Ok(());
     }
-    let shot = a
-        .iter()
-        .position(|x| x == "--shot")
-        .map(|i| a.get(i + 1).cloned().unwrap_or_else(|| "/tmp/shot.png".into()));
-    if soak_enabled(&a) {
+
+    if args.soak.is_some() {
         use tracing_subscriber::prelude::*;
         prof::enable();
         tracing_subscriber::registry().with(prof::Timing).init();
     }
-    let soak = a
-        .iter()
-        .position(|x| x == "--soak")
-        .map(|i| a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(12.0f32));
-    let record = a
-        .iter()
-        .position(|x| x == "--record")
-        .map(|i| a.get(i + 1).cloned().unwrap_or_else(|| "captures".into()))
-        .map(std::path::PathBuf::from);
-    let record_mb = a
-        .iter()
-        .position(|x| x == "--record-mb")
-        .and_then(|i| a.get(i + 1))
-        .and_then(|v| v.parse::<u64>().ok());
-    let span = a
-        .iter()
-        .position(|x| x == "--span")
-        .and_then(|i| a.get(i + 1))
-        .and_then(|v| v.parse::<f64>().ok())
-        // Quoted in kHz, which is the unit a narrow span is talked about in.
-        .map(|khz| khz * 1e3);
-    let tune = a
-        .iter()
-        .position(|x| x == "--tune")
-        .and_then(|i| a.get(i + 1))
-        .and_then(|v| v.parse::<f64>().ok());
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
+            .with_inner_size(if args.shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
             .with_min_inner_size([800.0, 500.0])
             .with_title("super-radio"),
         ..Default::default()
@@ -515,23 +574,23 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(move |cc| {
             let mut app = ui::App::new(cc);
-            if let Some(hz) = span {
-                app.set_span(hz);
+            if let Some(khz) = args.span {
+                app.set_span(khz * 1e3);
             }
-            if let Some(mhz) = tune {
-                app.tune_to(mhz, mode);
+            if let Some(mhz) = args.tune {
+                app.tune_to(mhz, args.mode.into());
             }
-            app.shot = shot;
-            if let Some(dir) = record.clone() {
-                app.record_to(dir, record_mb);
+            app.shot = args.shot.clone();
+            if let Some(dir) = args.record.clone() {
+                app.record_to(dir, args.record_mb);
             }
-            if a.iter().any(|x| x == "--gain") {
+            if args.gain {
                 app.show_radio_settings();
             }
-            if a.iter().any(|x| x == "--chain") {
+            if args.chain {
                 app.show_chain();
             }
-            app.soak = soak;
+            app.soak = args.soak;
             Ok(Box::new(app))
         }),
     )

@@ -166,6 +166,28 @@ impl Demod {
     }
 }
 
+/// Reopen a radio at a new rate and start it streaming again.
+///
+/// The gain is passed back in because opening a device resets it, and a span
+/// change that silently returned the receiver to its default gain would look
+/// like the antenna had fallen out.
+fn restart(
+    entry: &crate::devices::Entry,
+    rate: Sps,
+    center: Hz,
+    gain: GainMode,
+) -> common::Result<(Box<dyn common::Device>, Box<dyn common::RxStream>)> {
+    // The device needs a moment to release its USB claim; reopening
+    // immediately gets "already in use".
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut dev = crate::devices::open(entry)?;
+    dev.set_rate(rate)?;
+    dev.set_center(center)?;
+    let _ = dev.set_gain("tuner", gain);
+    let stream = dev.start_rx()?;
+    Ok((dev, stream))
+}
+
 /// The sample rate everything downstream of the zoom decimator sees.
 fn eff_rate(rate: f64, zoom: usize) -> f64 {
     rate / zoom.max(1) as f64
@@ -1125,6 +1147,10 @@ fn run(
     dev.set_rate(rate)?;
     dev.set_center(center)?;
     dev.set_gain("tuner", GainMode::Auto)?;
+    // Tracked so a restart can put it back: reopening a device resets it, and
+    // a span change that silently returned the gain to its default would look
+    // like the antenna had fallen out.
+    let mut gain = GainMode::Auto;
 
     let (_player, mut sink) = match AudioPlayer::open(48_000) {
         Ok((p, s)) => (Some(p), Some(s)),
@@ -1184,7 +1210,29 @@ fn run(
                 // frequencies already superseded.
                 Cmd::Center(f) => want_center = Some(f),
                 Cmd::Rate(r) => {
-                    dev.set_rate(r)?;
+                    // A HackRF's streaming reader owns the device and its
+                    // control channel does not carry the sample rate, so the
+                    // radio has to be stopped, reopened and started again.
+                    // Asking anyway used to fail, and the failure propagated
+                    // out of this loop and killed the thread: changing
+                    // bandwidth stopped the receiver dead.
+                    if dev.rate_needs_restart() {
+                        stream.stop();
+                        drop(stream);
+                        match restart(&entry, r, Hz(cur_center as u64), gain) {
+                            Ok((d, s)) => {
+                                dev = d;
+                                stream = s;
+                            }
+                            Err(e) => {
+                                *status.error.lock() = Some(format!("cannot change span: {e}"));
+                                return Ok(());
+                            }
+                        }
+                    } else if let Err(e) = dev.set_rate(r) {
+                        *status.error.lock() = Some(format!("cannot change span: {e}"));
+                        continue;
+                    }
                     cur_rate = dev.rate().as_f64();
                     spec.reset();
                     retune = true;
@@ -1199,7 +1247,10 @@ fn run(
                     }
                 }
                 Cmd::Gain(g) => {
-                    dev.set_gain("tuner", g)?;
+                    gain = g;
+                    if let Err(e) = dev.set_gain("tuner", g) {
+                        *status.error.lock() = Some(format!("cannot set gain: {e}"));
+                    }
                     status.set_radio(RadioControls::read(dev.as_ref()));
                     // Gain changes move the offset with it.
                     dc = None;
@@ -2136,7 +2187,9 @@ mod zoom_tests {
         }
     }
 
+    // Timing, so it needs optimisation to mean anything.
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing test, run with --release")]
     fn narrowing_costs_little_enough_to_run_alongside_everything_else() {
         // It runs on the radio thread, ahead of the spectrum, the scanner and
         // the audio, so anything near real time here stalls all three.
