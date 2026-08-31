@@ -432,6 +432,19 @@ fn main() -> eframe::Result<()> {
         .position(|x| x == "--tune")
         .and_then(|i| a.get(i + 1))
         .and_then(|v| v.parse::<f64>().ok());
+    let mode = a
+        .iter()
+        .position(|x| x == "--mode")
+        .and_then(|i| a.get(i + 1))
+        .map(|v| match v.to_ascii_lowercase().as_str() {
+            "nfm" | "fm" => radio::Demod::Nfm,
+            "am" => radio::Demod::Am,
+            "usb" => radio::Demod::Usb,
+            "lsb" => radio::Demod::Lsb,
+            "cw" => radio::Demod::Cw,
+            _ => radio::Demod::Wfm,
+        })
+        .unwrap_or(radio::Demod::Wfm);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
@@ -445,7 +458,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let mut app = ui::App::new(cc);
             if let Some(mhz) = tune {
-                app.tune_to(mhz, radio::Demod::Wfm);
+                app.tune_to(mhz, mode);
             }
             app.shot = shot;
             if let Some(dir) = record.clone() {
