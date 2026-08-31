@@ -12,6 +12,51 @@ mod waterfall;
 
 /// `--probe <mhz>` runs the radio thread without a window and reports what the
 /// waterfall would be drawing, so the signal path can be checked over ssh.
+/// Report what the squelch is measuring on a frequency, for setting one.
+///
+/// The threshold has to sit above the reading on an empty channel and below
+/// the reading on a signal, and neither number can be guessed from a bench
+/// test: the IF filter limits how much noise there is to measure, so the
+/// figures depend on the mode's own bandwidth.
+fn squelch_probe(mhz: f64, mode: radio::Demod) {
+    use common::{Hz, Sps};
+    let Some(entry) = devices::list().into_iter().next() else {
+        println!("no radio found");
+        return;
+    };
+    let r = radio::Radio::start(entry, Hz((mhz * 1e6) as u64), Sps(2_304_000), 2048, || {});
+    r.send(radio::Cmd::Demod(mode));
+    r.send(radio::Cmd::Listen(Some(0.0)));
+    r.send(radio::Cmd::Volume(0.0));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let mut readings = Vec::new();
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs_f32() < 6.0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (gain, open, measured) = r.status.audio_state();
+        readings.push((measured, gain, open));
+    }
+    r.send(radio::Cmd::Stop);
+    if readings.is_empty() {
+        println!("no audio ran");
+        return;
+    }
+    let mut m: Vec<f32> = readings.iter().map(|(v, _, _)| *v).collect();
+    m.sort_by(f32::total_cmp);
+    let pct = |p: f32| m[((m.len() - 1) as f32 * p) as usize];
+    let open = readings.iter().filter(|(_, _, o)| *o).count();
+    println!(
+        "{mhz} MHz {}: squelch reads {:.1} / {:.1} / {:.1} dB (min/median/max),          open {}% of the time, agc {:+.0} dB",
+        mode.label(),
+        pct(0.0),
+        pct(0.5),
+        pct(1.0),
+        open * 100 / readings.len(),
+        readings.last().unwrap().1,
+    );
+}
+
 fn probe(mhz: f64, listen: bool) {
     use common::{Hz, Sps};
     let rate = 2_304_000.0;
@@ -390,6 +435,25 @@ fn main() -> eframe::Result<()> {
         mpx_report(a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8));
         return Ok(());
     }
+    let mode = a
+        .iter()
+        .position(|x| x == "--mode")
+        .and_then(|i| a.get(i + 1))
+        .map(|v| match v.to_ascii_lowercase().as_str() {
+            "nfm" | "fm" => radio::Demod::Nfm,
+            "am" => radio::Demod::Am,
+            "usb" => radio::Demod::Usb,
+            "lsb" => radio::Demod::Lsb,
+            "cw" => radio::Demod::Cw,
+            _ => radio::Demod::Wfm,
+        })
+        .unwrap_or(radio::Demod::Wfm);
+
+    if let Some(i) = a.iter().position(|x| x == "--squelch-probe") {
+        let mhz = a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(145.5);
+        squelch_probe(mhz, mode);
+        return Ok(());
+    }
     if let Some(i) = a.iter().position(|x| x == "--probe") {
         probe(
             a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(95.8),
@@ -432,19 +496,6 @@ fn main() -> eframe::Result<()> {
         .position(|x| x == "--tune")
         .and_then(|i| a.get(i + 1))
         .and_then(|v| v.parse::<f64>().ok());
-    let mode = a
-        .iter()
-        .position(|x| x == "--mode")
-        .and_then(|i| a.get(i + 1))
-        .map(|v| match v.to_ascii_lowercase().as_str() {
-            "nfm" | "fm" => radio::Demod::Nfm,
-            "am" => radio::Demod::Am,
-            "usb" => radio::Demod::Usb,
-            "lsb" => radio::Demod::Lsb,
-            "cw" => radio::Demod::Cw,
-            _ => radio::Demod::Wfm,
-        })
-        .unwrap_or(radio::Demod::Wfm);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(if shot.is_some() { [1400.0, 860.0] } else { [1280.0, 800.0] })
