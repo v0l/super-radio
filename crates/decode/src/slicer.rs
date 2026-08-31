@@ -192,6 +192,7 @@ mod tests {
         Package {
             pulses: pulses.iter().map(|(m, g)| Pulse { mark: *m, gap: *g }).collect(),
             snr_db: 20.0,
+            rssi_dbfs: -12.0,
             start_sample: 0,
         }
     }

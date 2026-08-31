@@ -1,47 +1,14 @@
 //! The protocol abstraction: what every device decoder implements.
+//!
+//! [`Value`] is re-exported here because a decoder should not have to know it
+//! lives in `common`.
 
 use crate::bits::BitBuffer;
 use crate::slicer::{slice, Timing};
+pub use common::Value;
+
 use dsp::pulse::Package;
 use std::collections::BTreeMap;
-
-/// One decoded field. Kept as a small enum rather than strings so a consumer
-/// can format, convert or plot values without reparsing them.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Text(String),
-}
-
-impl Value {
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Float(v) => Some(*v),
-            Self::Int(v) => Some(*v as f64),
-            _ => None,
-        }
-    }
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Self::Int(v) => Some(*v),
-            Self::Float(v) => Some(*v as i64),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for Value {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Int(v) => write!(f, "{v}"),
-            Self::Float(v) => write!(f, "{v}"),
-            Self::Bool(v) => write!(f, "{v}"),
-            Self::Text(v) => write!(f, "{v}"),
-        }
-    }
-}
 
 /// A successful decode.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +56,18 @@ impl Report {
 
     pub fn get(&self, k: &str) -> Option<&Value> {
         self.fields.get(k)
+    }
+}
+
+impl Report {
+    /// Just the fields, for a list that already has a column naming the
+    /// protocol and another showing the integrity check.
+    pub fn fields_line(&self) -> String {
+        self.fields
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
