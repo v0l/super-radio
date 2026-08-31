@@ -2047,7 +2047,6 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod squelch_probe {
-    use super::tests::*;
     use super::*;
 
     /// An FM carrier modulated by a tone, plus noise, at a given SNR.
