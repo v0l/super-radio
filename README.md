@@ -252,6 +252,25 @@ the noise the meter looks for and the squelch sat open on an empty channel.
 AM, USB, LSB and CW have no capture effect to measure, so they squelch on
 level, set low because those modes are usually listened to wide open.
 
+GAIN opens the radio's own controls, separately from anything the software
+does to the samples afterwards. Each gain stage the device reports gets a
+slider that snaps to the steps the hardware actually has: an R820T takes 29
+discrete values and nothing between them, and a HackRF's LNA moves in 8 dB
+steps while its VGA moves in 2. The values shown are read back from the driver
+rather than remembered, because asking for 30 dB on an R820T gets you 29.7.
+
+A HackRF's three stages appear separately rather than as one number. They do
+different jobs: the LNA sets the noise figure, the VGA drives the converter,
+and the front end amp costs noise figure and overloads on a crowded band, so
+which one you raise matters as much as the total.
+
+The switches a device offers appear there too, each with what it costs: the
+RTL2832U's digital AGC, which rescues a weak signal and ruins any wideband
+measurement because the noise floor moves under you; the bias tee, which puts
+4.5 V on the antenna socket; direct sampling for HF on a v3 dongle. Reference
+oscillator correction and the DC spur removal are in the same place, since
+both are about making the receiver honest rather than about the display.
+
 The display auto-scales against the 10th and 99.9th percentiles rather than the
 extremes, so one strong carrier does not flatten everything else.
 
@@ -376,6 +395,7 @@ with this on.
 ```
 --tune <mhz>        start tuned and listening
 --mode <mode>       wfm, nfm, am, usb, lsb or cw (default wfm)
+--gain              open the radio's own controls on start
 --chain             open on the signal chain view
 --device <name>     pick a radio by name, for when several are plugged in
 --shot <path>       write a PNG of the interface and exit

@@ -146,6 +146,15 @@ pub struct RtlSdr {
     /// Supported tuner gains in dB, ascending, as reported by the tuner driver.
     gains: Vec<f32>,
     streaming: Arc<AtomicBool>,
+    /// Settings the driver cannot read back.
+    ///
+    /// librtlsdr has no getter for any of these, so the only way a control can
+    /// show what is switched on is for the driver to remember what it set.
+    tuner_gain: GainMode,
+    rtl_agc: bool,
+    bias_tee: bool,
+    direct_sampling: bool,
+    ppm: f64,
 }
 
 impl RtlSdr {
@@ -203,10 +212,17 @@ impl RtlSdr {
                 .map(Sps)
                 .collect(),
             rate_range: Sps(225_001)..=Sps(3_200_000),
-            gain_stages: vec![(
-                "tuner".to_string(),
-                gains.first().copied().unwrap_or(0.0)..=gains.last().copied().unwrap_or(0.0),
-            )],
+            gain_stages: vec![common::GainStage {
+                name: "tuner".to_string(),
+                label: "Tuner RF".to_string(),
+                range: gains.first().copied().unwrap_or(0.0)
+                    ..=gains.last().copied().unwrap_or(0.0),
+                // The tuner accepts these exact values and nothing between
+                // them, so the control should offer exactly these.
+                values: gains.clone(),
+                step: 0.0,
+                auto: true,
+            }],
             native_format: SampleFormat::Cu8,
             // The RTL2832U has no analogue anti-alias filter worth the name;
             // the outer ~20% of the span is contaminated by the decimation
@@ -221,6 +237,11 @@ impl RtlSdr {
             rate: Sps(2_048_000),
             gains,
             streaming: Arc::new(AtomicBool::new(false)),
+            tuner_gain: GainMode::Manual(0.0),
+            rtl_agc: false,
+            bias_tee: false,
+            direct_sampling: false,
+            ppm: 0.0,
         };
 
         // Sane defaults: manual tuner gain (AGC hunting ruins wideband
@@ -341,6 +362,7 @@ impl Device for RtlSdr {
         if stage != "tuner" {
             return Err(Error::other(format!("no gain stage named {stage:?}")));
         }
+        self.tuner_gain = mode;
         let _g = self.handle.ctl.lock().unwrap();
         match mode {
             GainMode::Auto => check(
@@ -361,11 +383,65 @@ impl Device for RtlSdr {
         }
     }
 
+    fn gains(&self) -> Vec<(String, GainMode)> {
+        vec![("tuner".to_string(), self.tuner_gain)]
+    }
+
+    fn toggles(&self) -> Vec<common::Toggle> {
+        vec![
+            common::Toggle {
+                name: "rtl_agc".into(),
+                label: "RTL2832U digital AGC".into(),
+                help: "Gain control in the demodulator chip, after the tuner. Recovers a weak signal on a quiet band, and ruins wideband work: the noise floor moves under you and every level measurement moves with it."
+                    .into(),
+                on: self.rtl_agc,
+            },
+            common::Toggle {
+                name: "bias_tee".into(),
+                label: "Bias tee".into(),
+                help: "Puts 4.5 V on the antenna socket to power a mast head amplifier. Leave it off unless you know what is on the other end of the cable, because a shorted or DC coupled antenna takes the current."
+                    .into(),
+                on: self.bias_tee,
+            },
+            common::Toggle {
+                name: "direct_sampling".into(),
+                label: "Direct sampling (HF)".into(),
+                help: "Bypasses the tuner and samples the Q branch directly, which reaches below the tuner's 24 MHz floor on a v3 dongle. Everything above about 14 MHz aliases, and the tuner gain does nothing while it is on."
+                    .into(),
+                on: self.direct_sampling,
+            },
+        ]
+    }
+
+    fn set_toggle(&mut self, name: &str, on: bool) -> Result<()> {
+        match name {
+            "rtl_agc" => {
+                self.set_rtl_agc(on)?;
+                self.rtl_agc = on;
+            }
+            "bias_tee" => {
+                self.set_bias_tee(on)?;
+                self.bias_tee = on;
+            }
+            "direct_sampling" => {
+                self.set_direct_sampling(if on { 2 } else { 0 })?;
+                self.direct_sampling = on;
+            }
+            _ => return Err(Error::other(format!("no setting named {name:?}"))),
+        }
+        Ok(())
+    }
+
+    fn ppm(&self) -> f64 {
+        self.ppm
+    }
+
     fn set_ppm(&mut self, ppm: f64) -> Result<()> {
         let _g = self.handle.ctl.lock().unwrap();
         let rc = unsafe { ffi::rtlsdr_set_freq_correction(self.handle.ptr(), ppm.round() as i32) };
         // -2 means "already set to this value", which is not an error.
         if rc == 0 || rc == -2 {
+            self.ppm = ppm;
             Ok(())
         } else {
             check(rc, "set_freq_correction")

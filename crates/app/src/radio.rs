@@ -54,6 +54,30 @@ impl Demod {
         }
     }
 
+    /// Where the squelch opens by default, or None for a mode with none.
+    ///
+    /// Public because a control has to show the value in use before the
+    /// operator has touched anything, and inventing a second copy of these
+    /// numbers in the interface is how the two drift apart.
+    pub fn default_squelch_db(self) -> Option<f32> {
+        match self {
+            Demod::Nfm => Some(9.0),
+            Demod::Am | Demod::Usb | Demod::Lsb | Demod::Cw => Some(-55.0),
+            Demod::Wfm => None,
+        }
+    }
+
+    /// The range a squelch control should span for this mode, and whether the
+    /// measurement is a noise ratio rather than a level.
+    pub fn squelch_range(self) -> (f32, f32, bool) {
+        match self {
+            // How much of the signal is not noise: 0 dB is an empty channel
+            // and 25 dB is full quieting.
+            Demod::Nfm => (0.0, 25.0, true),
+            _ => (-90.0, -10.0, false),
+        }
+    }
+
     /// The pitch a CW signal is heard at.
     ///
     /// The receiver is tuned this far below the carrier so that the dial
@@ -156,6 +180,16 @@ pub enum Cmd {
     Smoothing(f32),
     /// Remove the centre spur a direct-conversion receiver produces.
     DcBlock(bool),
+    /// Set one named gain stage on the radio itself.
+    GainStage(String, GainMode),
+    /// Flip one of the radio's own switches: bias tee, digital AGC and so on.
+    Toggle(String, bool),
+    /// Reference oscillator correction, in parts per million.
+    Ppm(f64),
+    /// Where the squelch opens, in dB on whatever the mode measures.
+    Squelch(f32),
+    /// Gain control on or off.
+    Agc(bool),
     /// Decode every channel in the span, or stop doing so.
     Decode(bool),
     /// Write every burst that decodes to this directory, with an optional
@@ -518,6 +552,10 @@ pub struct Status {
     /// from a deaf receiver.
     agc_gain: AtomicU32,
     squelch_open: AtomicBool,
+    /// What the squelch measured on the last block, as f32 bits.
+    squelch_level: AtomicU32,
+    /// The radio's own controls, republished whenever one of them moves.
+    radio: parking_lot::Mutex<RadioControls>,
     /// Station name, programme type and radiotext, when RDS is decoding.
     station: parking_lot::Mutex<StationInfo>,
     /// Shape of the chain currently demodulating, republished on every rebuild.
@@ -530,6 +568,39 @@ pub struct Status {
     /// off. Narrow ones run the OOK front end, wide ones the FSK front end.
     pub scan_channels: AtomicU64,
     pub scan_channels_wide: AtomicU64,
+}
+
+/// Everything the radio itself can be set to, and what it is set to now.
+///
+/// Read back from the driver rather than remembered by the interface, because
+/// the hardware quantises: ask an R820T for 30 dB and it gives 29.7, ask a
+/// HackRF's LNA for 20 and it gives 16. A control showing the request rather
+/// than the result is lying about the receiver.
+#[derive(Clone, Debug, Default)]
+pub struct RadioControls {
+    pub stages: Vec<(common::GainStage, GainMode)>,
+    pub toggles: Vec<common::Toggle>,
+    pub ppm: f64,
+}
+
+impl RadioControls {
+    fn read(dev: &dyn common::Device) -> Self {
+        let now = dev.gains();
+        let stages = dev
+            .info()
+            .gain_stages
+            .iter()
+            .map(|st| {
+                let mode = now
+                    .iter()
+                    .find(|(n, _)| *n == st.name)
+                    .map(|(_, m)| *m)
+                    .unwrap_or(GainMode::Manual(*st.range.start()));
+                (st.clone(), mode)
+            })
+            .collect();
+        Self { stages, toggles: dev.toggles(), ppm: dev.ppm() }
+    }
 }
 
 /// What the UI shows about the tuned station.
@@ -562,6 +633,8 @@ impl Default for Status {
             blend: AtomicU32::new(0),
             agc_gain: AtomicU32::new(0),
             squelch_open: AtomicBool::new(true),
+            squelch_level: AtomicU32::new(0),
+            radio: parking_lot::Mutex::new(RadioControls::default()),
             station: parking_lot::Mutex::new(StationInfo::default()),
             chain: parking_lot::Mutex::new(None),
             chain_latency: AtomicU32::new(0),
@@ -577,17 +650,29 @@ impl Status {
         f32::from_bits(self.blend.load(Ordering::Relaxed))
     }
 
-    /// Gain the AGC is applying, in dB, and whether audio is getting through.
-    pub fn audio_gain(&self) -> (f32, bool) {
+    /// The radio's gain stages and switches, as they currently are.
+    pub fn radio(&self) -> RadioControls {
+        self.radio.lock().clone()
+    }
+
+    fn set_radio(&self, c: RadioControls) {
+        *self.radio.lock() = c;
+    }
+
+    /// Gain the AGC is applying in dB, whether audio is getting through, and
+    /// what the squelch measured.
+    pub fn audio_state(&self) -> (f32, bool, f32) {
         (
             f32::from_bits(self.agc_gain.load(Ordering::Relaxed)),
             self.squelch_open.load(Ordering::Relaxed),
+            f32::from_bits(self.squelch_level.load(Ordering::Relaxed)),
         )
     }
 
-    fn set_audio_gain(&self, db: f32, open: bool) {
+    fn set_audio_state(&self, db: f32, open: bool, measured: f32) {
         self.agc_gain.store(db.to_bits(), Ordering::Relaxed);
         self.squelch_open.store(open, Ordering::Relaxed);
+        self.squelch_level.store(measured.to_bits(), Ordering::Relaxed);
     }
 
     fn set_blend(&self, v: f32) {
@@ -710,13 +795,11 @@ const CW_FILTER_HZ: f64 = 500.0;
 /// routinely listened to with the squelch off, which is why the threshold
 /// starts low enough to pass almost anything.
 fn squelch_for(mode: Demod) -> Option<SquelchNode> {
-    match mode {
-        Demod::Nfm => Some(SquelchNode::fm()),
-        Demod::Am | Demod::Usb | Demod::Lsb | Demod::Cw => {
-            Some(SquelchNode::new(SquelchKind::Level, -55.0))
-        }
-        Demod::Wfm => None,
-    }
+    let db = mode.default_squelch_db()?;
+    Some(match mode {
+        Demod::Nfm => SquelchNode::new(SquelchKind::Noise, db),
+        _ => SquelchNode::new(SquelchKind::Level, db),
+    })
 }
 
 /// The gain control a mode wants.
@@ -897,6 +980,44 @@ impl Audio {
         self.graph.output_latency() as f64 / self.audio_rate.max(1.0) * 1e3
     }
 
+    /// Move the squelch threshold on the running chain.
+    ///
+    /// The units differ by mode and that is not hidden: FM measures how much
+    /// of the signal is noise, everything else measures level in dBFS. A
+    /// control has to label itself from [`Audio::squelch_kind`] rather than
+    /// assume.
+    pub fn set_squelch_threshold(&mut self, db: f32) {
+        let Some(id) = self.squelch else { return };
+        if let Some(n) = self.graph.node_mut(id).and_then(|n| n.as_any_mut()) {
+            if let Some(sq) = n.downcast_mut::<SquelchNode>() {
+                sq.set_threshold_db(db);
+            }
+        }
+    }
+
+    /// The threshold the running chain is using, if it has a squelch.
+    pub fn squelch_threshold(&self) -> Option<f32> {
+        let id = self.squelch?;
+        let n = self.graph.node(id)?.as_any()?;
+        n.downcast_ref::<SquelchNode>().map(|sq| sq.threshold_db())
+    }
+
+    /// What that threshold is measured against.
+    pub fn squelch_kind(&self) -> Option<SquelchKind> {
+        let id = self.squelch?;
+        let n = self.graph.node(id)?.as_any()?;
+        n.downcast_ref::<SquelchNode>().map(|sq| sq.kind())
+    }
+
+    pub fn set_agc_enabled(&mut self, on: bool) {
+        let Some(id) = self.agc else { return };
+        if let Some(n) = self.graph.node_mut(id).and_then(|n| n.as_any_mut()) {
+            if let Some(a) = n.downcast_mut::<AgcNode>() {
+                a.set_enabled(on);
+            }
+        }
+    }
+
     /// How much gain the AGC is applying, or zero in a mode without one.
     ///
     /// Worth showing: on a weak signal this is the difference between a dead
@@ -1000,8 +1121,14 @@ fn run(
     let mut dc_on = true;
     let mut stream = dev.start_rx()?;
     status.running.store(true, Ordering::Relaxed);
+    status.set_radio(RadioControls::read(dev.as_ref()));
 
     let mut audio: Option<Audio> = None;
+    // Held here rather than only inside the chain, because the chain is
+    // rebuilt on every retune and mode change and the operator's settings
+    // must survive that.
+    let mut squelch_db: f32 = f32::NAN;
+    let mut agc_on = true;
     // On from the start: a receiver that only decodes what you tuned to will
     // miss the sensor that transmitted once while you were reading the
     // spectrum, and that transmission is the whole reason to be here.
@@ -1049,6 +1176,7 @@ fn run(
                 }
                 Cmd::Gain(g) => {
                     dev.set_gain("tuner", g)?;
+                    status.set_radio(RadioControls::read(dev.as_ref()));
                     // Gain changes move the offset with it.
                     dc = None;
                 }
@@ -1071,6 +1199,44 @@ fn run(
                 Cmd::DcBlock(on) => {
                     dc_on = on;
                     dc = None;
+                }
+                Cmd::GainStage(stage, mode) => {
+                    if let Err(e) = dev.set_gain(&stage, mode) {
+                        *status.error.lock() = Some(format!("{stage} gain: {e}"));
+                    }
+                    // The driver snaps to what the hardware supports, so the
+                    // control has to be told what it actually got rather than
+                    // what it asked for.
+                    status.set_radio(RadioControls::read(dev.as_ref()));
+                    dc = None;
+                }
+                Cmd::Toggle(name, on) => {
+                    if let Err(e) = dev.set_toggle(&name, on) {
+                        *status.error.lock() = Some(format!("{name}: {e}"));
+                    }
+                    status.set_radio(RadioControls::read(dev.as_ref()));
+                    // Any of these changes the offset, and a stale estimate
+                    // shows up as a spur that was not there a moment ago.
+                    dc = None;
+                }
+                Cmd::Ppm(ppm) => {
+                    if let Err(e) = dev.set_ppm(ppm) {
+                        *status.error.lock() = Some(format!("ppm: {e}"));
+                    }
+                    status.set_radio(RadioControls::read(dev.as_ref()));
+                    retune = true;
+                }
+                Cmd::Squelch(db) => {
+                    squelch_db = db;
+                    if let Some(a) = audio.as_mut() {
+                        a.set_squelch_threshold(db);
+                    }
+                }
+                Cmd::Agc(on) => {
+                    agc_on = on;
+                    if let Some(a) = audio.as_mut() {
+                        a.set_agc_enabled(on);
+                    }
                 }
                 Cmd::Record(dir) => {
                     rec = match dir {
@@ -1095,7 +1261,16 @@ fn run(
         }
 
         if retune {
-            audio = listen.map(|off| Audio::new(off, cur_rate, mode, 48_000.0));
+            audio = listen.map(|off| {
+                let mut a = Audio::new(off, cur_rate, mode, 48_000.0);
+                // A rebuilt chain starts at the mode's defaults, so anything
+                // the operator set has to be put back on top of it.
+                if squelch_db.is_finite() {
+                    a.set_squelch_threshold(squelch_db);
+                }
+                a.set_agc_enabled(agc_on);
+                a
+            });
             status.set_chain(
                 audio.as_ref().map(|a| a.graph().topology()),
                 audio.as_ref().map(|a| a.latency_ms()).unwrap_or(0.0),
@@ -1227,7 +1402,7 @@ fn run(
             }
             status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
             status.set_blend(a.stereo_blend());
-            status.set_audio_gain(a.agc_gain_db(), a.squelch_open());
+            status.set_audio_state(a.agc_gain_db(), a.squelch_open(), a.squelch_db());
             let (g, e, sy) = a.rds_stats();
             status.set_station(a.station(), g, e, sy);
         }
