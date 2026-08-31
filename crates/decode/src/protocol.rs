@@ -135,8 +135,23 @@ impl Protocols {
 
     /// All protocols enabled by the active cargo features.
     pub fn all() -> Self {
+        use crate::protocols::*;
         let mut p = Self::new();
-        p.add(Box::new(crate::protocols::FineOffsetWh1080));
+        p.add(Box::new(FineOffsetWh1080));
+        p.add(Box::new(Acurite609Txc));
+        p.add(Box::new(AcuriteTower));
+        p.add(Box::new(LacrosseTx141thBv2));
+        p.add(Box::new(LacrosseIt::tx29()));
+        p.add(Box::new(LacrosseIt::tx35()));
+        p.add(Box::new(NexusTh));
+        p.add(Box::new(Rubicson));
+        p.add(Box::new(Bresser3Ch));
+        p.add(Box::new(GtWt02));
+        p.add(Box::new(GtWt03));
+        p.add(Box::new(FineOffsetWh51));
+        p.add(Box::new(OregonV3));
+        p.add(Box::new(X10Rf));
+        p.add(Box::new(Ev1527));
         p
     }
 

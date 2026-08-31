@@ -10,6 +10,7 @@ mod chainview;
 mod theme;
 mod radio;
 mod record;
+mod session;
 mod ui;
 mod waterfall;
 

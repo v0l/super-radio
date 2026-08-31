@@ -247,7 +247,6 @@ fn tune_gap() -> std::time::Duration {
 pub enum Cmd {
     Center(Hz),
     Rate(Sps),
-    Gain(GainMode),
     /// The complete set of channels to demodulate and mix.
     Channels(Vec<ChannelSpec>),
     /// Master volume, applied to the mix.
@@ -669,8 +668,11 @@ pub struct Status {
     radio: parking_lot::Mutex<RadioControls>,
     /// What each running channel is doing, one entry per channel.
     channels: parking_lot::Mutex<Vec<ChannelState>>,
-    /// Station name, programme type and radiotext, when RDS is decoding.
-    station: parking_lot::Mutex<StationInfo>,
+    /// Station name, programme type and radiotext per channel, for the WFM
+    /// channels that are decoding RDS. Keyed by channel id: two channels on
+    /// two stations each have their own, and sharing one would print the
+    /// first channel's name over every other.
+    stations: parking_lot::Mutex<Vec<(u64, StationInfo)>>,
     /// Shape of the chain currently demodulating, republished on every rebuild.
     chain: parking_lot::Mutex<Option<pipeline::graph::Topology>>,
     /// Delay through that chain in milliseconds, as f32 bits.
@@ -749,7 +751,7 @@ impl Default for Status {
 
             radio: parking_lot::Mutex::new(RadioControls::default()),
             channels: parking_lot::Mutex::new(Vec::new()),
-            station: parking_lot::Mutex::new(StationInfo::default()),
+            stations: parking_lot::Mutex::new(Vec::new()),
             chain: parking_lot::Mutex::new(None),
             chain_latency: AtomicU32::new(0),
             decoded: AtomicU64::new(0),
@@ -805,11 +807,17 @@ impl Status {
         self.chain_latency.store((latency_ms as f32).to_bits(), Ordering::Relaxed);
     }
 
-    pub fn station(&self) -> StationInfo {
-        self.station.lock().clone()
+    /// What one channel is receiving, or nothing when it is not decoding RDS.
+    pub fn station_for(&self, id: u64) -> Option<StationInfo> {
+        self.stations.lock().iter().find(|(k, _)| *k == id).map(|(_, s)| s.clone())
     }
 
-    fn set_station(&self, s: &dsp::rds::Station, groups: u64, errors: u64, synced: bool) {
+    /// The first channel's station, for the headless probe, which runs one.
+    pub fn station(&self) -> StationInfo {
+        self.stations.lock().first().map(|(_, s)| s.clone()).unwrap_or_default()
+    }
+
+    fn set_station(&self, id: u64, s: &dsp::rds::Station, groups: u64, errors: u64, synced: bool) {
         let next = StationInfo {
             pi: s.pi,
             name: s.name.clone(),
@@ -819,17 +827,24 @@ impl Status {
             block_errors: errors,
             synced,
         };
-        let mut cur = self.station.lock();
-        // Only take the lock's write cost when something actually changed;
-        // this runs on every audio block.
-        if *cur != next {
-            *cur = next;
+        let mut cur = self.stations.lock();
+        // Only take the write cost when something actually changed; this runs
+        // on every audio block, for every channel.
+        match cur.iter_mut().find(|(k, _)| *k == id) {
+            Some((_, cur)) if *cur != next => *cur = next,
+            Some(_) => {}
+            None => cur.push((id, next)),
         }
     }
 
-    fn clear_station(&self) {
-        *self.station.lock() = StationInfo::default();
-        self.set_blend(0.0);
+    /// Drop the stations of channels that are no longer running, so a name
+    /// cannot linger over a channel that has been retuned or removed.
+    fn keep_stations(&self, ids: &[u64]) {
+        let mut cur = self.stations.lock();
+        cur.retain(|(id, _)| ids.contains(id));
+        if cur.is_empty() {
+            self.set_blend(0.0);
+        }
     }
 }
 
@@ -1306,15 +1321,6 @@ fn run(
                         r.retune(eff_rate(cur_rate, zoom), dev.center());
                     }
                 }
-                Cmd::Gain(g) => {
-                    gain = g;
-                    if let Err(e) = dev.set_gain("tuner", g) {
-                        *status.error.lock() = Some(format!("cannot set gain: {e}"));
-                    }
-                    status.set_radio(RadioControls::read(dev.as_ref()));
-                    // Gain changes move the offset with it.
-                    dc = None;
-                }
                 Cmd::Channels(specs) => {
                     wanted = specs;
                     retune = true;
@@ -1334,6 +1340,11 @@ fn run(
                 Cmd::GainStage(stage, mode) => {
                     if let Err(e) = dev.set_gain(&stage, mode) {
                         *status.error.lock() = Some(format!("{stage} gain: {e}"));
+                    }
+                    // Reopening for a rate change resets the device, so the
+                    // tuner setting has to survive outside it.
+                    if stage == "tuner" {
+                        gain = mode;
                     }
                     // The driver snaps to what the hardware supports, so the
                     // control has to be told what it actually got rather than
@@ -1408,6 +1419,7 @@ fn run(
             // state along with the station name it had recovered.
             live.retain(|l| wanted.iter().any(|w| w.id == l.spec.id));
             let mut refused: Option<String> = None;
+            let mut rebuilt: Vec<u64> = Vec::new();
             for want in &wanted {
                 let same = |a: &ChannelSpec, b: &ChannelSpec| {
                     a.demod == b.demod && (a.offset_hz - b.offset_hz).abs() < 1.0
@@ -1435,6 +1447,7 @@ fn run(
                             live.retain(|l| l.spec.id != want.id);
                             continue;
                         }
+                        rebuilt.push(want.id);
                         let mut audio = Audio::new(want.offset_hz, rate, want.demod, 48_000.0);
                         if let Some(db) = want.squelch_db {
                             audio.set_squelch_threshold(db);
@@ -1455,10 +1468,14 @@ fn run(
                 live.first().map(|l| l.audio.graph().topology()),
                 live.first().map(|l| l.audio.latency_ms()).unwrap_or(0.0),
             );
-            if !live.iter().any(|l| l.spec.demod == Demod::Wfm) {
-                // The old station's name must not linger over the new one.
-                status.clear_station();
-            }
+            // A chain that was rebuilt has lost its RDS state, and its old
+            // station name must not sit over whatever it is tuned to now.
+            let wfm: Vec<u64> = live
+                .iter()
+                .filter(|l| l.spec.demod == Demod::Wfm && !rebuilt.contains(&l.spec.id))
+                .map(|l| l.spec.id)
+                .collect();
+            status.keep_stations(&wfm);
             retune = false;
             rebuild = false;
         }
@@ -1622,10 +1639,12 @@ fn run(
                 s.write_adaptive_stereo(&mix[..frames * 2], rate);
                 status.audio_backlog.store(s.backlog().max(0) as u64, Ordering::Relaxed);
             }
+            for w in live.iter_mut().filter(|l| l.spec.demod == Demod::Wfm) {
+                let (g, e, sy) = w.audio.rds_stats();
+                status.set_station(w.spec.id, w.audio.station(), g, e, sy);
+            }
             if let Some(w) = live.iter_mut().find(|l| l.spec.demod == Demod::Wfm) {
                 status.set_blend(w.audio.stereo_blend());
-                let (g, e, sy) = w.audio.rds_stats();
-                status.set_station(w.audio.station(), g, e, sy);
             }
         }
     }
@@ -1634,6 +1653,31 @@ fn run(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn each_channel_keeps_its_own_station() {
+        // Two WFM channels are normally two different stations, and a shared
+        // slot printed the first one's name under both.
+        let s = Status::default();
+        let named = |n: &str, pi: u16| dsp::rds::Station {
+            pi: Some(pi),
+            name: Some(n.into()),
+            ..Default::default()
+        };
+        s.set_station(1, &named("SPIRIT", 0x2208), 10, 0, true);
+        s.set_station(2, &named("HEART", 0xC479), 8, 1, true);
+
+        assert_eq!(s.station_for(1).unwrap().name.as_deref(), Some("SPIRIT"));
+        assert_eq!(s.station_for(2).unwrap().name.as_deref(), Some("HEART"));
+        assert_eq!(s.station_for(2).unwrap().groups, 8);
+        // A channel with no RDS shows nothing rather than a neighbour's name.
+        assert!(s.station_for(3).is_none());
+
+        // A removed or rebuilt channel takes its station with it.
+        s.keep_stations(&[2]);
+        assert!(s.station_for(1).is_none());
+        assert_eq!(s.station_for(2).unwrap().name.as_deref(), Some("HEART"));
+    }
 
     fn block(n: usize) -> Vec<C32> {
         (0..n)
