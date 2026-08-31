@@ -1058,17 +1058,20 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(legend(&stage.label));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if stage.auto && ui.selectable_label(auto, "AUTO").clicked() {
-                        self.send(Cmd::GainStage(
-                            stage.name.clone(),
-                            if auto { GainMode::Manual(db) } else { GainMode::Auto },
-                        ));
+                    if stage.auto {
+                        let mut on = auto;
+                        if ui.checkbox(&mut on, "Auto").changed() {
+                            self.send(Cmd::GainStage(
+                                stage.name.clone(),
+                                if on { GainMode::Auto } else { GainMode::Manual(db) },
+                            ));
+                        }
                     }
                     // Under AUTO the number is the hardware's business and
                     // showing a stale one invites the operator to believe it.
                     let text =
                         if auto { "auto".to_string() } else { format!("{db:.1} dB") };
-                    ui.label(value(&text).size(11.0));
+                    ui.label(value(text).size(11.0));
                 });
             });
             let lo = *stage.range.start();
@@ -1093,8 +1096,9 @@ impl App {
             ui.separator();
             ui.add_space(6.0);
             for t in &controls.toggles {
-                if ui.selectable_label(t.on, &t.label).clicked() {
-                    self.send(Cmd::Toggle(t.name.clone(), !t.on));
+                let mut on = t.on;
+                if ui.checkbox(&mut on, &t.label).changed() {
+                    self.send(Cmd::Toggle(t.name.clone(), on));
                 }
                 hint(ui, &t.help);
                 ui.add_space(8.0);
@@ -1122,8 +1126,7 @@ impl App {
         ui.add_space(10.0);
 
         let mut dc = self.dc_block;
-        if ui.selectable_label(dc, "Remove the DC spur").clicked() {
-            dc = !dc;
+        if ui.checkbox(&mut dc, "Remove the DC spur").changed() {
             self.dc_block = dc;
             self.send(Cmd::DcBlock(dc));
         }
@@ -1322,7 +1325,7 @@ impl App {
                     changed = true;
                 }
                 if ch.agc {
-                    ui.label(value(&format!("{gain_db:+.0} dB")).size(10.0));
+                    ui.label(value(format!("{gain_db:+.0} dB")).size(10.0));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !open {
@@ -1341,8 +1344,7 @@ impl App {
                     changed = true;
                 }
                 ui.label(
-                    value(&format!("{db:.0}{}", if ratio { "" } else { " dBFS" }))
-                        .size(10.0),
+                    value(format!("{db:.0}{}", if ratio { "" } else { " dBFS" })).size(10.0),
                 );
             });
         }
