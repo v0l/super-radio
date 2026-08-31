@@ -491,6 +491,13 @@ fn main() -> eframe::Result<()> {
         .position(|x| x == "--record-mb")
         .and_then(|i| a.get(i + 1))
         .and_then(|v| v.parse::<u64>().ok());
+    let span = a
+        .iter()
+        .position(|x| x == "--span")
+        .and_then(|i| a.get(i + 1))
+        .and_then(|v| v.parse::<f64>().ok())
+        // Quoted in kHz, which is the unit a narrow span is talked about in.
+        .map(|khz| khz * 1e3);
     let tune = a
         .iter()
         .position(|x| x == "--tune")
@@ -508,6 +515,9 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(move |cc| {
             let mut app = ui::App::new(cc);
+            if let Some(hz) = span {
+                app.set_span(hz);
+            }
             if let Some(mhz) = tune {
                 app.tune_to(mhz, mode);
             }

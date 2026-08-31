@@ -4,6 +4,7 @@
 use audio::AudioPlayer;
 use common::{GainMode, Hz, Sps, C32};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use dsp::fir::FirDecim;
 use dsp::{DcBlock, Spectrum};
 use nodes::{
     AgcNode, ChannelBank, DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, Gating,
@@ -165,6 +166,11 @@ impl Demod {
     }
 }
 
+/// The sample rate everything downstream of the zoom decimator sees.
+fn eff_rate(rate: f64, zoom: usize) -> f64 {
+    rate / zoom.max(1) as f64
+}
+
 /// Shortest gap between retunes.
 ///
 /// A retune is a blocking USB control transfer costing about 25 ms on the
@@ -203,6 +209,12 @@ pub enum Cmd {
     Toggle(String, bool),
     /// Reference oscillator correction, in parts per million.
     Ppm(f64),
+    /// Narrow the span in software by decimating what the radio delivers.
+    ///
+    /// A HackRF cannot sample below 2 MS/s, so a 12.5 kHz channel is a
+    /// fraction of a pixel wide on any sensible display. This trades span for
+    /// resolution without the radio being involved.
+    Zoom(usize),
     /// Where the squelch opens, in dB on whatever the mode measures.
     Squelch(f32),
     /// Gain control on or off.
@@ -585,6 +597,8 @@ pub struct Status {
     /// off. Narrow ones run the OOK front end, wide ones the FSK front end.
     pub scan_channels: AtomicU64,
     pub scan_channels_wide: AtomicU64,
+    /// Software zoom currently applied, 1 for none.
+    pub zoom: AtomicU64,
 }
 
 /// Everything the radio itself can be set to, and what it is set to now.
@@ -658,6 +672,7 @@ impl Default for Status {
             decoded: AtomicU64::new(0),
             scan_channels: AtomicU64::new(0),
             scan_channels_wide: AtomicU64::new(0),
+            zoom: AtomicU64::new(1),
         }
     }
 }
@@ -1132,6 +1147,11 @@ fn run(
     // must survive that.
     let mut squelch_db: f32 = f32::NAN;
     let mut agc_on = true;
+    // Software zoom: the radio keeps sampling at its own rate and everything
+    // downstream sees a decimated copy.
+    let mut zoom: usize = 1;
+    let mut narrow: Option<FirDecim> = None;
+    let mut narrowed: Vec<C32> = Vec::new();
     // On from the start: a receiver that only decodes what you tuned to will
     // miss the sensor that transmitted once while you were reading the
     // spectrum, and that transmission is the whole reason to be here.
@@ -1172,9 +1192,10 @@ fn run(
                     dc = None;
                     // A different span is a different set of channels, so the
                     // bank is rebuilt rather than retuned.
-                    scan = scan_on.then(|| Scanner::new(cur_rate, dev.center()));
+                    scan = scan_on.then(|| Scanner::new(eff_rate(cur_rate, zoom), dev.center()));
+                    narrow = None;
                     if let Some(r) = rec.as_mut() {
-                        r.retune(cur_rate, dev.center());
+                        r.retune(eff_rate(cur_rate, zoom), dev.center());
                     }
                 }
                 Cmd::Gain(g) => {
@@ -1243,7 +1264,11 @@ fn run(
                 }
                 Cmd::Record(dir) => {
                     rec = match dir {
-                        Some((d, mb)) => match crate::record::Recorder::new(&d, cur_rate, Hz(cur_center as u64)) {
+                        Some((d, mb)) => match crate::record::Recorder::new(
+                            &d,
+                            eff_rate(cur_rate, zoom),
+                            Hz(cur_center as u64),
+                        ) {
                             Ok(r) => Some(match mb {
                                 Some(mb) => r.with_budget(mb << 20),
                                 None => r,
@@ -1256,16 +1281,47 @@ fn run(
                         None => None,
                     };
                 }
+                Cmd::Zoom(n) => {
+                    let n = n.clamp(1, 64);
+                    if n != zoom {
+                        zoom = n;
+                        narrow = None;
+                        spec.reset();
+                        retune = true;
+                        // Every downstream stage is built for a sample rate,
+                        // so all of them are rebuilt rather than adjusted.
+                        scan = scan_on.then(|| Scanner::new(eff_rate(cur_rate, zoom), dev.center()));
+                        if let Some(r) = rec.as_mut() {
+                            r.retune(eff_rate(cur_rate, zoom), dev.center());
+                        }
+                        status.zoom.store(zoom as u64, Ordering::Relaxed);
+                    }
+                }
                 Cmd::Decode(on) => {
                     scan_on = on;
-                    scan = on.then(|| Scanner::new(cur_rate, dev.center()));
+                    scan = on.then(|| Scanner::new(eff_rate(cur_rate, zoom), dev.center()));
                 }
             }
         }
 
         if retune {
-            audio = listen.map(|off| {
-                let mut a = Audio::new(off, cur_rate, mode, 48_000.0);
+            let rate = eff_rate(cur_rate, zoom);
+            // A span narrower than the demodulator's own IF cannot be
+            // demodulated: there is nothing to filter down to. Better to say
+            // so than to build a chain whose decimators all collapse to one
+            // and hand back noise.
+            if listen.is_some() && rate < mode.if_rate() {
+                *status.error.lock() = Some(format!(
+                    "{} needs a span of at least {:.0} kHz; this one is {:.0} kHz",
+                    mode.label(),
+                    mode.if_rate() / 1e3,
+                    rate / 1e3,
+                ));
+            }
+            audio = listen
+                .filter(|_| rate >= mode.if_rate())
+                .map(|off| {
+                let mut a = Audio::new(off, rate, mode, 48_000.0);
                 // A rebuilt chain starts at the mode's defaults, so anything
                 // the operator set has to be put back on top of it.
                 if squelch_db.is_finite() {
@@ -1298,7 +1354,7 @@ fn run(
                     s.retune(dev.center());
                 }
                 if let Some(r) = rec.as_mut() {
-                    r.retune(cur_rate, dev.center());
+                    r.retune(eff_rate(cur_rate, zoom), dev.center());
                 }
                 // The offset differs from tuning to tuning, so re-measure
                 // rather than dragging the old one to the new frequency.
@@ -1329,6 +1385,23 @@ fn run(
             });
             dcb.process(&mut buf.samples);
         }
+
+        // Narrowing happens after the DC block and before anything else, so
+        // the spectrum, the detectors and the audio all see the same samples
+        // at the same rate.
+        if zoom > 1 {
+            let _z = tracing::info_span!("zoom").entered();
+            let f = narrow.get_or_insert_with(|| {
+                // Passband just inside the new Nyquist: the whole point is
+                // that what is left is clean, since anything folded in cannot
+                // be told from a signal afterwards.
+                FirDecim::design_hz(cur_rate, zoom, eff_rate(cur_rate, zoom) * 0.45, 70.0)
+            });
+            narrowed.clear();
+            f.process(&buf.samples, &mut narrowed);
+            std::mem::swap(&mut buf.samples, &mut narrowed);
+        }
+        let cur_rate = eff_rate(cur_rate, zoom);
 
         // Only run the FFT and wake the UI when a frame is actually due.
         // Waking on every USB buffer asks for ~260 repaints a second, which
@@ -2027,5 +2100,75 @@ mod squelch_probe {
             "noise reads {noise:.1} dB and a signal {signal:.1} dB, \
              which leaves no room for a threshold at {default:.1} dB"
         );
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    /// A tone that is a fraction of a channel wide on the full span.
+    fn tone(rate: f64, hz: f64, n: usize) -> Vec<C32> {
+        (0..n)
+            .map(|i| {
+                let p = std::f64::consts::TAU * hz * i as f64 / rate;
+                C32::new(0.5 * p.cos() as f32, 0.5 * p.sin() as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrowing_the_span_puts_more_bins_across_a_channel() {
+        // The reason this exists: on a HackRF's narrowest span a 12.5 kHz
+        // channel is a fraction of a pixel, and no cursor can be placed on it.
+        let native = 2_000_000.0;
+        let fft = 2048;
+        for zoom in [1usize, 32] {
+            let rate = eff_rate(native, zoom);
+            let bins_per_channel = 12_500.0 / (rate / fft as f64);
+            if zoom == 1 {
+                assert!(bins_per_channel < 15.0, "{bins_per_channel:.1} bins already");
+            } else {
+                assert!(
+                    bins_per_channel > 400.0,
+                    "only {bins_per_channel:.0} bins across a channel at /{zoom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_costs_little_enough_to_run_alongside_everything_else() {
+        // It runs on the radio thread, ahead of the spectrum, the scanner and
+        // the audio, so anything near real time here stalls all three.
+        let native = 2_400_000.0;
+        let n = 2_400_000;
+        let sig = tone(native, 30_000.0, n);
+        for zoom in [2usize, 8, 32] {
+            let mut f = FirDecim::design_hz(native, zoom, eff_rate(native, zoom) * 0.45, 70.0);
+            let mut out = Vec::new();
+            let t = std::time::Instant::now();
+            f.process(&sig, &mut out);
+            let x = 1.0 / t.elapsed().as_secs_f64();
+            eprintln!("zoom /{zoom}: {} taps, {x:.0}x real time", f.taps());
+            assert!(x > 5.0, "narrowing by {zoom} only ran at {x:.1}x real time");
+        }
+    }
+
+    #[test]
+    fn what_survives_the_narrowing_is_what_was_inside_it() {
+        // Decimating without filtering folds the rest of the span on top of
+        // what is left, and a folded signal cannot be told from a real one.
+        let native = 2_000_000.0;
+        let zoom = 8;
+        let keep = eff_rate(native, zoom) / 2.0;
+        let mut f = FirDecim::design_hz(native, zoom, eff_rate(native, zoom) * 0.45, 70.0);
+        let mut out = Vec::new();
+        // A signal well outside the narrowed span, which must not appear.
+        f.process(&tone(native, keep * 4.0, 262_144), &mut out);
+        let tail = &out[out.len() / 2..];
+        let leaked = tail.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+        let db = 20.0 * leaked.max(1e-12).log10();
+        assert!(db < -60.0, "a signal outside the span folded in at {db:.1} dBFS");
     }
 }
