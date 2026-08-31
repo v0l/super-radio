@@ -6,6 +6,7 @@ mod dial;
 mod chainview;
 mod theme;
 mod radio;
+mod record;
 mod ui;
 mod waterfall;
 
@@ -307,6 +308,66 @@ fn bench_pan() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
+/// Decode a capture, or a directory of them, and print what came out.
+///
+/// This is the short loop: record once, then run this after every change to
+/// a slicer or a protocol and see immediately whether the same burst now
+/// decodes. No radio, no waiting for a device to transmit, and the same
+/// answer every time.
+fn replay(path: &str) -> anyhow::Result<()> {
+    let path = std::path::Path::new(path);
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|s| s.to_str()),
+                    Some("cu8" | "cs8" | "cs16" | "cf32" | "data")
+                )
+            })
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    if files.is_empty() {
+        anyhow::bail!("no captures in {}", path.display());
+    }
+
+    let (mut decoded, mut unknown) = (0, 0);
+    for f in &files {
+        let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        match radio::replay(f) {
+            Ok(recs) if recs.is_empty() => println!("{name}: nothing decoded"),
+            Ok(recs) => {
+                for r in &recs {
+                    if r.model == "unknown" {
+                        unknown += 1;
+                    } else {
+                        decoded += 1;
+                    }
+                    println!(
+                        "{name}: {:.4} MHz {} {:>6.1} dBFS {:>5.1} dB  {:<22} {:>3} B  {}",
+                        r.freq / 1e6,
+                        r.modulation,
+                        r.rssi_dbfs,
+                        r.snr_db,
+                        r.model,
+                        r.bytes.len(),
+                        r.detail,
+                    );
+                }
+            }
+            Err(e) => println!("{name}: {e}"),
+        }
+    }
+    println!(
+        "\n{} capture(s): {decoded} decoded, {unknown} unknown",
+        files.len()
+    );
+    Ok(())
+}
+
 fn soak_enabled(a: &[String]) -> bool {
     a.iter().any(|x| x == "--soak")
 }
@@ -336,6 +397,13 @@ fn main() -> eframe::Result<()> {
         );
         return Ok(());
     }
+    if let Some(i) = a.iter().position(|x| x == "--replay") {
+        if let Err(e) = replay(a.get(i + 1).map(String::as_str).unwrap_or("captures")) {
+            eprintln!("replay failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let shot = a
         .iter()
         .position(|x| x == "--shot")
@@ -349,6 +417,16 @@ fn main() -> eframe::Result<()> {
         .iter()
         .position(|x| x == "--soak")
         .map(|i| a.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(12.0f32));
+    let record = a
+        .iter()
+        .position(|x| x == "--record")
+        .map(|i| a.get(i + 1).cloned().unwrap_or_else(|| "captures".into()))
+        .map(std::path::PathBuf::from);
+    let record_mb = a
+        .iter()
+        .position(|x| x == "--record-mb")
+        .and_then(|i| a.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok());
     let tune = a
         .iter()
         .position(|x| x == "--tune")
@@ -370,6 +448,9 @@ fn main() -> eframe::Result<()> {
                 app.tune_to(mhz, radio::Demod::Wfm);
             }
             app.shot = shot;
+            if let Some(dir) = record.clone() {
+                app.record_to(dir, record_mb);
+            }
             if a.iter().any(|x| x == "--chain") {
                 app.show_chain();
             }
