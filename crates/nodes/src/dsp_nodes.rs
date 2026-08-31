@@ -6,10 +6,13 @@
 //! DSP is written.
 
 use common::{Result, C32};
+use dsp::agc::Agc;
+use dsp::squelch::{NoiseMeter, Squelch};
+use dsp::ssb::{Sideband, SsbDemod};
 use dsp::{Deemphasis, FirDecim, FmDemod, HighBlend, Mixer};
 use pipeline::param::{Param, ParamValue};
 use pipeline::node::{NodeCtx, PortSpec, Simple};
-use pipeline::port::{Payload, PortKind, StreamSpec, TagValue};
+use pipeline::port::{Payload, PortKind, StreamSpec, Tag, TagValue};
 
 /// Shift a signal in frequency.
 ///
@@ -476,5 +479,292 @@ impl Simple for HighBlendNode {
     fn reset(&mut self) {
         self.blend.iter_mut().for_each(|b| b.reset());
         self.noise = 0.0;
+    }
+}
+
+/// Single sideband and CW demodulator.
+pub struct SsbDemodNode {
+    sideband: Sideband,
+    low_hz: f64,
+    high_hz: f64,
+    demod: SsbDemod,
+}
+
+impl SsbDemodNode {
+    pub fn new(sideband: Sideband, low_hz: f64, high_hz: f64) -> Self {
+        Self {
+            sideband,
+            low_hz,
+            high_hz,
+            demod: SsbDemod::new(48_000.0, sideband, low_hz, high_hz),
+        }
+    }
+
+    pub fn voice(sideband: Sideband) -> Self {
+        Self::new(sideband, 300.0, 2_700.0)
+    }
+
+    /// A CW filter of `width_hz` centred on the pitch the operator hears.
+    pub fn cw(sideband: Sideband, pitch_hz: f64, width_hz: f64) -> Self {
+        let half = width_hz.max(50.0) / 2.0;
+        Self::new(sideband, (pitch_hz - half).max(50.0), pitch_hz + half)
+    }
+}
+
+impl Simple for SsbDemodNode {
+    fn name(&self) -> &str {
+        "ssb_demod"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Iq {
+            return Err(common::Error::other("ssb_demod needs an IQ input"));
+        }
+        self.demod = SsbDemod::new(i.spec.rate, self.sideband, self.low_hz, self.high_hz);
+        Ok(i.spec.with_kind(PortKind::Real))
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, _c: &mut NodeCtx<'_>) -> Result<()> {
+        self.demod.process(i.as_iq().unwrap(), o.real_mut());
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.demod.reset();
+    }
+
+    fn params(&self) -> Vec<Param> {
+        vec![
+            Param::float("low_hz", self.low_hz, 50.0..=3_000.0).unit("Hz").label("Filter low edge"),
+            Param::float("high_hz", self.high_hz, 100.0..=6_000.0)
+                .unit("Hz")
+                .label("Filter high edge"),
+        ]
+    }
+
+    fn set_param(&mut self, name: &str, v: ParamValue) -> Result<()> {
+        match name {
+            "low_hz" => self.low_hz = v.as_f64().unwrap_or(300.0),
+            "high_hz" => self.high_hz = v.as_f64().unwrap_or(2_700.0),
+            _ => return Err(common::Error::other(format!("ssb_demod: unknown parameter {name:?}"))),
+        }
+        self.demod = SsbDemod::new(self.demod_rate(), self.sideband, self.low_hz, self.high_hz);
+        Ok(())
+    }
+}
+
+impl SsbDemodNode {
+    fn demod_rate(&self) -> f64 {
+        48_000.0
+    }
+}
+
+/// Automatic gain control on an audio stream.
+pub struct AgcNode {
+    attack_ms: f64,
+    release_ms: f64,
+    hang_ms: f64,
+    max_gain_db: f32,
+    agc: Agc,
+}
+
+impl AgcNode {
+    pub fn new(attack_ms: f64, release_ms: f64, hang_ms: f64) -> Self {
+        Self {
+            attack_ms,
+            release_ms,
+            hang_ms,
+            max_gain_db: 60.0,
+            agc: Agc::new(48_000.0, attack_ms, release_ms, hang_ms),
+        }
+    }
+
+    pub fn voice() -> Self {
+        Self::new(5.0, 500.0, 300.0)
+    }
+
+    pub fn cw() -> Self {
+        Self::new(2.0, 1_000.0, 500.0)
+    }
+}
+
+impl AgcNode {
+    pub fn gain_db(&self) -> f32 {
+        self.agc.gain_db()
+    }
+}
+
+impl Simple for AgcNode {
+    fn name(&self) -> &str {
+        "agc"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Real {
+            return Err(common::Error::other("agc needs a real input"));
+        }
+        self.agc = Agc::new(i.spec.rate, self.attack_ms, self.release_ms, self.hang_ms);
+        self.agc.set_max_gain_db(self.max_gain_db);
+        Ok(i.spec)
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
+        let out = o.real_mut();
+        out.extend_from_slice(i.as_real().unwrap());
+        self.agc.process(out);
+        // Reported rather than hidden: on a weak signal the gain is the
+        // difference between "the band is dead" and "the receiver is deaf",
+        // and only one of those is worth acting on.
+        c.tag(Tag::new(c.sample_index, "agc_gain_db", TagValue::Float(self.agc.gain_db() as f64)));
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.agc.reset();
+    }
+
+    fn params(&self) -> Vec<Param> {
+        vec![
+            Param::float("attack_ms", self.attack_ms, 0.5..=50.0).unit("ms").label("Attack"),
+            Param::float("release_ms", self.release_ms, 50.0..=5_000.0)
+                .unit("ms")
+                .label("Release")
+                .log(),
+            Param::float("hang_ms", self.hang_ms, 0.0..=2_000.0).unit("ms").label("Hang"),
+            Param::float("max_gain_db", self.max_gain_db as f64, 0.0..=90.0)
+                .unit("dB")
+                .label("Maximum gain"),
+        ]
+    }
+
+    fn set_param(&mut self, name: &str, v: ParamValue) -> Result<()> {
+        match name {
+            "attack_ms" => self.attack_ms = v.as_f64().unwrap_or(5.0),
+            "release_ms" => self.release_ms = v.as_f64().unwrap_or(500.0),
+            "hang_ms" => self.hang_ms = v.as_f64().unwrap_or(300.0),
+            "max_gain_db" => {
+                self.max_gain_db = v.as_f64().unwrap_or(60.0) as f32;
+                self.agc.set_max_gain_db(self.max_gain_db);
+                return Ok(());
+            }
+            _ => return Err(common::Error::other(format!("agc: unknown parameter {name:?}"))),
+        }
+        let rate = self.agc.rate();
+        self.agc = Agc::new(rate, self.attack_ms, self.release_ms, self.hang_ms);
+        self.agc.set_max_gain_db(self.max_gain_db);
+        Ok(())
+    }
+}
+
+/// How a squelch decides whether a channel is busy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SquelchKind {
+    /// Noise above the speech band against everything below it. For FM.
+    Noise,
+    /// Plain audio level. For everything else.
+    Level,
+}
+
+/// Mute a channel with nothing on it.
+pub struct SquelchNode {
+    kind: SquelchKind,
+    threshold_db: f32,
+    hysteresis_db: f32,
+    squelch: Squelch,
+    meter: NoiseMeter,
+    open: bool,
+    measured: f32,
+}
+
+impl SquelchNode {
+    pub fn new(kind: SquelchKind, threshold_db: f32) -> Self {
+        Self {
+            kind,
+            threshold_db,
+            hysteresis_db: 3.0,
+            squelch: Squelch::new(48_000.0, threshold_db, threshold_db - 3.0, 5.0),
+            meter: NoiseMeter::new(48_000.0, 4_000.0),
+            open: false,
+            measured: -120.0,
+        }
+    }
+
+    /// Narrowband FM, at the level where a signal becomes intelligible.
+    pub fn fm() -> Self {
+        Self::new(SquelchKind::Noise, 9.0)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// What the squelch measured on the last block, in dB.
+    pub fn measured_db(&self) -> f32 {
+        self.measured
+    }
+}
+
+impl Simple for SquelchNode {
+    fn name(&self) -> &str {
+        "squelch"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Real {
+            return Err(common::Error::other("squelch needs a real input"));
+        }
+        self.squelch = Squelch::new(
+            i.spec.rate,
+            self.threshold_db,
+            self.threshold_db - self.hysteresis_db,
+            5.0,
+        );
+        self.meter = NoiseMeter::new(i.spec.rate, 4_000.0);
+        Ok(i.spec)
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
+        let input = i.as_real().unwrap();
+        let measured = match self.kind {
+            SquelchKind::Noise => self.meter.measure(input),
+            SquelchKind::Level => dsp::squelch::level_db(input),
+        };
+        self.measured = measured;
+        self.open = self.squelch.update(measured, input.len());
+        let out = o.real_mut();
+        out.extend_from_slice(input);
+        self.squelch.apply(out);
+        let at = c.sample_index;
+        c.tag(Tag::new(at, "squelch_open", TagValue::Int(self.open as i64)));
+        c.tag(Tag::new(at, "squelch_db", TagValue::Float(measured as f64)));
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.squelch.reset();
+        self.meter.reset();
+        self.open = false;
+    }
+
+    fn params(&self) -> Vec<Param> {
+        vec![
+            Param::float("threshold_db", self.threshold_db as f64, -100.0..=40.0)
+                .unit("dB")
+                .label("Threshold"),
+            Param::float("hysteresis_db", self.hysteresis_db as f64, 0.0..=20.0)
+                .unit("dB")
+                .label("Hysteresis"),
+        ]
+    }
+
+    fn set_param(&mut self, name: &str, v: ParamValue) -> Result<()> {
+        match name {
+            "threshold_db" => self.threshold_db = v.as_f64().unwrap_or(9.0) as f32,
+            "hysteresis_db" => self.hysteresis_db = v.as_f64().unwrap_or(3.0) as f32,
+            _ => return Err(common::Error::other(format!("squelch: unknown parameter {name:?}"))),
+        }
+        self.squelch
+            .set_thresholds(self.threshold_db, self.threshold_db - self.hysteresis_db);
+        Ok(())
     }
 }
