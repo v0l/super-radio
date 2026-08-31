@@ -174,4 +174,15 @@ impl<T: Simple + 'static> Node for T {
     fn set_param(&mut self, name: &str, value: ParamValue) -> Result<()> {
         Simple::set_param(self, name, value)
     }
+    /// Forwarded so a caller can read a running node's own state.
+    ///
+    /// Without this, every node written against `Simple` was invisible: the
+    /// blanket implementation left the default returning `None`, so a
+    /// downcast to the concrete type always failed and the state could only
+    /// be reached through tags. That is fine for something that changes
+    /// occasionally and wrong for something a display wants on every frame,
+    /// like the gain an AGC is currently applying.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
