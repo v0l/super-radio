@@ -2,7 +2,7 @@
 
 use crate::bands;
 use crate::dial::Dial;
-use crate::radio::{Cmd, Demod, Frame, Radio, StationInfo};
+use crate::radio::{Cmd, DecodeRecord, Demod, Frame, Radio, StationInfo};
 use crate::theme::{self, legend, value};
 use crate::waterfall::Waterfall;
 use crate::wheel::Wheel;
@@ -53,6 +53,9 @@ pub struct App {
     pub soak: Option<f32>,
     /// Save a PNG to this path once the radio has settled, then quit.
     pub shot: Option<String>,
+    /// Where bursts are being written and how much may be written, when
+    /// recording.
+    record_dir: Option<(std::path::PathBuf, Option<u64>)>,
     shot_at: Option<std::time::Instant>,
     shot_sent: bool,
     /// Remove the direct-conversion centre spur. On by default: it is an
@@ -64,6 +67,39 @@ pub struct App {
     /// thread that has to keep draining USB.
     chain_topo: Option<pipeline::graph::Topology>,
     chain_latency: f64,
+    /// Packets decoded anywhere in the span, oldest first.
+    decodes: Vec<Logged>,
+    /// Number given to the next packet.
+    next_packet: u64,
+    /// Packet whose bytes are shown in the dump.
+    selected: Option<u64>,
+    /// Show bursts no protocol claimed.
+    show_unknown: bool,
+    /// Width of the waterfall pane at the last redraw, in pixels. Marks are
+    /// stamped into the texture and have to be widened when it holds more bins
+    /// than the pane has pixels, which is the usual case.
+    /// Seeded rather than zero so a packet arriving before the first redraw
+    /// is still stamped at roughly the right width.
+    fall_px: f32,
+    /// Waterfall rows pushed since the app started.
+    ///
+    /// Marks are aged in rows, not seconds. Rows are only pushed when a
+    /// spectrum frame is due *and* one has arrived, so a busy moment or a
+    /// slow device makes the waterfall scroll slower than `rows_per_sec`
+    /// suggests. Ageing a mark by wall clock then slides it away from the
+    /// trace it belongs to, which is exactly the error it exists to avoid.
+    rows_pushed: u64,
+    /// Decoding every channel is on by default and can be turned off; it is
+    /// the most expensive thing the app does.
+    decode_on: bool,
+    /// Whether the packet log is showing.
+    log_open: bool,
+    /// Share of the scope pane given to the spectrum, the rest going to the
+    /// waterfall. Dragged rather than fixed: which of the two matters depends
+    /// entirely on what is being looked for.
+    plot_frac: f32,
+    /// The split between spectrum and waterfall is being dragged.
+    splitting: bool,
     /// Channel whose marker is being dragged in the spectrum.
     drag_ch: Option<usize>,
     /// Shared per-digit readout for the channel strip. Only one channel can be
@@ -78,6 +114,17 @@ pub struct App {
 pub enum Settings {
     Spectrum,
     Waterfall,
+}
+
+/// A decode, plus where the waterfall was when it arrived.
+pub struct Logged {
+    /// Position in the capture, counted from the first packet and never
+    /// reused. It is printed in the list and stamped on the waterfall, and is
+    /// the only thing tying one to the other.
+    id: u64,
+    rec: DecodeRecord,
+    /// Value of `rows_pushed` when this packet was logged.
+    row: u64,
 }
 
 pub struct Channel {
@@ -114,6 +161,21 @@ impl View {
     }
 }
 
+/// Packets kept in the log. About a screenful of scrollback at any plausible
+/// reading speed, and bounded memory on a band that never goes quiet.
+const DECODE_LOG_MAX: usize = 500;
+
+/// Colour of a packet whose integrity check passed.
+const CRC_OK: Color32 = Color32::from_rgb(0x6F, 0xD1, 0x8A);
+
+/// Share of the scope pane the spectrum gets by default.
+const DEFAULT_PLOT_FRAC: f32 = 0.34;
+/// Range the split can be dragged to. Neither pane may be squeezed to nothing:
+/// a two pixel waterfall is not a smaller waterfall, it is a broken one.
+const PLOT_FRAC_RANGE: std::ops::RangeInclusive<f32> = 0.12..=0.85;
+/// Height of the drag handle between the two, in pixels.
+const SPLIT_GRIP_H: f32 = 7.0;
+
 /// How near the pointer must be to a channel marker to grab it, in pixels.
 ///
 /// Must exceed egui's drag threshold, or the pointer leaves the marker before
@@ -132,6 +194,7 @@ fn device_rates(e: &crate::devices::Entry) -> std::ops::RangeInclusive<Sps> {
 impl Default for App {
     fn default() -> Self {
         Self {
+            record_dir: None,
             radio: None,
             err: None,
             center: 95_800_000.0,
@@ -165,6 +228,16 @@ impl Default for App {
             spans: Vec::new(),
             soak: None,
             shot: None,
+            decodes: Vec::new(),
+            next_packet: 1,
+            fall_px: 1000.0,
+            selected: None,
+            show_unknown: true,
+            rows_pushed: 0,
+            decode_on: true,
+            log_open: true,
+            plot_frac: DEFAULT_PLOT_FRAC,
+            splitting: false,
             drag_ch: None,
             chan_dial: crate::dial::Dial::new(),
             shot_at: None,
@@ -185,6 +258,16 @@ impl App {
         app.device = app.devices.first().cloned();
         app.connect(&cc.egui_ctx);
         app
+    }
+
+    /// Record every burst that decodes into a directory of captures.
+    ///
+    /// Held rather than sent once: choosing a device, or changing the span,
+    /// starts a new radio thread, and recording that quietly stopped when the
+    /// UI reconnected would be worse than not recording at all.
+    pub fn record_to(&mut self, dir: std::path::PathBuf, budget_mb: Option<u64>) {
+        self.record_dir = Some((dir.clone(), budget_mb));
+        self.send(Cmd::Record(Some((dir, budget_mb))));
     }
 
     /// Start tuned to a station and listening to it.
@@ -224,6 +307,9 @@ impl App {
             self.fft,
             move || c.request_repaint(),
         ));
+        if let Some(r) = self.record_dir.clone() {
+            self.send(Cmd::Record(Some(r)));
+        }
         self.reset_waterfall();
     }
 
@@ -264,6 +350,13 @@ impl App {
         }
         self.chain_topo = radio.status.chain();
         self.chain_latency = radio.status.chain_latency();
+        let mut batches = Vec::new();
+        while let Ok(batch) = radio.decodes.try_recv() {
+            batches.push(batch);
+        }
+        for b in batches {
+            self.log_decodes(b);
+        }
         if let Some(f) = latest {
             // The requested centre is not overwritten by the frame's. Retunes
             // are spaced out because each blocks the radio thread, so frames
@@ -296,12 +389,67 @@ impl App {
                 // ramp wants the opposite or its hottest colours go unused.
                 let pending = std::mem::take(&mut self.wf_pending);
                     self.wf.push(&pending, self.floor, self.ceil - self.wf_top_offset);
+                self.rows_pushed += 1;
                 self.wf_pending = pending;
                 self.wf_pending.fill(f32::MIN);
                 self.wf_last = Some(std::time::Instant::now());
             }
             self.db = f.db;
         }
+    }
+
+    /// Append decoded packets to the log, oldest first.
+    ///
+    /// Each is stamped with the waterfall row it belongs to, worked back from
+    /// when the radio thread saw it rather than when the UI got round to
+    /// reading it. The two differ by however long the queue and the frame took,
+    /// and a mark that is a few rows late is a mark on the wrong signal.
+    fn log_decodes(&mut self, batch: Vec<DecodeRecord>) {
+        let now = std::time::Instant::now();
+        let pushed = self.rows_pushed;
+        let rate = self.rows_per_sec.max(0.1);
+        let first = self.decodes.len();
+        for rec in batch {
+            let back = (now.duration_since(rec.at).as_secs_f32() * rate).round() as u64;
+            let id = self.next_packet;
+            self.next_packet += 1;
+            self.decodes.push(Logged { id, rec, row: pushed.saturating_sub(back) });
+        }
+        self.stamp_marks(first, self.fall_px);
+        // A busy band produces packets faster than anyone reads them, and an
+        // unbounded log is a slow memory leak with a scrollbar.
+        if self.decodes.len() > DECODE_LOG_MAX {
+            let drop = self.decodes.len() - DECODE_LOG_MAX;
+            self.decodes.drain(..drop);
+            // A selection that has aged out of the list must not leave the
+            // dump showing bytes with no row above them.
+            if self.selected.is_some_and(|id| !self.decodes.iter().any(|l| l.id == id)) {
+                self.selected = None;
+            }
+        }
+    }
+
+    /// Where a decode's mark belongs on the waterfall, or `None` when it has
+    /// scrolled off or sits outside the span.
+    fn mark_pos(&self, fall: &Rect, rec: &Logged) -> Option<Pos2> {
+        // Frequency is measured against the waterfall's own centre, not the
+        // tuned one. They differ while a retune is pending, and the history
+        // has already been slid to match itself rather than the dial.
+        let lo = self.wf_center - self.rate / 2.0;
+        let x = fall.left() + ((rec.rec.freq - lo) / self.rate) as f32 * fall.width();
+        if !fall.x_range().contains(x) {
+            return None;
+        }
+
+        // Whole rows, matching the bracket stamped into the texture. A
+        // fractional offset would look smoother and put the number a row off
+        // the mark it names.
+        let row = self.rows_pushed.saturating_sub(rec.row) as f32;
+        if row > self.wf.filled() as f32 {
+            return None;
+        }
+        let row_h = fall.height() / self.wf.height().max(1) as f32;
+        Some(Pos2::new(x, fall.top() + row * row_h))
     }
 
     /// Slide the waterfall to match a new centre frequency.
@@ -488,6 +636,10 @@ impl eframe::App for App {
         {
             let _s = tracing::info_span!("strip").entered();
             self.strip(ui);
+        }
+        {
+            let _s = tracing::info_span!("log").entered();
+            self.decode_log(ui);
         }
         {
             let _s = tracing::info_span!("scope").entered();
@@ -703,6 +855,26 @@ impl App {
                                 }
                             });
                         self.view = v;
+                    });
+
+                    ui.add_space(18.0);
+                    self.divider(ui);
+                    ui.add_space(18.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(legend("decode"));
+                        ui.horizontal(|ui| {
+                            // Decoding the whole span at once is the expensive
+                            // thing the app does, so it is a switch rather
+                            // than something buried in a settings modal.
+                            if ui.selectable_label(self.decode_on, "ALL").clicked() {
+                                self.decode_on = !self.decode_on;
+                                self.send(Cmd::Decode(self.decode_on));
+                            }
+                            if ui.selectable_label(self.log_open, "LOG").clicked() {
+                                self.log_open = !self.log_open;
+                            }
+                        });
                     });
 
                     ui.add_space(18.0);
@@ -1141,13 +1313,18 @@ impl App {
     fn scope(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
         let ribbon_h = 16.0;
-        let plot_h = (full.height() - ribbon_h) * 0.34;
+        let usable = (full.height() - ribbon_h - SPLIT_GRIP_H).max(1.0);
+        let plot_h = usable * self.plot_frac.clamp(*PLOT_FRAC_RANGE.start(), *PLOT_FRAC_RANGE.end());
         let plot = Rect::from_min_max(full.min, Pos2::new(full.right(), full.top() + plot_h));
         let ribbon = Rect::from_min_max(
             Pos2::new(full.left(), plot.bottom()),
             Pos2::new(full.right(), plot.bottom() + ribbon_h),
         );
-        let fall = Rect::from_min_max(Pos2::new(full.left(), ribbon.bottom()), full.max);
+        let grip = Rect::from_min_max(
+            Pos2::new(full.left(), ribbon.bottom()),
+            Pos2::new(full.right(), ribbon.bottom() + SPLIT_GRIP_H),
+        );
+        let fall = Rect::from_min_max(Pos2::new(full.left(), grip.bottom()), full.max);
 
         let resp = ui.allocate_rect(full, Sense::click_and_drag());
         let p = ui.painter_at(full).to_owned();
@@ -1168,9 +1345,13 @@ impl App {
             self.wf.draw(ui.ctx(), &p, fall);
         }
 
+        self.fall_px = fall.width();
+        self.decode_marks(&p, &fall);
         self.markers(&p, &full);
 
         let hover = resp.hover_pos();
+        let grip_hot = self.splitting || hover.is_some_and(|h| grip.contains(h));
+        split_grip(&p, &grip, grip_hot);
         let plot_hot = hover.is_some_and(|h| plot_cog.contains(h));
         let fall_hot = hover.is_some_and(|h| fall_cog.contains(h));
 
@@ -1193,6 +1374,9 @@ impl App {
                     self.open = Some(Settings::Spectrum);
                 } else if fall_cog.contains(pos) {
                     self.open = Some(Settings::Waterfall);
+                } else if grip.contains(pos) {
+                    // Dropping a channel on the divider is never what was
+                    // meant; a double click there restores the default split.
                 } else {
                     // Hit testing uses the true position; only the frequency a
                     // new channel lands on is snapped, so shift-clicking an
@@ -1217,14 +1401,23 @@ impl App {
             let origin = ui
                 .input(|i| i.pointer.press_origin())
                 .or_else(|| resp.interact_pointer_pos());
+            self.splitting = origin.is_some_and(|pos| grip.contains(pos));
             self.drag_ch = origin.and_then(|pos| {
-                if plot_cog.contains(pos) || fall_cog.contains(pos) {
+                if plot_cog.contains(pos) || fall_cog.contains(pos) || grip.contains(pos) {
                     return None;
                 }
                 self.channel_at(&full, pos.x)
             });
         }
-        if resp.dragged() {
+        if resp.dragged() && self.splitting {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                // Follow the pointer rather than accumulating deltas, so the
+                // divider cannot drift away from the cursor over a long drag.
+                let f = (pos.y - full.top() - SPLIT_GRIP_H / 2.0) / usable;
+                self.plot_frac =
+                    f.clamp(*PLOT_FRAC_RANGE.start(), *PLOT_FRAC_RANGE.end());
+            }
+        } else if resp.dragged() {
             match self.drag_ch {
                 Some(i) if i < self.channels.len() => {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -1246,16 +1439,21 @@ impl App {
         }
         if resp.drag_stopped() {
             self.drag_ch = None;
+            self.splitting = false;
+        }
+
+        if resp.double_clicked() && hover.is_some_and(|h| grip.contains(h)) {
+            self.plot_frac = DEFAULT_PLOT_FRAC;
         }
 
         // A marker under the pointer is draggable, so say so.
-        if self.drag_ch.is_some() {
+        if grip_hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        } else if self.drag_ch.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         } else if let Some(h) = hover {
-            if !plot_hot && !fall_hot {
-                if self.channel_at(&full, h.x).is_some() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
+            if !plot_hot && !fall_hot && self.channel_at(&full, h.x).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
         }
 
@@ -1386,6 +1584,289 @@ impl App {
         }
     }
 
+    /// Marks on the waterfall where packets were decoded.
+    ///
+    /// Drawn on the waterfall rather than the spectrum because a decode is an
+    /// event in time as much as in frequency, and the waterfall is the only
+    /// axis that shows time. The mark ages downwards with the row it belongs
+    /// to, so it stays attached to the trace that produced it instead of
+    /// hovering over whatever is transmitting now.
+    fn decode_marks(&self, p: &egui::Painter, fall: &Rect) {
+        if self.decodes.is_empty() {
+            return;
+        }
+        let mut labelled: Vec<Rect> = Vec::new();
+        for log in self.decodes.iter().rev() {
+            if self.rows_pushed.saturating_sub(log.row) > self.wf.filled() as u64 {
+                // Older than the history still on screen, and the list is in
+                // order, so everything left is older still.
+                break;
+            }
+            let Some(at) = self.mark_pos(fall, log) else { continue };
+            // The bracket itself is in the texture, put there when the packet
+            // arrived. All that is left to draw is its number, and only that:
+            // a protocol name over the waterfall is unreadable at the sizes
+            // that matter and covers the signal it describes. The number ties
+            // the mark to a row in the list, where there is room to say more.
+            let col = row_color(&log.rec);
+            let g = p.layout_no_wrap(
+                log.id.to_string(),
+                FontId::new(10.0, FontFamily::Name(theme::READOUT_FONT.into())),
+                col,
+            );
+            // Clear of the bracket's right arm, which is about five pixels
+            // wide however many bins the texture holds.
+            let pos = Pos2::new(at.x + 10.0, at.y - g.size().y / 2.0);
+            let box_ = Rect::from_min_size(pos, g.size()).expand(2.0);
+            if fall.contains_rect(box_) && !labelled.iter().any(|r: &Rect| r.intersects(box_)) {
+                labelled.push(box_);
+                p.galley(pos, g, col);
+            }
+        }
+    }
+
+    /// Stamp newly logged packets into the waterfall history.
+    ///
+    /// Done once, when the packet is logged, rather than every frame: the mark
+    /// then belongs to the row it was received on for as long as that row
+    /// exists, and no redraw can move it.
+    fn stamp_marks(&mut self, from: usize, pane_px: f32) {
+        let bins = self.wf.width();
+        if bins == 0 || pane_px < 1.0 {
+            return;
+        }
+        let bins_per_px = ((bins as f32 / pane_px).round() as usize).max(1);
+        let lo = self.wf_center - self.rate / 2.0;
+        for i in from..self.decodes.len() {
+            let log = &self.decodes[i];
+            let bin = ((log.rec.freq - lo) / self.rate * bins as f64).round();
+            if !(0.0..bins as f64).contains(&bin) {
+                continue;
+            }
+            let back = self.rows_pushed.saturating_sub(log.row) as usize;
+            let col = row_color(&log.rec);
+            self.wf.mark(bin as usize, back, col, bins_per_px);
+        }
+    }
+
+    /// The packet log: everything decoded anywhere in the span.
+    fn decode_log(&mut self, ui: &mut egui::Ui) {
+        if !self.log_open {
+            return;
+        }
+        Panel::bottom("decodes")
+            .default_size(230.0)
+            // Drag the top edge to resize. A band that is busy wants a tall
+            // list; one that is quiet wants the waterfall back.
+            .resizable(true)
+            .min_size(64.0)
+            .max_size(720.0)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ui, |ui| {
+                self.log_header(ui);
+                ui.add_space(4.0);
+                let selected = self
+                    .selected
+                    .and_then(|id| self.decodes.iter().find(|l| l.id == id))
+                    .map(|l| l.rec.clone());
+                let dump_h = if selected.is_some() { 116.0 } else { 0.0 };
+                let list_h = (ui.available_height() - dump_h).max(24.0);
+                // Two nested scroll areas so the headings stay above the rows
+                // vertically but travel with them sideways, which is the only
+                // arrangement where a narrow window can still reach the last
+                // column and the headings never leave the top.
+                // Both areas are given an explicit height. Without it the
+                // content asks for as much room as it has rows, the panel
+                // grows to match, and the headings are pushed off the top of
+                // the window they are supposed to be pinned to.
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, false])
+                    .max_height(list_h)
+                    .show(ui, |ui| {
+                    let w = ui.available_width().max(Self::table_width());
+                    ui.set_min_width(w);
+                    if !self.decodes.is_empty() {
+                        self.log_header_row(ui, w);
+                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height((list_h - Self::ROW_H).max(16.0))
+                        // Follow the newest only while nothing is selected:
+                        // sticking to the bottom drags a selected packet off
+                        // screen the moment another one arrives.
+                        .stick_to_bottom(self.selected.is_none())
+                        .id_salt("packet_rows")
+                        .show(ui, |ui| self.log_rows(ui, w));
+                });
+                if let Some(rec) = selected {
+                    ui.separator();
+                    packet_detail(ui, &rec);
+                }
+            });
+    }
+
+    fn log_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(legend("packets"));
+            ui.label(value(self.decodes.len().to_string()).size(12.0));
+            if let Some(r) = &self.radio {
+                use std::sync::atomic::Ordering;
+                let narrow = r.status.scan_channels.load(Ordering::Relaxed);
+                let wide = r.status.scan_channels_wide.load(Ordering::Relaxed);
+                let total = r.status.decoded.load(Ordering::Relaxed);
+                ui.add_space(10.0);
+                ui.label(legend(&if narrow > 0 {
+                    format!("{narrow} ook + {wide} fsk channels, {total} seen")
+                } else {
+                    "decoding off".into()
+                }));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("CLEAR").clicked() {
+                    self.decodes.clear();
+                    self.selected = None;
+                }
+                // Unknown bursts are the point of scanning a band, but on a
+                // noisy one they crowd out the decodes, so they can be hidden
+                // here without turning the reporting off upstream.
+                if ui.selectable_label(self.show_unknown, "UNKNOWN").clicked() {
+                    self.show_unknown = !self.show_unknown;
+                }
+            });
+        });
+    }
+
+    /// Column headings and their widths in pixels. Fixed rather than sized to
+    /// the content: a table whose columns resize as packets arrive is a table
+    /// that moves under the pointer, and the last column absorbs the slack.
+    const COLS: [(&'static str, f32); 8] = [
+        ("no", 40.0),
+        ("time", 64.0),
+        ("frequency", 96.0),
+        ("mod", 34.0),
+        ("rssi", 48.0),
+        ("snr", 44.0),
+        ("protocol", 140.0),
+        ("len", 38.0),
+    ];
+    const ROW_H: f32 = 16.0;
+
+    /// Width the table needs before the info column starts being squeezed.
+    fn table_width() -> f32 {
+        Self::COLS.iter().map(|(_, w)| w).sum::<f32>() + 340.0
+    }
+
+    /// The heading strip, above the rows and outside their vertical scroll, so
+    /// it cannot scroll away from what it labels.
+    fn log_header_row(&self, ui: &mut egui::Ui, w: f32) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, Self::ROW_H), Sense::hover());
+        let p = ui.painter_at(rect);
+        let mut x = rect.left();
+        for (name, cw) in Self::COLS {
+            Self::cell(&p, rect, x, cw, name, theme::LEGEND);
+            x += cw;
+        }
+        Self::cell(&p, rect, x, rect.right() - x, "info", theme::LEGEND);
+        p.line_segment(
+            [Pos2::new(rect.left(), rect.bottom()), Pos2::new(rect.right(), rect.bottom())],
+            Stroke::new(1.0, theme::ETCH),
+        );
+    }
+
+    /// One cell of text, clipped to its column so a long field cannot push the
+    /// ones after it sideways.
+    fn cell(p: &egui::Painter, row: Rect, x: f32, w: f32, text: &str, col: Color32) {
+        let r = Rect::from_min_max(Pos2::new(x, row.top()), Pos2::new(x + w - 6.0, row.bottom()));
+        p.with_clip_rect(r.intersect(p.clip_rect())).text(
+            Pos2::new(r.left(), r.center().y),
+            Align2::LEFT_CENTER,
+            text,
+            FontId::new(11.0, FontFamily::Name(theme::READOUT_FONT.into())),
+            col,
+        );
+    }
+
+    fn log_rows(&mut self, ui: &mut egui::Ui, width: f32) {
+        if self.decodes.is_empty() {
+            ui.label(legend(if self.decode_on {
+                "listening to every channel in the span"
+            } else {
+                "decoding is off"
+            }));
+            return;
+        }
+        let t0 = self.decodes.first().map(|l| l.rec.at);
+        let mut clicked = None;
+
+        for (n, log) in self.decodes.iter().enumerate() {
+            let rec = &log.rec;
+            if !self.show_unknown && !rec.is_known() {
+                continue;
+            }
+            // Every row is the same height and every column the same width, so
+            // nothing reflows as packets arrive or the pointer moves over
+            // them. The whole row is one hit target, painted rather than built
+            // from widgets, which is also what keeps a five hundred row list
+            // cheap to draw.
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(width, Self::ROW_H), Sense::click());
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
+            let on = self.selected == Some(log.id);
+            let p = ui.painter_at(rect);
+            if on {
+                p.rect_filled(rect, 0.0, theme::ETCH);
+            } else if resp.hovered() {
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x2A, 0x2E, 0x35));
+            } else if n % 2 == 1 {
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x24, 0x27, 0x2D));
+            }
+            if resp.clicked() {
+                clicked = Some(log.id);
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            let col = row_color(rec);
+            // Seconds since the first packet in the list, the way a capture is
+            // timed rather than a wall clock, so two transmissions can be
+            // compared without arithmetic.
+            let secs = t0
+                .map(|t0| rec.at.saturating_duration_since(t0).as_secs_f64())
+                .unwrap_or(0.0);
+            // The number is the one stamped on the waterfall, so a mark and a
+            // row can be matched by eye.
+            let text = [
+                (format!("{:>4}", log.id), col),
+                (format!("{secs:8.3}"), theme::LEGEND),
+                (fmt_hz(rec.freq), theme::TRACE),
+                (rec.modulation.to_string(), theme::LEGEND),
+                (fmt_db(rec.rssi_dbfs), level_color(rec.rssi_dbfs)),
+                (fmt_db(rec.snr_db), theme::LEGEND),
+                (rec.model.clone(), col),
+                (format!("{:>4}", rec.bytes.len()), theme::LEGEND),
+            ];
+            let mut x = rect.left();
+            for ((t, c), (_, cw)) in text.iter().zip(Self::COLS) {
+                Self::cell(&p, rect, x, cw, t, *c);
+                x += cw;
+            }
+            Self::cell(&p, rect, x, rect.right() - x, &rec.detail, theme::VALUE);
+        }
+
+        if let Some(id) = clicked {
+            // Clicking the selected packet again closes the dump.
+            self.selected = (self.selected != Some(id)).then_some(id);
+        }
+    }
+
     fn markers(&self, p: &egui::Painter, full: &Rect) {
         let (lo, hi) = (self.center - self.rate / 2.0, self.center + self.rate / 2.0);
         for (i, ch) in self.channels.iter().enumerate() {
@@ -1487,6 +1968,125 @@ impl App {
     }
 }
 
+/// The handle between the spectrum and the waterfall.
+///
+/// Drawn as a short bar rather than a full-width line: a line reads as a
+/// border, and a border is not something anyone tries to drag.
+fn split_grip(p: &egui::Painter, r: &Rect, hot: bool) {
+    p.rect_filled(*r, 0.0, theme::CHASSIS);
+    let col = if hot { theme::READOUT } else { theme::ETCH };
+    let w = 46.0;
+    let y = r.center().y;
+    let x0 = r.center().x - w / 2.0;
+    for dy in [-2.0f32, 1.0] {
+        p.line_segment(
+            [Pos2::new(x0, y + dy), Pos2::new(x0 + w, y + dy)],
+            Stroke::new(1.0, col),
+        );
+    }
+}
+
+/// A level in dB, or blank when the decoder did not measure one. Blank rather
+/// than a zero: a missing measurement and a strong signal must not look alike.
+fn fmt_db(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:6.1}")
+    } else {
+        "     -".into()
+    }
+}
+
+/// Amber when a packet is loud enough to be clipping the front end, which is
+/// worth seeing: a decode can fail from too much gain as easily as too little.
+fn level_color(rssi_dbfs: f32) -> Color32 {
+    if rssi_dbfs > -3.0 {
+        theme::FAULT
+    } else if rssi_dbfs > -12.0 {
+        theme::READOUT
+    } else {
+        theme::LEGEND
+    }
+}
+
+/// Fixed-width text, so columns of numbers line up and a hex dump reads as one.
+fn mono(text: &str, col: Color32) -> egui::RichText {
+    egui::RichText::new(text)
+        .font(FontId::new(11.0, FontFamily::Name(theme::READOUT_FONT.into())))
+        .color(col)
+}
+
+/// Green for a verified packet, amber for one with no check to verify, red for
+/// a failed one, grey for a burst nothing claimed. The same colours are used
+/// on the waterfall.
+fn row_color(rec: &DecodeRecord) -> Color32 {
+    if !rec.is_known() {
+        return theme::LEGEND;
+    }
+    match rec.crc {
+        Some(true) => CRC_OK,
+        Some(false) => theme::FAULT,
+        None => theme::READOUT,
+    }
+}
+
+/// What a selected packet holds: its fields, then its bytes.
+///
+/// The fields come first because they are the answer; the bytes are there for
+/// when the answer is wrong, or when the protocol is unknown and the bytes are
+/// all there is. Both are also what a view widget would consume: a map reads
+/// the fields, an image pane reads the bytes and the media type.
+fn packet_detail(ui: &mut egui::Ui, rec: &DecodeRecord) {
+    if !rec.fields.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            for (k, v) in &rec.fields {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(legend(k));
+                    ui.label(mono(&v.to_string(), theme::VALUE));
+                });
+            }
+        });
+        ui.add_space(4.0);
+    }
+    hex_dump(ui, &rec.bytes);
+}
+
+/// Offset, hex, and printable ASCII, sixteen bytes to the line.
+///
+/// The bytes are what a protocol is worked out from, so they are shown as they
+/// are rather than summarised. For an unknown burst these are the bits sliced
+/// under a guessed coding, which is a guess about the framing and not about
+/// the reception.
+fn hex_dump(ui: &mut egui::Ui, bytes: &[u8]) {
+    if bytes.is_empty() {
+        ui.label(legend("no bits could be read from this burst"));
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .id_salt("hex")
+        .show(ui, |ui| {
+            for (i, row) in bytes.chunks(16).enumerate() {
+                let hex: String = row
+                    .iter()
+                    .enumerate()
+                    .map(|(k, b)| if k == 7 { format!("{b:02x}  ") } else { format!("{b:02x} ") })
+                    .collect();
+                let ascii: String = row
+                    .iter()
+                    .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+                    .collect();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(mono(&format!("{:04x}", i * 16), theme::LEGEND));
+                    ui.label(mono(&format!("{hex:<49}"), theme::VALUE));
+                    ui.label(mono(&ascii, theme::TRACE));
+                });
+            }
+        });
+}
+
 fn lamp(ui: &mut egui::Ui, label: &str, lit: bool, col: Color32, text: &str) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
@@ -1507,11 +2107,244 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App { center: 100_000_000.0, rate: 2_000_000.0, ..Default::default() }
+        App {
+            center: 100_000_000.0,
+            rate: 2_000_000.0,
+            // The waterfall holds history from where the radio actually is,
+            // which after a settled tune is the same place.
+            wf_center: 100_000_000.0,
+            db_center: 100_000_000.0,
+            ..Default::default()
+        }
     }
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 400.0))
+    }
+
+
+    fn record(freq: f64, crc: Option<bool>) -> DecodeRecord {
+        DecodeRecord {
+            at: std::time::Instant::now(),
+            freq,
+            model: "Fineoffset-WHx080".into(),
+            channel_hz: 31_250.0,
+            modulation: "OOK",
+            detail: "temperature_c=16.2 humidity_pct=89".into(),
+            fields: vec![
+                ("temperature_c".into(), common::Value::Float(16.2)),
+                ("humidity_pct".into(), common::Value::Int(89)),
+            ],
+            media_type: pipeline::event::media::BYTES,
+            rssi_dbfs: -18.0,
+            snr_db: 21.5,
+            bytes: vec![0xab, 0xcd],
+            crc,
+        }
+    }
+
+    /// Push `rows` of waterfall history, the way `drain` does.
+    fn scroll(a: &mut App, rows: usize) {
+        let db = vec![-50.0f32; 64];
+        for _ in 0..rows {
+            a.wf.push(&db, a.floor, a.ceil);
+            a.rows_pushed += 1;
+        }
+    }
+
+    #[test]
+    fn the_scope_split_is_adjustable_and_bounded() {
+        let mut a = app();
+        assert_eq!(a.plot_frac, DEFAULT_PLOT_FRAC);
+        // Dragging past either end clamps rather than collapsing a pane: a
+        // two pixel waterfall is not a smaller waterfall, it is a broken one.
+        for want in [0.0f32, 1.0, 0.6] {
+            a.plot_frac = want.clamp(*PLOT_FRAC_RANGE.start(), *PLOT_FRAC_RANGE.end());
+            assert!(PLOT_FRAC_RANGE.contains(&a.plot_frac), "{want} left {}", a.plot_frac);
+        }
+        assert!(*PLOT_FRAC_RANGE.start() > 0.0 && *PLOT_FRAC_RANGE.end() < 1.0);
+    }
+
+    #[test]
+    fn the_split_moves_the_boundary_the_way_the_pointer_went() {
+        // The mapping the drag uses: pointer y within the pane becomes the
+        // spectrum's share of it.
+        let full = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(1000.0, 800.0));
+        let usable = full.height() - 16.0 - SPLIT_GRIP_H;
+        let frac_at = |y: f32| ((y - full.top() - SPLIT_GRIP_H / 2.0) / usable)
+            .clamp(*PLOT_FRAC_RANGE.start(), *PLOT_FRAC_RANGE.end());
+
+        let up = frac_at(300.0);
+        let down = frac_at(700.0);
+        assert!(down > up, "dragging down must grow the spectrum");
+        // A quarter of the way down the pane is about a quarter of the split.
+        assert!((frac_at(full.top() + usable * 0.25) - 0.25).abs() < 0.02);
+    }
+
+
+    #[test]
+    fn a_logged_packet_is_stamped_into_the_history() {
+        let mut a = app();
+        a.wf.set_height(64);
+        scroll(&mut a, 32);
+        a.fall_px = 512.0;
+        let before = a.wf.marked_pixels();
+
+        a.log_decodes(vec![record(a.center, Some(true))]);
+        assert!(
+            a.wf.marked_pixels() > before,
+            "the mark was not written into the waterfall"
+        );
+    }
+
+    #[test]
+    fn packets_outside_the_span_are_not_stamped() {
+        let mut a = app();
+        a.wf.set_height(64);
+        scroll(&mut a, 32);
+        a.fall_px = 512.0;
+        let before = a.wf.marked_pixels();
+        a.log_decodes(vec![record(a.center + a.rate, Some(true))]);
+        assert_eq!(a.wf.marked_pixels(), before, "stamped a packet off the edge");
+    }
+
+    #[test]
+    fn a_mark_and_its_list_row_carry_the_same_number() {
+        let mut a = app();
+        scroll(&mut a, 32);
+        a.log_decodes(vec![record(a.center, None), record(a.center, None)]);
+        assert_eq!(a.decodes[0].id, 1);
+        assert_eq!(a.decodes[1].id, 2);
+    }
+
+    #[test]
+    fn hiding_unknowns_does_not_discard_them() {
+        // The filter is a view, not a policy: turning it back on must show the
+        // bursts that arrived while it was off.
+        let mut a = app();
+        let mut unknown = record(a.center, None);
+        unknown.model = "unknown".into();
+        a.log_decodes(vec![unknown, record(a.center, Some(true))]);
+        a.show_unknown = false;
+        assert_eq!(a.decodes.len(), 2, "hiding must not drop anything");
+        assert_eq!(a.decodes.iter().filter(|l| !l.rec.is_known()).count(), 1);
+    }
+
+    #[test]
+    fn the_packet_log_is_bounded() {
+        let mut a = app();
+        for i in 0..(DECODE_LOG_MAX + 120) {
+            a.log_decodes(vec![record(100_000_000.0 + i as f64, Some(true))]);
+        }
+        assert_eq!(a.decodes.len(), DECODE_LOG_MAX);
+        // The oldest are the ones dropped, so the newest packet is still there.
+        let newest = 100_000_000.0 + (DECODE_LOG_MAX + 119) as f64;
+        assert_eq!(a.decodes.last().unwrap().rec.freq, newest);
+        // Numbers keep counting past what the list holds, so the number on a
+        // waterfall mark always names the packet it came from.
+        assert_eq!(a.decodes.last().unwrap().id, (DECODE_LOG_MAX + 120) as u64);
+    }
+
+    #[test]
+    fn a_mark_moves_down_one_row_per_row_of_history() {
+        // Rows, not seconds. The waterfall only scrolls when a frame arrives,
+        // so a mark aged by wall clock slides off the trace it belongs to
+        // whenever the display falls behind, which is exactly when a packet is
+        // most worth finding.
+        let mut a = app();
+        a.wf.set_height(200);
+        let fall = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(1000.0, 400.0));
+        let row_h = fall.height() / 200.0;
+
+        scroll(&mut a, 100);
+        a.log_decodes(vec![record(a.center, None)]);
+        let fresh = a.mark_pos(&fall, &a.decodes[0]).expect("fresh");
+        assert!((fresh.y - fall.top()).abs() <= row_h, "a new mark belongs at the top");
+
+        scroll(&mut a, 40);
+        let aged = a.mark_pos(&fall, &a.decodes[0]).expect("aged");
+        let expect = fall.top() + 40.0 * row_h;
+        assert!((aged.y - expect).abs() <= row_h, "aged to {} not {expect}", aged.y);
+
+        // Wall clock passing without rows being pushed must not move it.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let still = a.mark_pos(&fall, &a.decodes[0]).expect("still there");
+        assert!(
+            (still.y - aged.y).abs() <= row_h,
+            "the mark drifted {} px while the waterfall stood still",
+            still.y - aged.y
+        );
+    }
+
+    #[test]
+    fn a_late_delivery_is_marked_where_the_packet_actually_was() {
+        // The radio stamps a packet when it decodes it; the UI may not see it
+        // until a frame or two later. Marking it at the row the log was read
+        // puts it under whatever is transmitting now instead.
+        let mut a = app();
+        a.wf.set_height(200);
+        a.rows_per_sec = 20.0;
+        scroll(&mut a, 100);
+
+        let mut rec = record(a.center, None);
+        rec.at -= std::time::Duration::from_millis(500);
+        a.log_decodes(vec![rec]);
+
+        // Half a second at 20 rows/s is ten rows back.
+        assert_eq!(a.rows_pushed - a.decodes[0].row, 10);
+    }
+
+    #[test]
+    fn a_mark_needs_a_waterfall_row_to_sit_on() {
+        // Just after startup the pane is mostly empty. Drawing a mark in that
+        // empty space would claim a packet arrived at a time the display has
+        // no record of.
+        let mut a = app();
+        a.wf.set_height(200);
+        let fall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 400.0));
+
+        scroll(&mut a, 20);
+        a.log_decodes(vec![record(a.center, None)]);
+        assert!(a.mark_pos(&fall, &a.decodes[0]).is_some());
+
+        // Scrolled past the end of the history the waterfall still holds.
+        scroll(&mut a, 400);
+        assert!(a.mark_pos(&fall, &a.decodes[0]).is_none(), "drawn off the history");
+    }
+
+    #[test]
+    fn a_mark_lands_on_the_frequency_it_was_decoded_at() {
+        let mut a = app();
+        scroll(&mut a, 512);
+        let fall = rect();
+        let f = a.center + a.rate / 4.0;
+        a.log_decodes(vec![record(f, None)]);
+        let at = a.mark_pos(&fall, &a.decodes[0]).expect("in span");
+        assert!((a.hz_at(&fall, at.x) - f).abs() < 1.0, "mark is at the wrong frequency");
+        // Outside the span there is no column it could belong to.
+        a.log_decodes(vec![record(a.center + a.rate, None)]);
+        assert!(a.mark_pos(&fall, &a.decodes[1]).is_none());
+    }
+
+    #[test]
+    fn marks_follow_the_history_rather_than_the_dial_during_a_retune() {
+        // The waterfall is slid to keep its own centre, and retunes lag behind
+        // the dial by design. A mark measured against the dial would jump off
+        // the trace for as long as that lasts.
+        let mut a = app();
+        scroll(&mut a, 512);
+        let fall = rect();
+        let f = a.center;
+        a.log_decodes(vec![record(f, None)]);
+        let before = a.mark_pos(&fall, &a.decodes[0]).expect("in span");
+
+        // The dial moves; the waterfall has not caught up yet.
+        a.center += a.rate / 8.0;
+        let after = a.mark_pos(&fall, &a.decodes[0]).expect("still in span");
+        assert!(
+            (before.x - after.x).abs() < 0.01,
+            "the mark moved with the dial instead of the history"
+        );
     }
 
     #[test]
