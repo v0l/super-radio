@@ -1,6 +1,6 @@
 //! Out-of-band results produced by stages.
 
-use common::Hz;
+use common::{Hz, Value};
 
 /// Anything a stage wants to report that is not a sample.
 ///
@@ -70,6 +70,30 @@ pub struct Decoded {
     /// which matters: an unchecked decode should never be presented with the
     /// same confidence as a CRC-verified one.
     pub crc_ok: Option<bool>,
+    /// How it was keyed: "OOK", "FSK", "ASK". A packet list needs this in its
+    /// own column, and the protocol name does not imply it: plenty of devices
+    /// exist in both an OOK and an FSK variant.
+    pub modulation: Option<&'static str>,
+    /// The fields, timings or whatever else the decoder can say about this
+    /// frame beyond naming it. Kept apart from `text` so a list can put the
+    /// protocol in one column and its detail in another.
+    pub detail: Option<String>,
+    /// The frame's fields, as the decoder recovered them.
+    ///
+    /// The reason a packet list can be more than a list. A map plotting
+    /// aircraft, a chart plotting a sensor's temperature and a text pane
+    /// showing pager traffic all want the same packets and different parts of
+    /// them, and none of them should be parsing a display string to get there.
+    /// Ordered as the decoder emitted them, which is how they read best.
+    pub fields: Vec<(String, Value)>,
+    /// Received level in dBFS and signal to noise in dB, when the decoder
+    /// measured them.
+    ///
+    /// Both, because either alone misleads: a strong packet in a noisy channel
+    /// and a weak one in a quiet channel can share an SNR, and only the level
+    /// says whether the front end is near clipping.
+    pub rssi_dbfs: Option<f32>,
+    pub snr_db: Option<f32>,
 }
 
 impl Decoded {
@@ -83,7 +107,39 @@ impl Decoded {
             payload,
             text: None,
             crc_ok: None,
+            modulation: None,
+            detail: None,
+            fields: Vec::new(),
+            rssi_dbfs: None,
+            snr_db: None,
         }
+    }
+
+    pub fn with_fields(mut self, fields: Vec<(String, Value)>) -> Self {
+        self.fields = fields;
+        self
+    }
+
+    /// One field by name, for a view that needs a particular one.
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// Received level and signal to noise, both in dB.
+    pub fn with_level(mut self, rssi_dbfs: f32, snr_db: f32) -> Self {
+        self.rssi_dbfs = Some(rssi_dbfs);
+        self.snr_db = Some(snr_db);
+        self
+    }
+
+    pub fn with_modulation(mut self, m: &'static str) -> Self {
+        self.modulation = Some(m);
+        self
+    }
+
+    pub fn with_detail(mut self, d: impl Into<String>) -> Self {
+        self.detail = Some(d.into());
+        self
     }
 
     pub fn with_media(mut self, media_type: &'static str) -> Self {
