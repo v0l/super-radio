@@ -63,13 +63,20 @@ pub enum Gating {
     /// Costs more but keeps each graph's filter state continuous, which
     /// stateful nodes require.
     Always,
-    /// Run a channel's graph only while a burst is detected there.
+    /// Run a channel's graph only around bursts detected there.
     ///
     /// Much cheaper on a mostly empty band, and the right choice for ISM
     /// monitoring. The caveat is real though: a gated graph sees a
     /// discontinuous stream, so any node whose output depends on history
     /// across the gap will be wrong. Pulse detection is unaffected because a
     /// gap between bursts is exactly what it treats as a packet boundary.
+    ///
+    /// "Around", not "during", in two respects, and both are needed before
+    /// anything decodes at all. A block in which a burst opened *and closed*
+    /// still has to run, and so does the block after it: a pulse detector only
+    /// emits a package once it has seen the silence that ends it, so cutting
+    /// the channel off the instant the carrier drops leaves the last packet
+    /// sitting in the detector until the next transmission dislodges it.
     OnDetection,
 }
 
@@ -88,6 +95,8 @@ pub struct ChannelBank {
     graphs: Vec<Option<Graph>>,
     detector: Detector,
     gating: Gating,
+    /// Blocks since each channel last had a burst, for the gate's hangover.
+    idle_blocks: Vec<u32>,
     /// Scratch for collected results, reused between blocks.
     out: Vec<ChannelEvent>,
 }
@@ -109,6 +118,7 @@ impl ChannelBank {
             graphs: (0..channels).map(|_| None).collect(),
             detector: Detector::new(channels, DetectorConfig::default()),
             gating: Gating::Always,
+            idle_blocks: vec![u32::MAX; channels],
             out: Vec::new(),
         }
     }
@@ -136,6 +146,25 @@ impl ChannelBank {
     /// The channel nearest a given RF frequency.
     pub fn channel_for(&self, f: Hz) -> usize {
         self.ch.channel_for_offset(f.as_f64() - self.center.as_f64(), self.input_rate)
+    }
+
+    /// Retune the bank, keeping its graphs.
+    ///
+    /// Every channel now covers a different frequency, so all the state that
+    /// described the old ones is wrong: the noise floors, the open bursts and
+    /// any half-collected packet. Clearing them is not a precaution, it is the
+    /// difference between a retune and a fabricated decode stitched from two
+    /// frequencies.
+    pub fn set_center(&mut self, center: Hz) -> &mut Self {
+        if center != self.center {
+            self.center = center;
+            self.reset();
+        }
+        self
+    }
+
+    pub fn center(&self) -> Hz {
+        self.center
     }
 
     pub fn set_gating(&mut self, g: Gating) -> &mut Self {
@@ -184,6 +213,24 @@ impl ChannelBank {
         Ok(())
     }
 
+    /// Give every channel a graph built by `make`, for chains that branch and
+    /// so cannot be described as a list of nodes.
+    ///
+    /// `make` is called once per channel with that channel's spec, and must
+    /// return a fresh graph each time for the same reason
+    /// [`Self::set_all_chains`] does.
+    pub fn set_all_graphs(
+        &mut self,
+        make: impl Fn(StreamSpec) -> Result<Graph>,
+    ) -> Result<()> {
+        for ch in 0..self.channels {
+            let g = make(self.channel_spec(ch))
+                .map_err(|e| Error::other(format!("channel {ch}: {e}")))?;
+            self.graphs[ch] = Some(g);
+        }
+        Ok(())
+    }
+
     pub fn clear_chain(&mut self, ch: usize) {
         if ch < self.channels {
             self.graphs[ch] = None;
@@ -205,6 +252,7 @@ impl ChannelBank {
     pub fn reset(&mut self) {
         self.ch.reset();
         self.detector.reset();
+        self.idle_blocks.fill(u32::MAX);
         for g in self.graphs.iter_mut().flatten() {
             g.reset();
         }
@@ -263,8 +311,16 @@ impl ChannelBank {
         // 4. Run the graphs in parallel. Each reads a contiguous lane, owns
         //    its own state, and mutates nothing shared, so there is no locking
         //    anywhere in here.
+        for (c, idle) in self.idle_blocks.iter_mut().enumerate() {
+            if self.detector.was_open(c) {
+                *idle = 0;
+            } else {
+                *idle = idle.saturating_add(1);
+            }
+        }
+
         let gating = self.gating;
-        let detector = &self.detector;
+        let idle_blocks = &self.idle_blocks;
         let lanes = &self.lanes;
         let results: Vec<(usize, Vec<Event>)> = self
             .graphs
@@ -272,7 +328,9 @@ impl ChannelBank {
             .enumerate()
             .filter_map(|(c, slot)| {
                 let g = slot.as_mut()?;
-                if gating == Gating::OnDetection && !detector.is_open(c) {
+                // One block of hangover: enough for the trailing silence to
+                // reach the pulse detector and close the package.
+                if gating == Gating::OnDetection && idle_blocks[c] > 1 {
                     return None;
                 }
                 let buf = g.input_buf();

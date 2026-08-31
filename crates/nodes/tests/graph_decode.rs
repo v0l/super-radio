@@ -50,6 +50,17 @@ fn chain_specs() -> Vec<NodeSpec> {
     ]
 }
 
+/// The unmatchable chain, which produces bursts no protocol claims.
+fn specs_with_unknown() -> Vec<NodeSpec> {
+    vec![
+        NodeSpec::new("decimate").i("factor", 8),
+        NodeSpec::new("envelope"),
+        NodeSpec::new("real_decimate").i("factor", 20),
+        NodeSpec::new("pulse_detect").f("reset_us", 10_000.0).i("min_pulses", 20),
+        NodeSpec::new("protocol_decode"),
+    ]
+}
+
 fn decodes_from(graph_events: &[Event]) -> Vec<String> {
     graph_events
         .iter()
@@ -153,9 +164,11 @@ fn retuning_a_parameter_at_runtime_changes_behaviour() {
 }
 
 #[test]
-fn an_unrecognised_burst_is_reported_rather_than_silently_dropped() {
-    // A chain whose timings cannot match anything should still say what it
-    // saw. Silence is the worst possible output for an unknown signal.
+fn an_unrecognised_burst_is_reported_as_a_packet_of_its_own() {
+    // An unknown device is what a scanner should be best at, so a burst no
+    // protocol claims still becomes a packet: the coding inferred from its own
+    // timings, and the bits that fall out under that reading. Silence would
+    // make the receiver useless for exactly this case.
     let buf = need_fixture!(fixture());
     let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
     let specs = vec![
@@ -170,12 +183,53 @@ fn an_unrecognised_burst_is_reported_rather_than_silently_dropped() {
     let mut g = build_chain(spec, &specs, &registry()).unwrap();
     let events = g.feed_iq(&buf.samples).unwrap().to_vec();
 
-    assert!(decodes_from(&events).is_empty(), "should not have decoded");
-    let warnings: Vec<&Event> = events
+    let packets: Vec<&pipeline::event::Decoded> = events
         .iter()
-        .filter(|e| matches!(e, Event::Warning { .. }))
+        .filter_map(|e| match e {
+            Event::Decoded(d) => Some(d),
+            _ => None,
+        })
         .collect();
-    assert!(!warnings.is_empty(), "an unknown burst must be reported: {events:?}");
+    assert!(!packets.is_empty(), "an unknown burst must be reported: {events:?}");
+    for d in &packets {
+        assert_eq!(d.protocol, "unknown", "nothing should have matched: {d:?}");
+        assert_eq!(d.modulation, Some("OOK"), "the modulation belongs in the report");
+        let detail = d.detail.as_deref().unwrap_or_default();
+        // Enough to start reverse engineering from: a coding with its timings,
+        // bits to compare between receptions, and how the signal was received.
+        assert!(detail.contains("us"), "no timings in {detail:?}");
+        assert!(detail.contains("pulses"), "no pulse count in {detail:?}");
+        assert!(d.snr_db.is_some_and(|v| v > 0.0), "no SNR on {d:?}");
+        assert!(d.rssi_dbfs.is_some(), "no level on {d:?}");
+    }
+}
+
+#[test]
+fn turning_off_unknown_reporting_silences_them_without_touching_decodes() {
+    let buf = need_fixture!(fixture());
+    let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
+    // The same unmatchable chain as above, which is the only one that
+    // produces unknowns to silence in the first place.
+    let mut specs = specs_with_unknown();
+    specs[4] = NodeSpec::new("protocol_decode").b("report_unknown", false);
+    let mut g = build_chain(spec, &specs, &registry()).unwrap();
+    let events = g.feed_iq(&buf.samples).unwrap().to_vec();
+
+    let unknown = events
+        .iter()
+        .filter(|e| matches!(e, Event::Decoded(d) if d.protocol == "unknown"))
+        .count();
+    assert_eq!(unknown, 0, "unknown reporting was turned off");
+
+    // And with it on, the same chain does report them.
+    let mut g = build_chain(spec, &specs_with_unknown(), &registry()).unwrap();
+    let events = g.feed_iq(&buf.samples).unwrap().to_vec();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Decoded(d) if d.protocol == "unknown")),
+        "the same chain must report unknowns when asked to"
+    );
 }
 
 #[test]
@@ -242,4 +296,28 @@ fn a_mistuned_detector_says_what_it_discarded_and_which_knob_to_turn() {
         .expect("a mistuned detector must not fail silently");
     assert!(msg.contains("discarded"), "{msg}");
     assert!(msg.contains("min_pulses") || msg.contains("reset_us"), "must name a knob: {msg}");
+}
+
+#[test]
+fn the_ask_detector_decodes_the_real_capture_too() {
+    // Fine Offset is deep OOK, so the shallow-ASK detector is not needed here.
+    // That is exactly why it is worth checking: a detector meant as a drop-in
+    // replacement must give the same answer on a signal the OOK path already
+    // handles, or swapping it in trades one failure for another.
+    let buf = need_fixture!(fixture());
+    let spec = StreamSpec::iq(buf.rate.as_f64(), buf.center);
+    let specs = vec![
+        NodeSpec::new("decimate").i("factor", 8),
+        NodeSpec::new("envelope"),
+        NodeSpec::new("ask_detect").f("reset_us", 10_000.0).i("min_pulses", 20),
+        NodeSpec::new("protocol_decode"),
+    ];
+    let mut g = build_chain(spec, &specs, &registry()).expect("build chain");
+    let events = g.feed_iq(&buf.samples).expect("run graph").to_vec();
+    let decodes = decodes_from(&events);
+
+    assert_eq!(decodes.len(), 1, "expected one decode, got {decodes:?}");
+    assert!(decodes[0].contains("station_id=196"), "{}", decodes[0]);
+    assert!(decodes[0].contains("temperature_c=16.2"), "{}", decodes[0]);
+    assert!(decodes[0].contains("[CRC ok]"), "{}", decodes[0]);
 }
