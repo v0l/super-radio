@@ -229,3 +229,60 @@ fn channels_without_a_chain_are_skipped() {
     }
     assert!(events.iter().any(|e| matches!(e.event, Event::Decoded(_))));
 }
+
+/// The chain the app runs when it decodes everything it can hear: no protocol
+/// chosen, no modulation chosen, nothing tuned by hand.
+#[test]
+fn the_automatic_chain_decodes_without_being_told_the_modulation() {
+    let base = need_fixture!(fixture());
+    let mut bank = make_bank();
+    // Exactly what the app runs: gated on detection, both modulations, every
+    // protocol, nothing chosen by hand.
+    bank.set_gating(Gating::OnDetection);
+    bank.set_detector_config(nodes::ism_detector_config());
+    bank.set_all_graphs(nodes::ism_decode_graph).expect("build graphs");
+    let wide = wideband(&base.samples, &bank);
+
+    let mut found: Vec<(usize, String)> = Vec::new();
+    let mut unknown = 0;
+    for block in wide.chunks(65_536) {
+        for ev in bank.process(block).expect("run bank") {
+            if let Event::Decoded(d) = &ev.event {
+                // Bursts nothing claims are reported too, and on this
+                // recording the repeated transmission produces some. They are
+                // counted rather than matched: the point here is the decode.
+                if d.protocol == "unknown" {
+                    unknown += 1;
+                    continue;
+                }
+                found.push((ev.channel, d.text.clone().unwrap_or_default()));
+            }
+        }
+    }
+    assert!(unknown > 0, "unclaimed bursts should be reported, not dropped");
+
+    let mut channels: Vec<usize> = found.iter().map(|(c, _)| *c).collect();
+    channels.sort_unstable();
+    channels.dedup();
+    assert_eq!(channels, OCCUPIED, "wrong channels decoded: {found:?}");
+    for (_, text) in &found {
+        assert!(text.contains("Fineoffset-WHx080"), "{text}");
+        assert!(text.contains("[CRC ok]"), "{text}");
+    }
+}
+
+/// Both branches must be live, or the graph is an OOK chain with extra steps.
+#[test]
+fn the_automatic_chain_runs_an_ook_and_an_fsk_branch() {
+    let bank = make_bank();
+    let g = nodes::ism_decode_graph(bank.channel_spec(0)).expect("build graph");
+    let t = g.topology();
+    let kinds: Vec<&str> = t.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert!(kinds.contains(&"pulse_detect"), "{kinds:?}");
+    assert!(kinds.contains(&"fsk_detect"), "{kinds:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "protocol_decode").count(),
+        2,
+        "each branch needs its own decoder: {kinds:?}"
+    );
+}

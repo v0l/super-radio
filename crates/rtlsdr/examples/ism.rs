@@ -10,7 +10,7 @@
 
 use common::device::{Device, GainMode};
 use common::{Hz, Sps};
-use dsp::{FirDecim, Mixer, OokDetector, PulseConfig};
+use dsp::{FirDecim, FskConfig, FskDetector, Mixer, OokDetector, PulseConfig};
 
 const RF_RATE: u64 = 2_400_000;
 /// 2.4 MS/s / 8 = 300 kHz, wide enough for ISM channels and a convenient
@@ -39,10 +39,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mixer = Mixer::new(-offset, RF_RATE as f64);
     let mut dec = FirDecim::design(DECIM, 0.9, 80.0);
     let mut ook = OokDetector::new(ENV_RATE, PulseConfig::default());
+    // Run both front ends over the same samples. Which one a device needs is
+    // exactly the question this example exists to answer, and guessing wrong
+    // produces silence rather than a clue.
+    let mut fsk = FskDetector::new(ENV_RATE, FskConfig::default());
 
     let (mut shifted, mut iq, mut env, mut pkgs) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut total = 0usize;
+    let mut fsk_total = 0usize;
 
     let mut rx = sdr.start_rx()?;
     let t0 = std::time::Instant::now();
@@ -56,14 +61,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env.extend(iq.iter().map(|c| c.norm()));
         pkgs.clear();
         ook.process(&env, &mut pkgs);
+        let ook_here = pkgs.len();
+        fsk.process(&iq, &mut pkgs);
+        fsk_total += pkgs.len() - ook_here;
 
-        for p in &pkgs {
+        for (n, p) in pkgs.iter().enumerate() {
+            let how = if n < ook_here { "OOK" } else { "FSK" };
             total += 1;
             if total > 12 {
                 continue;
             }
             println!(
-                "--- package {total}: {} pulses, {:.1} ms, SNR {:.1} dB",
+                "--- package {total} [{how}]: {} pulses, {:.1} ms, SNR {:.1} dB",
                 p.pulses.len(),
                 p.duration_us() as f64 / 1000.0,
                 p.snr_db
@@ -83,11 +92,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     rx.stop();
 
-    println!("\n{total} packages in {secs}s. noise {:.4} signal {:.4} ({:.1} dB)",
+    println!("\n{total} packages in {secs}s ({fsk_total} FSK). \
+              noise {:.4} signal {:.4} ({:.1} dB)",
         ook.noise_level(), ook.signal_level(), ook.snr_db());
+    if fsk_total > 0 {
+        println!("last FSK tone separation: {:.0} Hz", fsk.separation_hz());
+    }
     if total == 0 {
-        println!("Nothing decoded as OOK. The signal may be FSK, which shows as a\n\
-                  constant envelope and produces no pulses at all here.");
+        println!("Nothing seen on either front end. Check the frequency and the gain:\n\
+                  an FSK burst would have shown up as a flat envelope with a\n\
+                  measurable tone separation.");
     }
     Ok(())
 }

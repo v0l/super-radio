@@ -13,14 +13,14 @@ pub mod wfm;
 
 pub use bank::{ChannelBank, ChannelEvent, Gating};
 pub use wfm::WfmDemodNode;
-pub use decode_nodes::{ProtocolDecodeNode, PulseDetectNode};
+pub use decode_nodes::{AskDetectNode, FskDetectNode, ProtocolDecodeNode, PulseDetectNode};
 pub use dsp_nodes::{
     DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, HighBlendNode, MixerNode,
     RealDecimateNode,
 };
 
 use common::Result;
-use dsp::PulseConfig;
+use dsp::{AskConfig, FskConfig, PulseConfig};
 use pipeline::node::Node;
 use pipeline::registry::{Registry, Settings, SettingsExt, StageDesc};
 use pipeline::{Graph, StreamSpec};
@@ -119,11 +119,79 @@ pub fn registry() -> Registry {
 
     r.register(
         StageDesc {
+            name: "ask_detect",
+            summary: "Amplitude keying with a low level that is not silence, \
+                      which `pulse_detect` latches through",
+            category: "decode",
+        },
+        |s: &Settings| {
+            let d = AskConfig::default();
+            let cfg = AskConfig {
+                reset_us: s.f64_or("reset_us", d.reset_us as f64) as u32,
+                min_run_us: s.f64_or("min_run_us", d.min_run_us as f64) as u32,
+                min_pulses: s.i64_or("min_pulses", d.min_pulses as i64).max(1) as usize,
+                hysteresis: s.f64_or("hysteresis", d.hysteresis as f64) as f32,
+                tau_us: s.f64_or("tau_us", d.tau_us as f64) as f32,
+                min_snr_db: s.f64_or("min_snr_db", d.min_snr_db as f64) as f32,
+                noise_threshold_ratio: s
+                    .f64_or("noise_threshold_ratio", d.noise_threshold_ratio as f64)
+                    as f32,
+                min_depth_db: s.f64_or("min_depth_db", d.min_depth_db as f64) as f32,
+                max_burst_us: s.f64_or("max_burst_us", d.max_burst_us as f64) as u32,
+            };
+            Ok(Box::new(AskDetectNode::new(cfg)) as Box<dyn Node>)
+        },
+    );
+
+    r.register(
+        StageDesc {
+            name: "fsk_detect",
+            summary: "Two-level FSK to mark/gap timings, straight from IQ; the \
+                      constant-envelope signals an OOK detector cannot see",
+            category: "decode",
+        },
+        |s: &Settings| {
+            let d = FskConfig::default();
+            let cfg = FskConfig {
+                reset_us: s.f64_or("reset_us", d.reset_us as f64) as u32,
+                min_run_us: s.f64_or("min_run_us", d.min_run_us as f64) as u32,
+                min_pulses: s.i64_or("min_pulses", d.min_pulses as i64).max(1) as usize,
+                hysteresis: s.f64_or("hysteresis", d.hysteresis as f64) as f32,
+                tau_us: s.f64_or("tau_us", d.tau_us as f64) as f32,
+                min_snr_db: s.f64_or("min_snr_db", d.min_snr_db as f64) as f32,
+                noise_threshold_ratio: s
+                    .f64_or("noise_threshold_ratio", d.noise_threshold_ratio as f64)
+                    as f32,
+                min_separation_hz: s.f64_or("min_separation_hz", d.min_separation_hz as f64)
+                    as f32,
+                max_burst_us: s.f64_or("max_burst_us", d.max_burst_us as f64) as u32,
+            };
+            Ok(Box::new(FskDetectNode::new(cfg)) as Box<dyn Node>)
+        },
+    );
+
+    r.register(
+        StageDesc {
             name: "protocol_decode",
             summary: "Try every known protocol against each burst",
             category: "decode",
         },
-        |_s: &Settings| Ok(Box::new(ProtocolDecodeNode::all()) as Box<dyn Node>),
+        |s: &Settings| {
+            // Static because the modulation rides on every packet this node
+            // emits, and a list column should not own a string per row.
+            let m = match s.str_or("modulation", "OOK") {
+                "FSK" | "fsk" => "FSK",
+                "ASK" | "ask" => "ASK",
+                _ => "OOK",
+            };
+            let mut n = ProtocolDecodeNode::all().with_modulation(m);
+            for k in ["report_all", "report_crc_failures", "report_unknown"] {
+                if let Some(v) = s.get(k) {
+                    pipeline::node::Node::set_param(&mut n, k, v.clone())?;
+                }
+            }
+            Ok(Box::new(n) as Box<dyn Node>)
+        },
     );
 
     r
@@ -191,6 +259,113 @@ pub fn ook_chain(shift_hz: f64, decimate: usize, reset_us: u32) -> Vec<NodeSpec>
         NodeSpec::new("decimate").i("factor", decimate as i64),
         NodeSpec::new("envelope"),
         NodeSpec::new("pulse_detect").f("reset_us", reset_us as f64).i("min_pulses", 20),
+        NodeSpec::new("protocol_decode"),
+    ]
+}
+
+/// Burst detection settings for gating ISM decode chains.
+///
+/// The stock 10 dB open threshold is right for finding transmissions to look
+/// at and wrong for gating a decoder, because it is stricter than the decoder
+/// it is gating. Measured on the Fine Offset capture spread across four
+/// channels, the channel-power detector sees 12 dB while the pulse detector
+/// reads 19 dB on the same burst and decodes it perfectly: at 10 dB the gate
+/// throws away packets that would otherwise have been decoded, which is the
+/// one thing a gate must never do. At 6 dB all four decode.
+///
+/// The floor is what a gate is worth: idle channels cost the detector only,
+/// and that is most of the band most of the time.
+pub fn ism_detector_config() -> dsp::DetectorConfig {
+    dsp::DetectorConfig { open_db: 6.0, close_db: 3.0, ..Default::default() }
+}
+
+/// Everything an ISM channel needs, in one graph: OOK and FSK at once.
+///
+/// ```text
+///   IQ ---> envelope ---> pulse_detect --\
+///     \                                   >--> protocol_decode (one each)
+///      \--> fsk_detect ------------------/
+/// ```
+///
+/// Two branches rather than a choice between them, because which one a device
+/// uses is not knowable in advance and is not visible in a spectrum either: an
+/// OOK burst and an FSK burst look alike in a waterfall. rtl_433 runs both
+/// demodulators over every sample for the same reason. The branches share the
+/// channelizer and the channel's IQ, which is where nearly all the cost is,
+/// and each protocol below them is integer work on complete bursts only.
+///
+/// Shallow-ASK detection is deliberately *not* a third branch. It only earns
+/// its place when `pulse_detect` is latching, which is rare, and adding it
+/// everywhere would buy a third of the CPU budget a case that mostly does not
+/// arise. `ask_detect` is there to be swapped in on a channel that needs it.
+pub fn ism_decode_graph(input: StreamSpec) -> Result<Graph> {
+    ism_graph(input, true, true)
+}
+
+/// The OOK half alone, for a bank of channels narrow enough to suit it.
+pub fn ism_ook_graph(input: StreamSpec) -> Result<Graph> {
+    ism_graph(input, true, false)
+}
+
+/// The FSK half alone, for a bank wide enough to hold a whole deviation.
+pub fn ism_fsk_graph(input: StreamSpec) -> Result<Graph> {
+    ism_graph(input, false, true)
+}
+
+fn ism_graph(input: StreamSpec, ook: bool, fsk: bool) -> Result<Graph> {
+    let mut b = Graph::builder(input);
+    let mut last = None;
+
+    if ook {
+        let env = b.add_labeled("Envelope", Box::new(EnvelopeNode));
+        // Eight pulses, not the detector's default four. Scanning a whole band
+        // turns up short bursts constantly, and four pulses is at most a few
+        // bits: not enough to identify anything, and enough of them to bury
+        // the packets that are. Every real ISM frame is tens of pulses long.
+        let mut ook_det = PulseDetectNode::default_ook();
+        ook_det.set_min_pulses(8);
+        let det = b.add_labeled("OOK pulses", Box::new(ook_det));
+        let dec = b.add_labeled(
+            "OOK protocols",
+            Box::new(ProtocolDecodeNode::all().with_modulation("OOK")),
+        );
+        b.source(env.i());
+        b.link(env, det);
+        b.link(det, dec);
+        last = Some(dec);
+    }
+
+    if fsk {
+        let det = b.add_labeled("FSK pulses", Box::new(FskDetectNode::default_fsk()));
+        let dec = b.add_labeled(
+            "FSK protocols",
+            Box::new(ProtocolDecodeNode::all().with_modulation("FSK")),
+        );
+        b.source(det.i());
+        b.link(det, dec);
+        last = last.or(Some(dec));
+    }
+
+    // Decodes leave as events, from every branch. The nominated output only
+    // decides what a downstream reader would see, so any branch will do.
+    let out = last.ok_or_else(|| common::Error::other("an ISM graph needs a front end"))?;
+    b.output(out.o());
+    b.build()
+}
+
+/// A ready-made FSK chain: shift, decimate, detect, decode.
+///
+/// Shorter than the OOK chain by one node, because the detector takes IQ and
+/// does its own discrimination. `deviation_hz` is the protocol's published
+/// deviation; the separation between the tones is twice that, and the check is
+/// set at half of it so a mistuned or drifting transmitter still passes.
+pub fn fsk_chain(shift_hz: f64, decimate: usize, deviation_hz: f64, reset_us: u32) -> Vec<NodeSpec> {
+    vec![
+        NodeSpec::new("mixer").f("shift_hz", shift_hz),
+        NodeSpec::new("decimate").i("factor", decimate as i64),
+        NodeSpec::new("fsk_detect")
+            .f("reset_us", reset_us as f64)
+            .f("min_separation_hz", deviation_hz),
         NodeSpec::new("protocol_decode"),
     ]
 }

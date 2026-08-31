@@ -7,7 +7,7 @@
 
 use common::Result;
 use decode::protocol::{DecodeError, Protocols};
-use dsp::{OokDetector, PulseConfig};
+use dsp::{AskConfig, AskDetector, FskConfig, FskDetector, OokDetector, PulseConfig};
 use pipeline::event::{Decoded, Event};
 use pipeline::node::{NodeCtx, PortSpec, Simple};
 use pipeline::param::{Param, ParamValue};
@@ -26,6 +26,14 @@ impl PulseDetectNode {
 
     pub fn default_ook() -> Self {
         Self::new(PulseConfig::default())
+    }
+
+    /// Shortest burst worth reporting, in pulses.
+    pub fn set_min_pulses(&mut self, n: usize) -> &mut Self {
+        self.cfg.min_pulses = n.max(1);
+        let rate = self.det.rate();
+        self.det = OokDetector::new(rate, self.cfg);
+        self
     }
 }
 
@@ -128,6 +136,262 @@ impl Simple for PulseDetectNode {
     }
 }
 
+/// Shallow ASK to pulse packages.
+///
+/// The fallback for when `pulse_detect` reports one enormous mark: below about
+/// 11 dB of modulation depth its adaptive threshold latches high, because the
+/// low symbol never goes under it. This one buffers the burst and thresholds
+/// between the two levels it measures, at the cost of a burst of latency.
+/// Takes the same envelope input, so it is a drop-in swap.
+pub struct AskDetectNode {
+    cfg: AskConfig,
+    det: AskDetector,
+}
+
+impl AskDetectNode {
+    pub fn new(cfg: AskConfig) -> Self {
+        Self { cfg, det: AskDetector::new(1.0, cfg) }
+    }
+
+    pub fn default_ask() -> Self {
+        Self::new(AskConfig::default())
+    }
+}
+
+impl Simple for AskDetectNode {
+    fn name(&self) -> &str {
+        "ask_detect"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Real {
+            return Err(common::Error::other(
+                "ask_detect needs a real envelope; put an `envelope` node before it",
+            ));
+        }
+        self.det = AskDetector::new(i.spec.rate, self.cfg);
+        let mut out = i.spec.with_kind(PortKind::Pulses);
+        out.rate = 0.0;
+        Ok(out)
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
+        let pkgs = o.pulses_mut();
+        self.det.process(i.as_real().unwrap(), pkgs);
+        let depth = self.det.depth_db() as f64;
+        for p in pkgs.iter() {
+            c.tag(Tag::new(p.start_sample, "burst", TagValue::Float(p.snr_db as f64)));
+            c.tag(Tag::new(p.start_sample, "ask_depth_db", TagValue::Float(depth)));
+        }
+
+        let s = self.det.take_stats();
+        if s.rejected_total() > 0 {
+            let mut why = Vec::new();
+            if s.rejected_no_separation > 0 {
+                why.push(format!(
+                    "{} shallower than {:.0} dB, so not keyed (lower min_depth_db)",
+                    s.rejected_no_separation, self.cfg.min_depth_db
+                ));
+            }
+            if s.rejected_too_few_pulses > 0 {
+                why.push(format!(
+                    "{} with fewer than {} pulses (raise reset_us, or lower min_pulses)",
+                    s.rejected_too_few_pulses, self.cfg.min_pulses
+                ));
+            }
+            if s.rejected_low_snr > 0 {
+                why.push(format!(
+                    "{} below {:.0} dB SNR (lower min_snr_db, or increase gain)",
+                    s.rejected_low_snr, self.cfg.min_snr_db
+                ));
+            }
+            c.emit(Event::Warning {
+                stage: "ask_detect".into(),
+                message: format!("discarded {}", why.join("; ")),
+            });
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.det.reset();
+    }
+
+    fn params(&self) -> Vec<Param> {
+        vec![
+            Param::float("reset_us", self.cfg.reset_us as f64, 500.0..=100_000.0)
+                .unit("us")
+                .label("Gap that ends a packet")
+                .log(),
+            Param::float("min_run_us", self.cfg.min_run_us as f64, 10.0..=2000.0)
+                .unit("us")
+                .label("Shortest credible symbol"),
+            Param::int("min_pulses", self.cfg.min_pulses as i64, 2..=512)
+                .label("Minimum pulses per packet"),
+            Param::float("min_depth_db", self.cfg.min_depth_db as f64, 1.0..=40.0)
+                .unit("dB")
+                .label("Minimum modulation depth"),
+            Param::float("min_snr_db", self.cfg.min_snr_db as f64, 3.0..=40.0)
+                .unit("dB")
+                .label("Minimum SNR"),
+            Param::float("hysteresis", self.cfg.hysteresis as f64, 0.0..=0.5)
+                .label("Threshold hysteresis"),
+        ]
+    }
+
+    fn set_param(&mut self, name: &str, v: ParamValue) -> Result<()> {
+        let f = v.as_f64().unwrap_or_default();
+        match name {
+            "reset_us" => self.cfg.reset_us = f.max(1.0) as u32,
+            "min_run_us" => self.cfg.min_run_us = f.max(1.0) as u32,
+            "min_pulses" => self.cfg.min_pulses = f.max(1.0) as usize,
+            "min_depth_db" => self.cfg.min_depth_db = f as f32,
+            "min_snr_db" => self.cfg.min_snr_db = f as f32,
+            "hysteresis" => self.cfg.hysteresis = f.clamp(0.0, 0.9) as f32,
+            _ => {
+                return Err(common::Error::other(format!(
+                    "ask_detect: unknown parameter {name:?}"
+                )))
+            }
+        }
+        let rate = self.det.rate();
+        self.det = AskDetector::new(rate, self.cfg);
+        Ok(())
+    }
+}
+
+/// Two-level FSK to pulse packages.
+///
+/// Takes IQ rather than a real stream, unlike [`PulseDetectNode`], because it
+/// needs the amplitude to know when a burst is happening and the phase to know
+/// which tone is being sent. Putting an `envelope` or `fm_demod` node in front
+/// would throw away exactly the half it still needs.
+pub struct FskDetectNode {
+    cfg: FskConfig,
+    det: FskDetector,
+}
+
+impl FskDetectNode {
+    pub fn new(cfg: FskConfig) -> Self {
+        Self { cfg, det: FskDetector::new(1.0, cfg) }
+    }
+
+    pub fn default_fsk() -> Self {
+        Self::new(FskConfig::default())
+    }
+}
+
+impl Simple for FskDetectNode {
+    fn name(&self) -> &str {
+        "fsk_detect"
+    }
+
+    fn negotiate(&mut self, i: &PortSpec) -> Result<StreamSpec> {
+        if i.spec.kind != PortKind::Iq {
+            return Err(common::Error::other(
+                "fsk_detect needs IQ; it does its own discrimination, so remove any \
+                 `envelope` or `fm_demod` node before it",
+            ));
+        }
+        self.det = FskDetector::new(i.spec.rate, self.cfg);
+        let mut out = i.spec.with_kind(PortKind::Pulses);
+        out.rate = 0.0;
+        Ok(out)
+    }
+
+    fn process(&mut self, i: &Payload, o: &mut Payload, c: &mut NodeCtx<'_>) -> Result<()> {
+        let pkgs = o.pulses_mut();
+        self.det.process(i.as_iq().unwrap(), pkgs);
+        let sep = self.det.separation_hz() as f64;
+        for p in pkgs.iter() {
+            c.tag(Tag::new(p.start_sample, "burst", TagValue::Float(p.snr_db as f64)));
+            // The measured deviation names a device family before anything has
+            // decoded, so it is worth carrying even when no protocol matches.
+            c.tag(Tag::new(p.start_sample, "fsk_separation_hz", TagValue::Float(sep)));
+        }
+
+        let s = self.det.take_stats();
+        if s.rejected_total() > 0 {
+            let mut why = Vec::new();
+            if s.rejected_no_separation > 0 {
+                why.push(format!(
+                    "{} with tones closer than {:.0} Hz, so not FSK (lower \
+                     min_separation_hz, or widen the channel)",
+                    s.rejected_no_separation, self.cfg.min_separation_hz
+                ));
+            }
+            if s.rejected_too_few_pulses > 0 {
+                why.push(format!(
+                    "{} with fewer than {} pulses (raise reset_us, or lower min_pulses)",
+                    s.rejected_too_few_pulses, self.cfg.min_pulses
+                ));
+            }
+            if s.rejected_low_snr > 0 {
+                why.push(format!(
+                    "{} below {:.0} dB SNR (lower min_snr_db, or increase gain)",
+                    s.rejected_low_snr, self.cfg.min_snr_db
+                ));
+            }
+            c.emit(Event::Warning {
+                stage: "fsk_detect".into(),
+                message: format!("discarded {}", why.join("; ")),
+            });
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.det.reset();
+    }
+
+    fn params(&self) -> Vec<Param> {
+        vec![
+            Param::float("reset_us", self.cfg.reset_us as f64, 100.0..=100_000.0)
+                .unit("us")
+                .label("Silence that ends a burst")
+                .log(),
+            Param::float("min_run_us", self.cfg.min_run_us as f64, 2.0..=2000.0)
+                .unit("us")
+                .label("Shortest credible symbol"),
+            Param::int("min_pulses", self.cfg.min_pulses as i64, 2..=512)
+                .label("Minimum pulses per packet"),
+            Param::float(
+                "min_separation_hz",
+                self.cfg.min_separation_hz as f64,
+                200.0..=200_000.0,
+            )
+            .unit("Hz")
+            .label("Minimum tone separation")
+            .log(),
+            Param::float("min_snr_db", self.cfg.min_snr_db as f64, 3.0..=40.0)
+                .unit("dB")
+                .label("Minimum SNR"),
+            Param::float("hysteresis", self.cfg.hysteresis as f64, 0.0..=0.5)
+                .label("Threshold hysteresis"),
+        ]
+    }
+
+    fn set_param(&mut self, name: &str, v: ParamValue) -> Result<()> {
+        let f = v.as_f64().unwrap_or_default();
+        match name {
+            "reset_us" => self.cfg.reset_us = f.max(1.0) as u32,
+            "min_run_us" => self.cfg.min_run_us = f.max(1.0) as u32,
+            "min_pulses" => self.cfg.min_pulses = f.max(1.0) as usize,
+            "min_separation_hz" => self.cfg.min_separation_hz = f.max(0.0) as f32,
+            "min_snr_db" => self.cfg.min_snr_db = f as f32,
+            "hysteresis" => self.cfg.hysteresis = f.clamp(0.0, 0.9) as f32,
+            _ => {
+                return Err(common::Error::other(format!(
+                    "fsk_detect: unknown parameter {name:?}"
+                )))
+            }
+        }
+        let rate = self.det.rate();
+        self.det = FskDetector::new(rate, self.cfg);
+        Ok(())
+    }
+}
+
 /// Run protocols against pulse packages and emit decodes as events.
 pub struct ProtocolDecodeNode {
     protocols: Protocols,
@@ -136,11 +400,60 @@ pub struct ProtocolDecodeNode {
     /// Emit a warning event when a package matched a protocol's timings but
     /// failed its CRC.
     report_crc_failures: bool,
+    /// Report bursts no protocol claimed, with the coding inferred from their
+    /// timings.
+    ///
+    /// On by default, and it is the whole reason this is worth running across
+    /// a band: an unknown device is exactly what a scanner should surface.
+    /// Silence would make the receiver useless for the case it should be best
+    /// at, and the inferred bits are where reverse engineering starts.
+    report_unknown: bool,
+    /// How the pulses reaching this node were keyed, for the report.
+    modulation: &'static str,
 }
 
 impl ProtocolDecodeNode {
     pub fn new(protocols: Protocols) -> Self {
-        Self { protocols, report_all: true, report_crc_failures: true }
+        Self {
+            protocols,
+            report_all: true,
+            report_crc_failures: true,
+            report_unknown: true,
+            modulation: "OOK",
+        }
+    }
+
+    /// Name the modulation feeding this decoder: "OOK", "FSK", "ASK".
+    pub fn with_modulation(mut self, m: &'static str) -> Self {
+        self.modulation = m;
+        self
+    }
+
+    /// Emit a burst no protocol claimed, read under a guessed coding.
+    fn report_unmatched(&self, pkg: &common::Package, c: &mut NodeCtx<'_>) {
+        if !self.report_unknown {
+            return;
+        }
+        let center = c.inputs[0].spec.center;
+        let at = pkg.start_sample as f64;
+        let ev = match decode::analyze(pkg) {
+            Some(a) => Decoded::bytes("unknown", center, at, a.bits.as_bytes().to_vec())
+                .with_text(format!("unknown: {}", a.summary()))
+                .with_detail(a.summary()),
+            // Too short or too irregular to read. Still worth a line: it says
+            // something was there, which is the difference between a quiet
+            // band and a misconfigured chain.
+            None => Decoded::bytes("unknown", center, at, Vec::new())
+                .with_text("unknown: unreadable burst")
+                .with_detail(format!(
+                    "{} pulses, {:.1} ms, no coding inferred",
+                    pkg.pulses.len(),
+                    pkg.duration_us() as f64 / 1000.0,
+                )),
+        };
+        c.emit(Event::Decoded(
+            ev.with_modulation(self.modulation).with_level(pkg.rssi_dbfs, pkg.snr_db),
+        ));
     }
 
     pub fn all() -> Self {
@@ -183,6 +496,12 @@ impl Simple for ProtocolDecodeNode {
                                 report.raw.clone(),
                             )
                             .with_text(report.to_string())
+                            .with_detail(report.fields_line())
+                            .with_fields(
+                                report.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                            )
+                            .with_modulation(self.modulation)
+                            .with_level(pkg.rssi_dbfs, pkg.snr_db)
                             .with_crc(report.crc_valid),
                         ));
                         if !self.report_all {
@@ -206,16 +525,7 @@ impl Simple for ProtocolDecodeNode {
                 }
             }
             if !matched {
-                c.emit(Event::Warning {
-                    stage: "protocol_decode".into(),
-                    message: format!(
-                        "unrecognised burst: {} pulses, {:.1} ms, {:.1} dB; marks {:?}",
-                        pkg.pulses.len(),
-                        pkg.duration_us() as f64 / 1000.0,
-                        pkg.snr_db,
-                        pkg.mark_histogram(100)
-                    ),
-                });
+                self.report_unmatched(pkg, c);
             }
         }
         Ok(())
@@ -226,6 +536,8 @@ impl Simple for ProtocolDecodeNode {
             Param::bool("report_all", self.report_all).label("Report every matching protocol"),
             Param::bool("report_crc_failures", self.report_crc_failures)
                 .label("Warn on CRC failures"),
+            Param::bool("report_unknown", self.report_unknown)
+                .label("Report unrecognised bursts"),
         ]
     }
 
@@ -233,6 +545,7 @@ impl Simple for ProtocolDecodeNode {
         match name {
             "report_all" => self.report_all = v.as_bool().unwrap_or(true),
             "report_crc_failures" => self.report_crc_failures = v.as_bool().unwrap_or(true),
+            "report_unknown" => self.report_unknown = v.as_bool().unwrap_or(true),
             _ => {
                 return Err(common::Error::other(format!(
                     "protocol_decode: unknown parameter {name:?}"
