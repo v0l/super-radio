@@ -15,8 +15,8 @@ pub use bank::{ChannelBank, ChannelEvent, Gating};
 pub use wfm::WfmDemodNode;
 pub use decode_nodes::{AskDetectNode, FskDetectNode, ProtocolDecodeNode, PulseDetectNode};
 pub use dsp_nodes::{
-    DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, HighBlendNode, MixerNode,
-    RealDecimateNode,
+    AgcNode, DecimateNode, DeemphasisNode, EnvelopeNode, FmDemodNode, HighBlendNode, MixerNode,
+    RealDecimateNode, SquelchKind, SquelchNode, SsbDemodNode,
 };
 
 use common::Result;
@@ -167,6 +167,60 @@ pub fn registry() -> Registry {
                 max_burst_us: s.f64_or("max_burst_us", d.max_burst_us as f64) as u32,
             };
             Ok(Box::new(FskDetectNode::new(cfg)) as Box<dyn Node>)
+        },
+    );
+
+    r.register(
+        StageDesc {
+            name: "ssb_demod",
+            summary: "Demodulate one sideband, or a narrow slice of it for CW",
+            category: "demod",
+        },
+        |s: &Settings| {
+            let sideband = match s.str_or("sideband", "usb") {
+                "lsb" | "LSB" => dsp::ssb::Sideband::Lower,
+                _ => dsp::ssb::Sideband::Upper,
+            };
+            Ok(Box::new(SsbDemodNode::new(
+                sideband,
+                s.f64_or("low_hz", 300.0),
+                s.f64_or("high_hz", 2_700.0),
+            )) as Box<dyn Node>)
+        },
+    );
+
+    r.register(
+        StageDesc {
+            name: "agc",
+            summary: "Hold audio at a usable level without riding the volume control",
+            category: "audio",
+        },
+        |s: &Settings| {
+            let mut n = AgcNode::new(
+                s.f64_or("attack_ms", 5.0),
+                s.f64_or("release_ms", 500.0),
+                s.f64_or("hang_ms", 300.0),
+            );
+            if let Some(v) = s.get("max_gain_db") {
+                pipeline::node::Node::set_param(&mut n, "max_gain_db", v.clone())?;
+            }
+            Ok(Box::new(n) as Box<dyn Node>)
+        },
+    );
+
+    r.register(
+        StageDesc {
+            name: "squelch",
+            summary: "Mute a channel with nothing on it, by noise for FM or by level",
+            category: "audio",
+        },
+        |s: &Settings| {
+            let kind = match s.str_or("kind", "noise") {
+                "level" => SquelchKind::Level,
+                _ => SquelchKind::Noise,
+            };
+            Ok(Box::new(SquelchNode::new(kind, s.f64_or("threshold_db", 9.0) as f32))
+                as Box<dyn Node>)
         },
     );
 
