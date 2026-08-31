@@ -424,25 +424,19 @@ with this on.
 
 ### Command line
 
+`--help` lists everything with its defaults; the ones worth knowing:
+
 ```
 --tune <mhz>        start tuned and listening
---mode <mode>       wfm, nfm, am, usb, lsb or cw (default wfm)
---span <khz>        start at the nearest span to this, narrowing if needed
+--mode <mode>       wfm, nfm, am, usb, lsb or cw
+--span <khz>        start at the nearest span, narrowing in software if needed
 --gain              open the radio's own controls on start
---squelch-probe <mhz>  report what the squelch reads on a frequency
---chain             open on the signal chain view
---device <name>     pick a radio by name, for when several are plugged in
---shot <path>       write a PNG of the interface and exit
---record <dir>      write every burst that decodes to a directory of captures
---record-mb <n>     how much to write before recording stops (default 256)
---replay <path>     decode a capture, or a directory of them, and print it
---soak <secs>       run for N seconds, then report CPU and span timings
---probe <mhz>       check the signal path with no display
---mpx <mhz>         report FM multiplex levels
---no-dc             leave the centre spur in
---bench-tune        time a retune
---bench-pan         frames delivered while the centre is dragged
---bench-audio       audio chain throughput
+--record [dir]      write every burst that decodes to a directory of captures
+--replay [path]     decode a capture, or a directory of them, and print it
+--shot [path]       write a PNG of the interface and exit
+--squelch-probe [mhz]  report what the squelch reads on a frequency
+--soak [secs]       run for N seconds, then report CPU and span timings
+--probe [mhz]       check the signal path with no display
 ```
 
 Span times under `--soak` are wall clock, so `rf_read` sitting near 100% means
