@@ -4,6 +4,7 @@
 //! sample. Parallelism is the caller's business, so these types are `Send` but
 //! not internally threaded.
 
+pub mod agc;
 pub mod ask;
 pub mod blend;
 pub mod channelizer;
@@ -16,6 +17,7 @@ pub mod mixer;
 pub mod pulse;
 pub mod rds;
 pub mod spectrum;
+pub mod squelch;
 pub mod ssb;
 pub mod stereo;
 pub(crate) mod twolevel;
