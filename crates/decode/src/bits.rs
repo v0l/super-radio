@@ -112,6 +112,19 @@ impl BitBuffer {
         out
     }
 
+    /// Every bit flipped.
+    ///
+    /// Several protocols are documented with the opposite polarity to the one
+    /// the slicer produces, and rtl_433 handles them by inverting the whole
+    /// buffer before parsing. Doing the same keeps a transcribed frame layout
+    /// readable against its source.
+    pub fn inverted(&self) -> BitBuffer {
+        BitBuffer {
+            bytes: self.bytes.iter().map(|b| !b).collect(),
+            len: self.len,
+        }
+    }
+
     pub fn to_hex(&self) -> String {
         self.bytes
             .iter()
@@ -157,6 +170,35 @@ pub fn xor8(data: &[u8]) -> u8 {
 /// Reverse the bit order within a byte, for protocols transmitted LSB first.
 pub fn reflect8(b: u8) -> u8 {
     b.reverse_bits()
+}
+
+/// Even parity of one byte: 1 when an odd number of bits are set.
+pub fn parity8(b: u8) -> u8 {
+    b.count_ones() as u8 & 1
+}
+
+/// True when every byte carries even parity, as Acurite's TXR family requires.
+pub fn even_parity(data: &[u8]) -> bool {
+    data.iter().all(|b| parity8(*b) == 0)
+}
+
+/// Galois LFSR digest, reflected, as rtl_433's `lfsr_digest8_reflect`.
+///
+/// Used by LaCrosse and several others in place of a CRC. Bytes are processed
+/// last to first and bits LSB first, the key rolling left through `gen` at
+/// every bit. It is not a CRC and cannot be computed with one.
+pub fn lfsr_digest8_reflect(data: &[u8], gen: u8, key: u8) -> u8 {
+    let mut sum = 0u8;
+    let mut key = key;
+    for &byte in data.iter().rev() {
+        for i in 0..8 {
+            if byte >> i & 1 != 0 {
+                sum ^= key;
+            }
+            key = if key & 0x80 != 0 { (key << 1) ^ gen } else { key << 1 };
+        }
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -216,6 +258,32 @@ mod tests {
         let mut framed = payload.to_vec();
         framed.push(c);
         assert_eq!(crc8(&framed, 0x31, 0xff), 0);
+    }
+
+    #[test]
+    fn inverted_flips_every_bit_and_keeps_the_length() {
+        let b = BitBuffer::from_bytes(&[0b1010_0000, 0xff]).slice(0, 12);
+        let i = b.inverted();
+        assert_eq!(i.len(), 12);
+        for n in 0..12 {
+            assert_eq!(i.get(n), b.get(n).map(|v| !v));
+        }
+    }
+
+    #[test]
+    fn parity_counts_set_bits() {
+        assert_eq!(parity8(0b0000_0000), 0);
+        assert_eq!(parity8(0b1000_0001), 0);
+        assert_eq!(parity8(0b1000_0000), 1);
+        assert!(even_parity(&[0x00, 0x03, 0xff]));
+        assert!(!even_parity(&[0x00, 0x01]));
+    }
+
+    #[test]
+    fn lfsr_digest_matches_rtl_433() {
+        // Checked against rtl_433's own lfsr_digest8_reflect compiled and run
+        // on the same input, with the LaCrosse TX141TH parameters.
+        assert_eq!(lfsr_digest8_reflect(&[0xd4, 0x22, 0xf5, 0x3b], 0x31, 0xf4), 0x5b);
     }
 
     #[test]

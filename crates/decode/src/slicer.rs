@@ -17,7 +17,8 @@ pub enum Coding {
     /// published protocol parameters can be used unchanged.
     Pwm,
     /// Pulse position modulation: marks are uniform and the *gap* carries the
-    /// bit. Short gap is 1, long gap is 0.
+    /// bit. Short gap is 0, long gap is 1, again matching rtl_433, whose PPM
+    /// slicer uses the opposite polarity to its PWM one.
     Ppm,
     /// Manchester: each bit is a transition at mid-symbol. Encoded here over
     /// mark/gap pairs, with the convention that a full-length mark or gap is
@@ -53,6 +54,20 @@ impl Timing {
 
     pub fn ppm(short_us: u32, long_us: u32, reset_us: u32) -> Self {
         Self { coding: Coding::Ppm, short_us, long_us, sync_us: 0, tolerance_us: 0, reset_us }
+    }
+
+    /// PWM with a sync mark, which several protocols put before every frame.
+    ///
+    /// The sync carries no bit. It is dropped rather than used to split the
+    /// package, so a burst of repeats slices into one long buffer and the
+    /// decoder finds its frame in there by checksum.
+    pub fn pwm_sync(short_us: u32, long_us: u32, sync_us: u32, reset_us: u32) -> Self {
+        Self { coding: Coding::Pwm, short_us, long_us, sync_us, tolerance_us: 0, reset_us }
+    }
+
+    pub fn with_tolerance(mut self, us: u32) -> Self {
+        self.tolerance_us = us;
+        self
     }
 
     fn tol(&self) -> u32 {
@@ -118,6 +133,9 @@ fn slice_pwm(pkg: &Package, t: &Timing) -> Result<BitBuffer, SliceError> {
         // protocol, and guessing would manufacture plausible-looking rubbish.
         let lo = t.short_us.saturating_sub(t.tol() * 2);
         let hi = t.long_us + t.tol() * 2;
+        if t.sync_us > 0 && p.mark.abs_diff(t.sync_us) <= t.tol() {
+            continue;
+        }
         if p.mark < lo || p.mark > hi {
             return Err(SliceError::BadWidth { index: i, width_us: p.mark });
         }
@@ -134,7 +152,7 @@ fn slice_ppm(pkg: &Package, t: &Timing) -> Result<BitBuffer, SliceError> {
     let mut b = BitBuffer::with_capacity(pkg.pulses.len());
     // The final gap is the terminating timeout and carries no bit.
     for p in &pkg.pulses[..pkg.pulses.len() - 1] {
-        b.push(p.gap < mid);
+        b.push(p.gap >= mid);
     }
     Ok(b)
 }
@@ -266,7 +284,22 @@ mod tests {
         ]);
         let b = slice(&p, &t).unwrap();
         assert_eq!(b.len(), 8, "terminator must not become a bit");
-        assert_eq!(b.as_bytes(), &[0b1010_1101]);
+        // Long gap is 1, the way rtl_433 reads PPM. Getting this backwards
+        // makes every transcribed table decode to nonsense.
+        assert_eq!(b.as_bytes(), &[0b0101_0010]);
+    }
+
+    #[test]
+    fn a_sync_mark_carries_no_bit() {
+        // LaCrosse TX141TH: four 833 us sync marks, then 625 us data pulses.
+        let t = Timing::pwm_sync(208, 417, 833, 1700);
+        let mut pulses = vec![(833, 833); 4];
+        pulses.extend([(417, 208), (208, 417), (208, 417), (417, 208)]);
+        pulses.extend([(417, 208), (417, 208), (208, 417), (208, 417)]);
+        let b = slice(&pkg(&pulses), &t).unwrap();
+        assert_eq!(b.len(), 8, "sync marks became bits");
+        // Short mark is 1, so the long-mark bits read as zeros here.
+        assert_eq!(b.as_bytes(), &[0b0110_0011]);
     }
 
     #[test]

@@ -1,0 +1,216 @@
+//! What the receiver was set to last time, so it comes back that way.
+//!
+//! Tuning a receiver is a dozen small decisions: which radio, where it points,
+//! how wide, how much gain in each stage, how far out the crystal is. Making
+//! the operator take all of them again at every start is the difference
+//! between a instrument and a demo.
+//!
+//! Written as plain `key = value` lines rather than through a serialisation
+//! crate. The file is a dozen scalars, it wants to survive a version bump
+//! without a migration, and it is worth being editable by hand when something
+//! about the saved state is what is broken. Unknown keys are ignored and
+//! missing ones keep their defaults, which is what makes both of those true.
+
+use common::GainMode;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+/// Where the receiver starts with nothing saved.
+///
+/// 433.92 MHz rather than an FM broadcast station: the point of the thing is
+/// digital modes, and this is where they are.
+pub const DEFAULT_CENTER: f64 = 433_920_000.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    /// Device label, matched against what is attached at startup. A label
+    /// rather than an index, because plug order is not stable.
+    pub device: Option<String>,
+    pub center: f64,
+    pub rate: f64,
+    pub zoom: usize,
+    pub fft: usize,
+    /// Gain stages by driver name, re-applied once the radio is running.
+    pub gains: Vec<(String, GainMode)>,
+    /// Named switches: bias tee, digital AGC and so on.
+    pub toggles: Vec<(String, bool)>,
+    pub ppm: f64,
+    pub dc_block: bool,
+    pub decode_on: bool,
+    pub volume: f32,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            device: None,
+            center: DEFAULT_CENTER,
+            rate: 2_304_000.0,
+            zoom: 1,
+            fft: 2048,
+            gains: Vec::new(),
+            toggles: Vec::new(),
+            ppm: 0.0,
+            dc_block: true,
+            decode_on: true,
+            volume: 0.5,
+        }
+    }
+}
+
+impl Session {
+    /// `$XDG_CONFIG_HOME/super-radio/session`, or `~/.config` when unset.
+    pub fn path() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        Some(base.join("super-radio").join("session"))
+    }
+
+    /// Load, falling back to defaults for anything missing or unreadable.
+    ///
+    /// A corrupt session file must never stop the receiver starting: the whole
+    /// file is a convenience, and refusing to run because of one is worse than
+    /// any setting it could restore.
+    pub fn load() -> Self {
+        Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| Self::parse(&s))
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, self.render());
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut kv: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut gains = Vec::new();
+        let mut toggles = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            if let Some(name) = k.strip_prefix("gain.") {
+                if let Some(m) = parse_gain(v) {
+                    gains.push((name.to_string(), m));
+                }
+            } else if let Some(name) = k.strip_prefix("toggle.") {
+                toggles.push((name.to_string(), v == "true"));
+            } else {
+                kv.insert(k, v);
+            }
+        }
+        let d = Session::default();
+        let f = |k: &str, or: f64| kv.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
+        Session {
+            device: kv.get("device").map(|v| v.to_string()).filter(|v| !v.is_empty()),
+            center: f("center", d.center),
+            rate: f("rate", d.rate),
+            zoom: kv.get("zoom").and_then(|v| v.parse().ok()).unwrap_or(d.zoom),
+            fft: kv.get("fft").and_then(|v| v.parse().ok()).unwrap_or(d.fft),
+            gains,
+            toggles,
+            ppm: f("ppm", d.ppm),
+            dc_block: kv.get("dc_block").map(|v| *v == "true").unwrap_or(d.dc_block),
+            decode_on: kv.get("decode").map(|v| *v == "true").unwrap_or(d.decode_on),
+            volume: f("volume", d.volume as f64) as f32,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut s = String::from("# super-radio session, rewritten as settings change\n");
+        if let Some(d) = &self.device {
+            s.push_str(&format!("device = {d}\n"));
+        }
+        s.push_str(&format!("center = {:.0}\n", self.center));
+        s.push_str(&format!("rate = {:.0}\n", self.rate));
+        s.push_str(&format!("zoom = {}\n", self.zoom));
+        s.push_str(&format!("fft = {}\n", self.fft));
+        s.push_str(&format!("ppm = {}\n", self.ppm));
+        s.push_str(&format!("dc_block = {}\n", self.dc_block));
+        s.push_str(&format!("decode = {}\n", self.decode_on));
+        s.push_str(&format!("volume = {}\n", self.volume));
+        for (name, mode) in &self.gains {
+            s.push_str(&format!("gain.{name} = {}\n", render_gain(*mode)));
+        }
+        for (name, on) in &self.toggles {
+            s.push_str(&format!("toggle.{name} = {on}\n"));
+        }
+        s
+    }
+}
+
+fn parse_gain(v: &str) -> Option<GainMode> {
+    if v == "auto" {
+        return Some(GainMode::Auto);
+    }
+    v.parse().ok().map(GainMode::Manual)
+}
+
+fn render_gain(m: GainMode) -> String {
+    match m {
+        GainMode::Auto => "auto".into(),
+        GainMode::Manual(v) => format!("{v}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_round_trips_through_the_file_format() {
+        let s = Session {
+            device: Some("RTL2838 #00000001".into()),
+            center: 433_920_000.0,
+            rate: 2_048_000.0,
+            zoom: 4,
+            fft: 4096,
+            gains: vec![
+                ("tuner".into(), GainMode::Manual(29.7)),
+                ("lna".into(), GainMode::Auto),
+            ],
+            toggles: vec![("bias_tee".into(), true)],
+            ppm: -3.5,
+            dc_block: false,
+            decode_on: false,
+            volume: 0.25,
+        };
+        assert_eq!(Session::parse(&s.render()), s);
+    }
+
+    #[test]
+    fn an_empty_or_broken_file_gives_the_defaults() {
+        // The session is a convenience. Refusing to start because of it, or
+        // starting somewhere unexpected, are both worse than ignoring it.
+        assert_eq!(Session::parse(""), Session::default());
+        assert_eq!(Session::parse("nonsense\n\x00\ncenter = banana"), Session::default());
+        assert_eq!(Session::parse("").center, DEFAULT_CENTER);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_rather_than_fatal() {
+        // A file written by a later version has to load in an earlier one,
+        // or a downgrade loses every setting rather than the new ones.
+        let s = Session::parse("center = 868300000\nfuture_setting = 7\n");
+        assert_eq!(s.center, 868_300_000.0);
+        assert_eq!(s.rate, Session::default().rate);
+    }
+
+    #[test]
+    fn gain_stages_keep_their_names_and_modes() {
+        let s = Session::parse("gain.tuner = 29.7\ngain.if = auto\n");
+        assert_eq!(
+            s.gains,
+            vec![("tuner".into(), GainMode::Manual(29.7)), ("if".into(), GainMode::Auto)]
+        );
+    }
+}

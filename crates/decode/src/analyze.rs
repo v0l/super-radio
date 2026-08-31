@@ -209,7 +209,7 @@ mod tests {
         let a = analyze(&p).expect("analysis");
         assert_eq!(a.coding, Coding::Ppm);
         assert_eq!(a.bits.len(), 8, "the terminating gap is not a bit");
-        assert_eq!(a.bits.as_bytes()[0], 0b1010_0110);
+        assert_eq!(a.bits.as_bytes()[0], 0b0101_1001);
     }
 
     #[test]

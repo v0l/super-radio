@@ -22,9 +22,9 @@
 //! - `D`  4-bit wind direction index
 //! - `CC` CRC-8, polynomial 0x31, init 0xff, over all 11 bytes
 
-use crate::bits::{crc8, BitBuffer};
+use crate::bits::{checksum8, crc8, BitBuffer};
 use crate::protocol::{DecodeError, Protocol, Report};
-use crate::slicer::Timing;
+use crate::slicer::{Coding, Timing};
 
 /// Wind direction index to degrees, 22.5 degree steps starting at north.
 const WIND_DIR: [u16; 16] =
@@ -123,6 +123,90 @@ impl Protocol for FineOffsetWh1080 {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Fine Offset / Ecowitt WH51 soil moisture probe, also sold as the Ecowitt
+/// WN31, MISOL/1 and SwitchDoc Labs SM23.
+///
+/// FSK rather than OOK, 58 us a bit, at 433.92, 868 or 915 MHz depending on
+/// the region. Fourteen bytes behind an `aa 2d d4` preamble:
+///
+/// ```text
+/// FF II II II TB YY MM ZA AA XX XX XX CC SS
+/// ```
+///
+/// - `FF` family code, always 0x51
+/// - `II` 24 bit id
+/// - `T`  transmission boost: set to 7 when the reading changes and counted
+///   down, which is what makes the sensor report every 10 s instead of 70 s
+/// - `B`  battery voltage in tenths of a volt
+/// - `MM` moisture percent, as the sensor computes it
+/// - `AAA` 9 bit raw ADC reading, which is the number to calibrate against
+///   when the percentage looks wrong at the ends of the scale
+/// - `CC` CRC-8, polynomial 0x31, init 0x00, over the first twelve bytes
+/// - `SS` sum of the first thirteen
+///
+/// Two independent checks over the same bytes, so a decode here is about as
+/// trustworthy as anything on these bands gets.
+pub struct FineOffsetWh51;
+
+const WH51_BYTES: usize = 14;
+const WH51_PREAMBLE: [u8; 3] = [0xaa, 0x2d, 0xd4];
+const WH51_FAMILY: u8 = 0x51;
+
+impl Protocol for FineOffsetWh51 {
+    fn name(&self) -> &'static str {
+        "Fineoffset-WH51"
+    }
+
+    fn timing(&self) -> Timing {
+        Timing {
+            coding: Coding::Nrz,
+            short_us: 58,
+            long_us: 58,
+            sync_us: 0,
+            tolerance_us: 0,
+            reset_us: 5000,
+        }
+    }
+
+    fn decode(&self, bits: &BitBuffer) -> Result<Report, DecodeError> {
+        let at = bits.find(&WH51_PREAMBLE, 24).ok_or(DecodeError::NotThisProtocol)?;
+        let start = at + 24;
+        if start + WH51_BYTES * 8 > bits.len() {
+            return Err(DecodeError::WrongLength {
+                got: bits.len() - start,
+                want: WH51_BYTES * 8,
+            });
+        }
+        let frame = bits.slice(start, WH51_BYTES * 8);
+        let b = frame.as_bytes();
+        if b[0] != WH51_FAMILY {
+            return Err(DecodeError::NotThisProtocol);
+        }
+        if crc8(&b[..12], 0x31, 0x00) != b[12] || checksum8(&b[..13]) != b[13] {
+            return Err(DecodeError::CrcFailed);
+        }
+
+        let moisture = b[6];
+        if moisture > 100 {
+            return Err(DecodeError::Implausible("moisture above 100%"));
+        }
+
+        let mut r = Report::new(self.name());
+        r.crc_valid = Some(true);
+        r.raw = b.to_vec();
+        Ok(r
+            .text("id", format!("{:02x}{:02x}{:02x}", b[1], b[2], b[3]))
+            .int("moisture_pct", moisture as i64)
+            .int("ad_raw", (((b[7] as i64) & 0x01) << 8) | b[8] as i64)
+            .int("battery_mv", (b[4] & 0x1f) as i64 * 100)
+            .int("boost", (b[4] >> 5) as i64)
+            // A single alkaline cell: 1.6 V is fresh, 1.2 V is about to take
+            // the readings with it. Reported as millivolts rather than a
+            // fraction so the threshold stays the reader's to choose.
+            .bool("battery_ok", b[4] & 0x1f >= 13))
+    }
 }
 
 #[cfg(test)]

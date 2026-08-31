@@ -1,8 +1,7 @@
 # Protocols
 
 The target is the union of what rtl_433, a Flipper Zero, a PortaPack running
-Mayhem and SDRangel can do, in one receiver, with transmit where transmit is
-lawful. This file lists those protocols, what each one costs to add, and which
+Mayhem and SDRangel can do, in one receiver, and transmit for the same set. This file lists those protocols, what each one costs to add, and which
 direction is realistic for it.
 
 The point of the list is to make the cost visible before starting, because
@@ -56,6 +55,9 @@ can reach.
 Receive:
 
 - **done**: decoding now, verified against a recording
+- **synthetic**: decoding now, but only checked against frames this project
+  built itself from rtl_433's published layout. The parser is exercised; the
+  timings and the front end in front of it are not
 - **table**: fits an existing front end. A timing table plus a payload parser
 - **framing**: fits an existing front end, but needs sync words, bit
   destuffing or forward error correction that is not written yet
@@ -68,13 +70,12 @@ Transmit:
   exists
 - **mod**: needs a modulator beyond OOK/FSK keying
 - **chain**: needs its own transmit chain
-- **no**: technically possible, not lawful to transmit in normal use. Listed
-  so the answer is recorded rather than rediscovered
 
-Transmitting is regulated. ISM band transmission is bounded by power and duty
-cycle limits, amateur bands need a licence, and aviation, maritime, paging,
-public safety and cellular bands are not open to transmit on at all. Cloning
-someone else's remote or jamming anything is not a feature this project wants.
+The transmit column is an engineering estimate and nothing else. What is legal
+to radiate depends on the band, the power, the antenna and the country, and
+that is the operator's call, not this file's. The one place it becomes a code
+concern is duty cycle: parts of 868 MHz are capped at 1%, and a scheduler that
+enforces the cap is easier to trust than an operator who has to remember it.
 
 ## ISM sensors, remotes and telemetry
 
@@ -85,26 +86,34 @@ existing pulse front end. Lowest marginal cost, highest coverage gain.
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
 | Fine Offset WH1080 family | 433.92 MHz | OOK PWM 544/1524 us | 31 kHz | done | table | CRC8, matches rtl_433 25.02 field for field |
-| PT2262 / EV1527 / HS1527 fixed code | 315/433.92 MHz | OOK PWM | 31 kHz | table | table | Garage doors, doorbells, cheap sensors. The most common thing on 433 |
+| PT2262 / EV1527 / HS1527 fixed code | 315/433.92 MHz | OOK PWM | 31 kHz | synthetic | table | Garage doors, doorbells, cheap sensors. The most common thing on 433. No integrity check at all, so a burst is only claimed when it is exactly one frame long |
 | Nice Flo, CAME, Holtek, Ansonic, Linear | 433.92 MHz | OOK PWM | 31 kHz | table | table | Flipper's fixed-code gate remotes, one table each |
 | Chamberlain / Security+ 1.0 and 2.0 | 310/315/390 MHz | OOK PWM | 31 kHz | table | table | Rolling code: readable, not cloneable |
-| KeeLoq, FAAC SLH, Somfy RTS, Star Line | 433.42/433.92 MHz | OOK PWM/Manchester | 31 kHz | table | no | Frames read fine; the code is encrypted by design, and transmitting one is cloning someone's gate |
-| Acurite, Ambient Weather, LaCrosse, Oregon Scientific | 433.92/915 MHz | OOK PWM/Manchester | 31 kHz | table | table | Several families each, all timing tables |
-| TPMS (Schrader, Toyota, Renault, Citroen) | 315/433.92 MHz | OOK/FSK Manchester | 31-125 kHz | table | no | Bursty, short, CRC8. Faking tyre pressure to a moving car is not a feature |
+| KeeLoq, FAAC SLH, Somfy RTS, Star Line | 433.42/433.92 MHz | OOK PWM/Manchester | 31 kHz | table | table | Frames read fine; the payload is encrypted, so a replay is all a transmitter can do with one |
+| Acurite 609TXC, 592TXR tower | 433.92 MHz | OOK PPM/PWM | 31 kHz | synthetic | table | Checksum, and per-byte parity on the tower family |
+| LaCrosse TX141TH-Bv2 | 433.92 MHz | OOK PWM | 31 kHz | synthetic | table | LFSR digest, not a CRC |
+| LaCrosse TX29-IT, TX35DTH-IT | 868.24 MHz | FSK NRZ 55/105 us | 125 kHz | synthetic | table | Sync word 0x2dd4, CRC8, BCD temperature |
+| Nexus, FreeTec, Solight, TFA 30.3209 | 433.92 MHz | OOK PPM | 31 kHz | synthetic | table | No checksum: one constant nibble and rtl_433's sanity rules |
+| Rubicson, TFA 30.3197, inFactory PT-310 | 433.92 MHz | OOK PPM | 31 kHz | synthetic | table | CRC8 over a nibble-padded frame. Shares its layout with Nexus, which defers to it |
+| Bresser Thermo-/Hygro 3CH, Renkforce DM-7511 | 433.92 MHz | OOK PWM | 31 kHz | synthetic | table | Additive checksum. Measures in Fahrenheit, reported in Celsius |
+| Globaltronics GT-WT-02 (Aldi) | 433.92 MHz | OOK PPM, ms symbols | 31 kHz | synthetic | table | Nibble-sum checksum, LL/HH humidity sentinels |
+| Globaltronics GT-WT-03 (Aldi, Lidl) | 433.92 MHz | OOK PWM | 31 kHz | synthetic | table | Rolling-key checksum, neither a CRC nor a sum |
+| Ambient Weather, Oregon Scientific, other Acurite | 433.92/915 MHz | OOK PWM/Manchester | 31 kHz | table | table | Several families each, all timing tables |
+| TPMS (Schrader, Toyota, Renault, Citroen) | 315/433.92 MHz | OOK/FSK Manchester | 31-125 kHz | table | table | Bursty, short, CRC8. Sensors report on a timer, so a receiver waits minutes per wheel |
 | EnOcean | 868.3 MHz | ASK | 31 kHz | table | table | Self-powered switches |
-| Itron / ERT smart meters | 902-928 MHz | OOK/FSK Manchester | 125 kHz | table | no | The rtlamr target |
+| Itron / ERT smart meters | 902-928 MHz | OOK/FSK Manchester | 125 kHz | table | table | The rtlamr target |
 | X10 RF | 310/433.92 MHz | OOK | 31 kHz | table | table | |
 | Homematic | 868.3 MHz | GFSK 10 kbps | 125 kHz | framing | mod | Sync word plus whitening |
-| Radiosondes (RS41, DFM, M10) | 400-406 MHz | GFSK 4800 bps | 125 kHz | framing | no | Reed-Solomon, and a GPS position worth having |
+| Radiosondes (RS41, DFM, M10) | 400-406 MHz | GFSK 4800 bps | 125 kHz | framing | mod | Reed-Solomon, and a GPS position worth having |
 | nRF24 ShockBurst | 2.4 GHz | GFSK 1-2 Mbps | 2 MHz | demod | mod | HackRF only. Flipper does this with a separate module |
 
 ## Utility metering and home automation
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| Wireless M-Bus mode T | 868.95 MHz | 2-FSK 100 kbps, 3-of-6 | 125 kHz | framing | no | Very common on 868. Block CRCs, payloads often encrypted |
-| Wireless M-Bus mode S | 868.3 MHz | 2-FSK 32.768 kbps, Manchester | 125 kHz | framing | no | |
-| Wireless M-Bus mode C | 868.95 MHz | 2-FSK 100 kbps NRZ | 125 kHz | framing | no | |
+| Wireless M-Bus mode T | 868.95 MHz | 2-FSK 100 kbps, 3-of-6 | 125 kHz | framing | table | Very common on 868. Block CRCs, payloads often encrypted |
+| Wireless M-Bus mode S | 868.3 MHz | 2-FSK 32.768 kbps, Manchester | 125 kHz | framing | table | |
+| Wireless M-Bus mode C | 868.95 MHz | 2-FSK 100 kbps NRZ | 125 kHz | framing | table | |
 | Wireless M-Bus mode N | 169 MHz | 4-GFSK 2.4/4.8 kbps | 31 kHz | demod | mod | Four levels, so the two-level slicer does not apply |
 | Z-Wave R1 | 868.42/908.42 MHz | FSK 9.6 kbps, Manchester | 125 kHz | framing | table | Preamble, sync byte, checksum |
 | Z-Wave R2/R3 | 868.42/908.42 MHz | FSK 40/100 kbps | 125 kHz | framing | table | |
@@ -117,82 +126,81 @@ existing pulse front end. Lowest marginal cost, highest coverage gain.
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
 | LoRa | 433/868/915 MHz | CSS chirp SF7-12 | 125-500 kHz | demod | mod | Dechirp with a conjugate chirp then FFT. Self-contained, well documented, highest value item on the demod list |
-| LoRaWAN | as LoRa | as LoRa | 125-500 kHz | demod | no | Payloads are AES encrypted; the metadata is still worth logging |
-| Meshtastic | 433/868/915 MHz | LoRa | 250 kHz | demod | mod | LoRa plus a known framing, and lawful to transmit on your own mesh |
+| LoRaWAN | as LoRa | as LoRa | 125-500 kHz | demod | mod | Payloads are AES encrypted; the metadata is still worth logging |
+| Meshtastic | 433/868/915 MHz | LoRa | 250 kHz | demod | mod | LoRa plus a known framing |
 | Sigfox uplink | 868.13 MHz | DBPSK 100 bps (600 US) | 100 Hz | demod | mod | Ultra narrowband, coherent detection, very narrow channel |
-| Sigfox downlink | 869.525 MHz | GFSK 600 bps | 31 kHz | framing | no | |
+| Sigfox downlink | 869.525 MHz | GFSK 600 bps | 31 kHz | framing | mod | |
 
 ## Aviation
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| ADS-B 1090ES (Mode S) | 1090 MHz | PPM 1 Mbit/s | 2 MHz | chain | no | The pulse layer fits, the rate does not: 0.5 us half-bits need 2 MS/s or better, so it wants its own chain. CRC24. PortaPack transmits this; broadcasting fake aircraft is not something to build |
-| Mode A/C | 1090 MHz | pulse pairs | 2 MHz | chain | no | Same chain as Mode S once it exists |
-| UAT | 978 MHz | CPFSK 1.041667 Mbps | 2 MHz | chain | no | US general aviation, Reed-Solomon |
-| ACARS | 129-137 MHz | AM, MSK 2400 bps | 25 kHz | framing | no | Rides on an AM channel: envelope path plus MSK bit recovery |
-| VDL Mode 2 | 136 MHz | D8PSK 31.5 kbps | 25 kHz | demod | no | Differential 8-PSK, so a coherent chain |
-| VOR / ILS | 108-118 MHz | AM with 30 Hz subcarriers | 25 kHz | framing | no | SDRangel decodes bearing from these; the maths is small |
-| HFDL | 2-22 MHz | PSK | 3 kHz | demod | no | Needs HF hardware too |
+| ADS-B 1090ES (Mode S) | 1090 MHz | PPM 1 Mbit/s | 2 MHz | chain | mod | The pulse layer fits, the rate does not: 0.5 us half-bits need 2 MS/s or better, so it wants its own chain. CRC24 |
+| Mode A/C | 1090 MHz | pulse pairs | 2 MHz | chain | mod | Same chain as Mode S once it exists |
+| UAT | 978 MHz | CPFSK 1.041667 Mbps | 2 MHz | chain | mod | US general aviation, Reed-Solomon |
+| ACARS | 129-137 MHz | AM, MSK 2400 bps | 25 kHz | framing | mod | Rides on an AM channel: envelope path plus MSK bit recovery |
+| VDL Mode 2 | 136 MHz | D8PSK 31.5 kbps | 25 kHz | demod | mod | Differential 8-PSK, so a coherent chain |
+| VOR / ILS | 108-118 MHz | AM with 30 Hz subcarriers | 25 kHz | framing | mod | SDRangel decodes bearing from these; the maths is small |
+| HFDL | 2-22 MHz | PSK | 3 kHz | demod | mod | Needs HF hardware too |
 
 ## Maritime
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| AIS | 161.975/162.025 MHz | GMSK 9600 bps | 25 kHz | framing | no | NRZI, HDLC bit stuffing, CRC16. The discriminator output is usable directly, so this is the cheapest of the "real" protocols |
-| DSC | 156.525 MHz, HF | FSK 1200 baud | 25 kHz | framing | no | Distress calls. Transmitting is a criminal matter, not a licensing one |
-| NAVTEX | 518 kHz | FSK 100 baud SITOR-B | 1 kHz | chain | no | Needs HF hardware |
+| AIS | 161.975/162.025 MHz | GMSK 9600 bps | 25 kHz | framing | mod | NRZI, HDLC bit stuffing, CRC16. The discriminator output is usable directly, so this is the cheapest of the "real" protocols |
+| DSC | 156.525 MHz, HF | FSK 1200 baud | 25 kHz | framing | table | Distress calls, so anything transmitted here reaches a coastguard watch room |
+| NAVTEX | 518 kHz | FSK 100 baud SITOR-B | 1 kHz | chain | table | Needs HF hardware |
 
 ## Paging
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| POCSAG | 137-174, 450-470, 929 MHz | 2-FSK 512/1200/2400 bps | 25 kHz | framing | table | Fits the FSK front end directly; needs sync word search and BCH(31,21). Amateur DAPNET networks make transmit lawful for licence holders |
-| FLEX | 929-932 MHz | 2/4-FSK 1600-6400 bps | 25 kHz | demod | no | The four-level modes need a four-way slicer |
-| ERMES | 169 MHz | 4-FSK 6250 bps | 25 kHz | demod | no | As FLEX |
+| POCSAG | 137-174, 450-470, 929 MHz | 2-FSK 512/1200/2400 bps | 25 kHz | framing | table | Fits the FSK front end directly; needs sync word search and BCH(31,21). Amateur DAPNET networks run the same protocol |
+| FLEX | 929-932 MHz | 2/4-FSK 1600-6400 bps | 25 kHz | demod | mod | The four-level modes need a four-way slicer |
+| ERMES | 169 MHz | 4-FSK 6250 bps | 25 kHz | demod | mod | As FLEX |
 
-Message content may be legally protected. Decoding and displaying other
-people's messages is regulated differently in different countries; this is a
-capability note, not advice.
+Pager traffic is unencrypted and often carries medical and personal detail.
+Worth knowing before pointing a decoder at it and logging the output.
 
 ## Land mobile and digital voice
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| DMR | 136-174, 400-470 MHz | 4-FSK 4800 baud | 12.5 kHz | demod | no | Four-level slicer, then AMBE, which is patent encumbered |
-| P25 phase 1 | 700-900 MHz | C4FM | 12.5 kHz | demod | no | As DMR, plus IMBE |
-| NXDN, dPMR | 400-470 MHz | 4-FSK | 6.25/12.5 kHz | demod | no | |
-| M17 | amateur bands | 4-FSK 4800 baud | 12.5 kHz | demod | mod | Open codec and open spec, so the only one here worth transmitting, and lawful with a licence |
-| TETRA | 380-400, 410-430 MHz | pi/4-DQPSK 36 kbps | 25 kHz | demod | no | Coherent differential PSK |
+| DMR | 136-174, 400-470 MHz | 4-FSK 4800 baud | 12.5 kHz | demod | mod | Four-level slicer, then AMBE, which is patent encumbered |
+| P25 phase 1 | 700-900 MHz | C4FM | 12.5 kHz | demod | mod | As DMR, plus IMBE |
+| NXDN, dPMR | 400-470 MHz | 4-FSK | 6.25/12.5 kHz | demod | mod | |
+| M17 | amateur bands | 4-FSK 4800 baud | 12.5 kHz | demod | mod | Open codec and open spec, so the only one here with no patent or vocoder problem |
+| TETRA | 380-400, 410-430 MHz | pi/4-DQPSK 36 kbps | 25 kHz | demod | mod | Coherent differential PSK |
 | FM with CTCSS/DCS | any | FM plus subaudible tone | 12.5 kHz | table | mod | Trivial next to the rest: a Goertzel on the discriminator output |
 
 ## Broadcast
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| FM stereo | 87.5-108 MHz | FM, 38 kHz subcarrier | 200 kHz | done | mod | Transmitting needs a dummy load or a licence |
+| FM stereo | 87.5-108 MHz | FM, 38 kHz subcarrier | 200 kHz | done | mod | |
 | RDS | 87.5-108 MHz | 57 kHz BPSK 1187.5 bps | 200 kHz | done | mod | PortaPack transmits RDS; the encoder is small once the modulator exists |
 | AM broadcast | 530-1700 kHz | AM | 10 kHz | done | mod | Envelope detector; the band itself needs HF hardware |
-| DAB / DAB+ | 174-240 MHz | OFDM DQPSK | 1.536 MHz | chain | no | Viterbi plus Reed-Solomon after the OFDM |
-| DVB-T | 470-790 MHz | OFDM | 8 MHz | chain | no | HackRF only, and a large amount of machinery |
-| DRM | HF | OFDM | 10 kHz | chain | no | |
-| HD Radio (IBOC) | 88-108 MHz | OFDM sidebands | 400 kHz | chain | no | |
+| DAB / DAB+ | 174-240 MHz | OFDM DQPSK | 1.536 MHz | chain | chain | Viterbi plus Reed-Solomon after the OFDM |
+| DVB-T | 470-790 MHz | OFDM | 8 MHz | chain | chain | HackRF only, and a large amount of machinery |
+| DRM | HF | OFDM | 10 kHz | chain | chain | |
+| HD Radio (IBOC) | 88-108 MHz | OFDM sidebands | 400 kHz | chain | chain | |
 
 ## Satellite
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| NOAA APT | 137 MHz | FM, 2.4 kHz AM subcarrier | 40 kHz | framing | no | An image rather than packets: the demodulation is easy, the presentation is the work |
-| Meteor-M LRPT | 137.9 MHz | QPSK 72 kbps | 120 kHz | demod | no | Viterbi plus Reed-Solomon |
-| Iridium | 1616-1626 MHz | QPSK 25 kbaud bursts | 500 kHz | demod | no | Bursty, needs good timing |
-| Inmarsat STD-C | 1537 MHz | BPSK 1200 bps | 10 kHz | demod | no | Needs an L-band antenna and an LNA |
-| GOES HRIT | 1694 MHz | BPSK 927 kbps | 2 MHz | chain | no | |
-| GPS L1 | 1575.42 MHz | BPSK DSSS | 2 MHz | demod | mod | Receiving needs a despreader. PortaPack simulates GPS; transmitting is jamming with extra steps |
+| NOAA APT | 137 MHz | FM, 2.4 kHz AM subcarrier | 40 kHz | framing | mod | An image rather than packets: the demodulation is easy, the presentation is the work |
+| Meteor-M LRPT | 137.9 MHz | QPSK 72 kbps | 120 kHz | demod | mod | Viterbi plus Reed-Solomon |
+| Iridium | 1616-1626 MHz | QPSK 25 kbaud bursts | 500 kHz | demod | mod | Bursty, needs good timing |
+| Inmarsat STD-C | 1537 MHz | BPSK 1200 bps | 10 kHz | demod | mod | Needs an L-band antenna and an LNA |
+| GOES HRIT | 1694 MHz | BPSK 927 kbps | 2 MHz | chain | mod | |
+| GPS L1 | 1575.42 MHz | BPSK DSSS | 2 MHz | demod | mod | Receiving needs a despreader. PortaPack simulates GPS, which is the usual reason to transmit it |
 
 ## Amateur
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| APRS / AX.25 1200 | 144.39/144.8 MHz | AFSK over FM | 12.5 kHz | framing | mod | Discriminator, Bell 202 tones, HDLC, CRC16. A good first framing target, and lawful to transmit with a licence |
+| APRS / AX.25 1200 | 144.39/144.8 MHz | AFSK over FM | 12.5 kHz | framing | mod | Discriminator, Bell 202 tones, HDLC, CRC16. A good first framing target |
 | Packet 9600 (G3RUH) | 144-440 MHz | direct FSK 9600 | 25 kHz | framing | mod | Scrambled NRZI |
 | Morse (CW) | any | OOK | 500 Hz | table | table | The envelope path already produces the timings, and keying a carrier is the simplest transmit case there is |
 | RTTY | HF, VHF | FSK 45.45 baud | 1 kHz | framing | mod | Baudot, and the same two-tone shape as everything else here |
@@ -205,16 +213,16 @@ capability note, not advice.
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| GSM downlink control | 900/1800 MHz | GMSK 270.833 kbps | 200 kHz | demod | no | Broadcast channels carry cell identity in the clear; traffic uses A5 ciphers and breaking those is illegal in most places. Only the control plane is worth building |
-| LTE / 5G | various | OFDM | 1.4-100 MHz | chain | no | Cell search and MIB decode is possible in principle; past that it is a stack, not a decoder |
+| GSM downlink control | 900/1800 MHz | GMSK 270.833 kbps | 200 kHz | demod | mod | Broadcast channels carry cell identity in the clear; traffic uses A5 ciphers, so only the control plane is decodable without attacking them |
+| LTE / 5G | various | OFDM | 1.4-100 MHz | chain | chain | Cell search and MIB decode is possible in principle; past that it is a stack, not a decoder |
 
 ## Time and beacons
 
 | Protocol | Where | Modulation | Width | RX | TX | Notes |
 |---|---|---|---|---|---|---|
-| DCF77 | 77.5 kHz | AM plus phase modulation | 100 Hz | chain | no | Needs VLF hardware |
-| MSF, WWVB | 60 kHz | AM | 100 Hz | chain | no | As DCF77 |
-| NDB beacons | 190-535 kHz | keyed carrier | 1 kHz | chain | no | |
+| DCF77 | 77.5 kHz | AM plus phase modulation | 100 Hz | chain | mod | Needs VLF hardware |
+| MSF, WWVB | 60 kHz | AM | 100 Hz | chain | mod | As DCF77 |
+| NDB beacons | 190-535 kHz | keyed carrier | 1 kHz | chain | mod | |
 
 ## Transmit
 
@@ -245,9 +253,9 @@ protocol. Four things are missing:
    parts of 868 MHz), and the transmitter should enforce them rather than
    leave it to the operator to remember.
 
-A sensible first target is Morse keying on an amateur band into a dummy load:
-it exercises the device, the modulator and the scheduler with no framing at
-all, and it is unambiguously lawful with a licence.
+A sensible first target is Morse keying into a dummy load: it exercises the
+device, the modulator and the scheduler with no framing at all, and a dummy
+load keeps the first attempt off the air while it is still wrong.
 
 ## Suggested order
 

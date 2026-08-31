@@ -7,8 +7,9 @@ decode every signal in it in parallel.
 
 Working receiver, narrow coverage. The signal path runs end to end against real
 off-air RF, there is an egui front end, and FM broadcast decodes to stereo audio
-with RDS. What is missing is protocols: one ISM device family is implemented
-where the goal is hundreds.
+with RDS. What is missing is protocols: twelve ISM device decoders are
+implemented where the goal is hundreds, and only the Fine Offset one has been
+checked against a real recording.
 
 Proof it works: `crates/decode/tests/fineoffset_capture.rs` decodes a real
 recorded 433.92 MHz weather-station transmission and asserts the result matches
@@ -36,8 +37,7 @@ Named `common` rather than `core` because a workspace crate called `core`
 shadows the Rust sysroot crate.
 
 [`docs/views.md`](docs/views.md) describes the packet stream as a bus: the
-list and the waterfall marks are views over it, and a map, an image pane or a
-chart attach the same way, by reading a packet's structured fields and its
+list is a view over it, and a map, an image pane or a chart attach the same way, by reading a packet's structured fields and its
 media type rather than the demodulator that produced it.
 
 [`docs/protocols.md`](docs/protocols.md) is the protocol roadmap: everything
@@ -211,6 +211,14 @@ both harder to find.
 Stopping releases the USB claim without quitting, which is the only way to hand
 the radio to another program: a held claim is what makes the next process fail
 to open it at all.
+
+Where it was pointing last time is where it starts: device, centre frequency,
+span and zoom, every gain stage, the radio's switches, the crystal correction,
+and whether decoding was on. They are written to
+`$XDG_CONFIG_HOME/super-radio/session` as plain `key = value` lines, a couple of
+seconds after the last change and again on exit, so the file is editable by hand
+and a corrupt one costs the settings rather than the startup. With nothing saved
+it opens on 433.92 MHz, where the devices this thing decodes actually are.
 
 ### Spectrum
 
@@ -403,15 +411,6 @@ level says the front end is clipping. It is referenced to full scale at the
 detector, not to the antenna, so it compares packets on one receiver and is
 not a field strength. Clicking a packet opens an offset/hex/ASCII dump of its
 bytes. `UNKNOWN` hides unclaimed bursts when a noisy band buries the decodes.
-
-Each packet is also marked on the waterfall, written into the history itself
-rather than painted over it, so it scrolls, pans and ages with the row it
-arrived on and cannot drift away from the trace that produced it. The bracket
-frames the signal instead of covering it, coloured green for a verified
-packet, amber for one with no check to verify, red for a failed one and grey
-for an unknown. Beside it is the packet's number from the list, which is all
-the text worth putting over a waterfall: a protocol name is unreadable at the
-sizes that matter, and the number leads to a row that has room to say more.
 
 Idle channels cost only the burst detector, which is why the whole band can be
 covered continuously even with two banks running: measured at 2.4 MS/s over 78

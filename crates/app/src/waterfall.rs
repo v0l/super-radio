@@ -19,8 +19,6 @@ pub struct Waterfall {
     /// Only this row changed since the last upload.
     dirty_row: Option<usize>,
     row_buf: Vec<Color32>,
-    /// Pixels written by [`Self::mark`], counted so tests can see them.
-    marked: usize,
 }
 
 impl Waterfall {
@@ -35,7 +33,6 @@ impl Waterfall {
             dirty_all: true,
             dirty_row: None,
             row_buf: Vec::new(),
-            marked: 0,
         }
     }
 
@@ -71,69 +68,6 @@ impl Waterfall {
         self.filled = (self.filled + 1).min(self.height);
     }
 
-    /// Stamp a packet marker into the history itself.
-    ///
-    /// Drawn into the pixels rather than painted over them, so it scrolls,
-    /// pans and ages with the row it belongs to and cannot drift away from the
-    /// trace that produced it. Anything drawn on top has to re-derive where
-    /// that row went, and gets it wrong the moment the display stutters.
-    ///
-    /// `rows_back` counts from the newest row. `bins_per_px` stretches the
-    /// marker so it stays visible when the texture is wider than the pane it
-    /// is drawn into: at 2048 bins across 1000 pixels a three bin arm is a
-    /// pixel and a half, which is nothing.
-    ///
-    /// The centre bin is deliberately left alone. A marker that paints over
-    /// the signal hides the evidence it is pointing at.
-    pub fn mark(&mut self, bin: usize, rows_back: usize, col: Color32, bins_per_px: usize) {
-        if self.width == 0 || self.filled == 0 || rows_back >= self.filled || bin >= self.width {
-            return;
-        }
-        let scale = bins_per_px.clamp(1, 16);
-        let arm = 3 * scale;
-        let gap = scale;
-        let row = |back: usize| (self.cursor + self.height - 1 - back) % self.height;
-        let width = self.width;
-        let pixels = &mut self.pixels;
-        let marked = &mut self.marked;
-        let mut put = |r: usize, b: isize| {
-            if b >= 0 && (b as usize) < width {
-                pixels[r * width + b as usize] = col;
-                *marked += 1;
-            }
-        };
-
-        // A bracket either side of the signal. Two rows of arms, not one:
-        // rows are about a screen pixel tall, and a single row of marker
-        // disappears into a busy waterfall.
-        for dr in [0usize, 1] {
-            if rows_back + dr >= self.filled {
-                break;
-            }
-            let r = row(rows_back + dr);
-            for i in 0..arm {
-                let off = (gap + i) as isize;
-                put(r, bin as isize - off);
-                put(r, bin as isize + off);
-            }
-        }
-        // A tick at each end, so it reads as a marker rather than a dropout.
-        for dr in [2usize, 3] {
-            if rows_back + dr >= self.filled {
-                break;
-            }
-            let r = row(rows_back + dr);
-            let end = (gap + arm - 1) as isize;
-            put(r, bin as isize - end);
-            put(r, bin as isize + end);
-        }
-
-        // Marks are rare, a few a minute against twenty rows a second, so the
-        // cost of a full upload here is nothing next to the complexity of
-        // tracking several dirty rows.
-        self.dirty_all = true;
-    }
-
     /// Change how many rows of history are kept.
     pub fn set_height(&mut self, rows: usize) {
         let rows = rows.max(16);
@@ -147,25 +81,6 @@ impl Waterfall {
         self.tex = None;
         self.dirty_all = true;
         self.dirty_row = None;
-    }
-
-    /// Rows that actually contain history. The rest of the pane is empty, so
-    /// nothing should be drawn against it as though it were data.
-    pub fn filled(&self) -> usize {
-        self.filled
-    }
-
-    /// Pixels a marker has been stamped onto, for tests: a marker is written
-    /// into the history rather than drawn over it, so this is the only place
-    /// it can be observed from.
-    #[cfg(test)]
-    pub fn marked_pixels(&self) -> usize {
-        self.marked
-    }
-
-    /// Bins per row, which is the FFT size the rows were built from.
-    pub fn width(&self) -> usize {
-        self.width
     }
 
     pub fn height(&self) -> usize {
@@ -313,69 +228,6 @@ mod tests {
         0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
     }
 
-
-    #[test]
-    fn a_mark_is_written_into_the_history_beside_the_signal() {
-        let mut w = Waterfall::new(32);
-        for _ in 0..8 {
-            w.push(&vec![-50.0; 64], -90.0, -20.0);
-        }
-        // The newest row is at `cursor - 1`.
-        let row = (w.cursor + w.height - 1) % w.height;
-        let before = w.pixels[row * 64 + 32];
-        w.mark(32, 0, Color32::RED, 1);
-        assert_eq!(w.pixels[row * 64 + 32], before, "the marker covered the signal");
-        assert_eq!(w.pixels[row * 64 + 31], Color32::RED, "no left arm");
-        assert_eq!(w.pixels[row * 64 + 33], Color32::RED, "no right arm");
-    }
-
-    #[test]
-    fn a_mark_scrolls_with_the_row_it_was_put_on() {
-        let mut w = Waterfall::new(32);
-        for _ in 0..16 {
-            w.push(&vec![-50.0; 64], -90.0, -20.0);
-        }
-        w.mark(20, 0, Color32::RED, 1);
-        let marked = (w.cursor + w.height - 1) % w.height;
-
-        for _ in 0..5 {
-            w.push(&vec![-50.0; 64], -90.0, -20.0);
-        }
-        // The pixels have not moved; the row is simply further from the
-        // cursor, which is what drawing further down the pane means.
-        assert_eq!(w.pixels[marked * 64 + 19], Color32::RED);
-        assert_eq!((w.cursor + w.height - 1 - 5) % w.height, marked);
-    }
-
-    #[test]
-    fn a_mark_is_widened_when_the_texture_is_wider_than_the_pane() {
-        let mut w = Waterfall::new(32);
-        for _ in 0..4 {
-            w.push(&vec![-50.0; 64], -90.0, -20.0);
-        }
-        w.mark(32, 0, Color32::RED, 4);
-        let row = (w.cursor + w.height - 1) % w.height;
-        let lit = (0..64).filter(|b| w.pixels[row * 64 + b] == Color32::RED).count();
-        // Three arm pixels each side, each four bins wide.
-        assert_eq!(lit, 24, "arms were not stretched to stay visible");
-        // And the row below carries the same arms, so the marker is visible
-        // against a busy waterfall.
-        let below = (w.cursor + w.height - 2) % w.height;
-        let lit_below = (0..64).filter(|b| w.pixels[below * 64 + b] == Color32::RED).count();
-        assert_eq!(lit_below, 24, "the marker is only one row tall");
-    }
-
-    #[test]
-    fn marking_an_empty_or_out_of_range_place_does_nothing() {
-        let mut w = Waterfall::new(32);
-        w.mark(10, 0, Color32::RED, 1); // no history at all
-        for _ in 0..4 {
-            w.push(&vec![-50.0; 64], -90.0, -20.0);
-        }
-        w.mark(999, 0, Color32::RED, 1); // past the end of the span
-        w.mark(10, 99, Color32::RED, 1); // older than the history
-        assert!(!w.pixels.contains(&Color32::RED));
-    }
 
     #[test]
     fn the_colormap_brightens_monotonically() {

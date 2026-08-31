@@ -17,7 +17,7 @@ planned view needs from it.
 | Field | What it is | Who uses it |
 |---|---|---|
 | `at` | when the burst arrived, stamped at the start of the block that held it | every view, for ageing and ordering |
-| `freq` | centre of the channel it arrived on | list, waterfall marks, map (as a filter) |
+| `freq` | centre of the channel it arrived on | list, map (as a filter) |
 | `model` | protocol name, or "unknown" | routing |
 | `media_type` | what `bytes` holds | routing |
 | `fields` | the decoder's own fields, structured | map, chart, text |
@@ -40,10 +40,7 @@ claims what it can render.
 
 - **Packet list**: every record, newest at the bottom, with a detail pane
   showing fields and a hex dump of the selected packet.
-- **Waterfall marks**: a bracket stamped into the history at the row and
-  column a packet arrived on, numbered to match its row in the list.
-
-Both are views by this definition. Neither knows anything about a protocol.
+It is a view by this definition. It knows nothing about a protocol.
 
 ## Planned views
 
